@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    LaunchAgent, not a LaunchDaemon: the iOS Simulator needs the logged-in
+    Aqua session. Install to ~/Library/LaunchAgents/ and load with:
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hustler.macbuilder.plist
+
+    Paths use $HOME so the file works for any account. Edit the Hustler path
+    below if the repository lives somewhere else, then log in (auto-login) and
+    launchd starts the bot.
+  -->
+  <key>Label</key>
+  <string>com.hustler.macbuilder</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>cd "$HOME/Hustler/mac-builder" &amp;&amp; exec "$HOME/Hustler/mac-builder/.venv/bin/python" bot.py &gt;&gt; "$HOME/Hustler/mac-builder/logs/launchd.log" 2&gt;&amp;1</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>LANG</key>
+    <string>en_US.UTF-8</string>
+  </dict>
+</dict>
+</plist>
