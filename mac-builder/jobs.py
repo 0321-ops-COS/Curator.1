@@ -66,6 +66,10 @@ class ReviewOutcome:
     test_state: str
     diff_lines: int
     changed_files: tuple[str, ...]
+    # Whether the real stages passed. test_ok=None means /test was unavailable
+    # (no test action), which is reported but cannot fail a diff.
+    check_ok: bool = True
+    test_ok: bool | None = None
     # HEAD plus the staged-change digest the review saw; Approve re-checks it.
     snapshot: str = ""
     violations: tuple[rules.RuleViolation, ...] = ()
@@ -494,6 +498,8 @@ class JobRunner:
                     test_state=test_state,
                     diff_lines=changes.diff_lines,
                     changed_files=tuple(all_paths),
+                    check_ok=check_ok,
+                    test_ok=test_ok,
                     snapshot=changes.snapshot,
                 )
                 await self.post_review(outcome)
