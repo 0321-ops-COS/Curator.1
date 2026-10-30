@@ -8,6 +8,7 @@ the base URL, key and model all come from the environment.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -24,6 +25,18 @@ MAX_CONTEXT_CHARS = 80_000
 MAX_CHAT_CHARS = 24_000
 MAX_CHAT_MESSAGES = 12
 MAX_PROPOSED_TASKS = 3
+
+# A reply has to fit a verdict plus notes, but reasoning models such as Gemini
+# flash spend tokens thinking before they answer; too small a budget yields an
+# empty or truncated reply, which reads as a broken provider.
+DEFAULT_MAX_TOKENS = 4000
+
+# Log tails are the part of the review prompt that is allowed to shrink. They
+# sit before the diff, so an uncapped tail used to push the diff out of the
+# context budget entirely.
+MAX_LOG_TAIL_CHARS = 2500
+
+RETRY_DELAY_SECONDS = 2.0
 
 REVIEW_SYSTEM_PROMPT = """You are the repo manager for a private iOS build bot. Your project, repo and
 builder are given under PROJECT below. You only READ and JUDGE.
@@ -124,6 +137,18 @@ def _tail(text: str, limit: int) -> str:
     return "[earlier output omitted]\n" + text[-limit:]
 
 
+def _is_retryable(exc: BaseException) -> bool:
+    """Retry only what the same request can plausibly survive.
+
+    A 5xx, a 429 or a timeout may succeed on a second attempt. A 401, a 404 or a
+    malformed reply will not, and retrying them only doubles the wait.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status == 429 or status >= 500
+    return isinstance(exc, httpx.TimeoutException)
+
+
 def _status_text(response: httpx.Response) -> str:
     """'HTTP 503 Service Unavailable', without a trailing space when there is no reason."""
     reason = (response.reason_phrase or "").strip()
@@ -166,11 +191,11 @@ GIT STATUS
 
 CHECK (/check, swift test in HustlerCore)
 state: {brief.check_state}
-{_tail(brief.check_tail.strip() or "(no output)", 6000)}
+{_tail(brief.check_tail.strip() or "(no output)", MAX_LOG_TAIL_CHARS)}
 
 TEST (/test, xcodebuild test on one simulator)
 state: {brief.test_state}
-{_tail(brief.test_tail.strip() or "(no output)", 6000)}
+{_tail(brief.test_tail.strip() or "(no output)", MAX_LOG_TAIL_CHARS)}
 
 DIFF
 {diff_text}
@@ -255,11 +280,15 @@ class Manager:
         api_key: str = "",
         model: str = "",
         timeout_seconds: float = 120.0,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        retry_delay_seconds: float = RETRY_DELAY_SECONDS,
     ) -> None:
         self.api_base = (api_base or "").strip().rstrip("/")
         self.api_key = (api_key or "").strip()
         self.model = (model or "").strip()
         self.timeout_seconds = float(timeout_seconds)
+        self.max_tokens = int(max_tokens)
+        self.retry_delay_seconds = float(retry_delay_seconds)
         self._client: httpx.AsyncClient | None = None
 
     @property
@@ -303,9 +332,6 @@ class Manager:
         for attempt in range(2):
             try:
                 response = await self._http().post(self.endpoint, json=payload)
-                if response.status_code >= 500 and attempt == 0:
-                    last_error = ManagerUnavailable(_status_text(response))
-                    continue
                 response.raise_for_status()
                 data = response.json()
                 content = data["choices"][0]["message"]["content"]
@@ -314,13 +340,19 @@ class Manager:
                 return content
             except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
                 last_error = exc
-                if attempt == 0:
+                if attempt == 0 and _is_retryable(exc):
+                    log.info("manager retrying after %s", describe_error(exc))
+                    if self.retry_delay_seconds > 0:
+                        await asyncio.sleep(self.retry_delay_seconds)
                     continue
+                break
         raise ManagerUnavailable(f"manager request failed: {describe_error(last_error)}")
 
     async def review(self, brief: ReviewBrief) -> ReviewResult:
         try:
-            text = await self._complete(build_review_messages(brief), max_tokens=900)
+            text = await self._complete(
+                build_review_messages(brief), max_tokens=self.max_tokens
+            )
         except ManagerUnavailable as exc:
             log.warning("manager unavailable: %s", exc)
             return ReviewResult(
@@ -345,7 +377,7 @@ class Manager:
             + _truncate(context.strip() or "(no jobs yet)", MAX_CHAT_CHARS),
         }
         try:
-            text = await self._complete([system, *trimmed], max_tokens=900)
+            text = await self._complete([system, *trimmed], max_tokens=self.max_tokens)
         except ManagerUnavailable as exc:
             return ChatReply(text=f"The AI manager is not available: {exc}")
         reply = parse_chat_reply(text)
