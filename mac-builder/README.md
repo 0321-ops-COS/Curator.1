@@ -190,6 +190,7 @@ tail -f ~/Hustler/mac-builder/logs/launchd.log
 | `/test` | `xcodegen`, then `xcodebuild test` on one simulator, then shuts it down. Queued. |
 | `/build` | `xcodegen`, then unsigned `xcodebuild build`. Queued. |
 | `/logs [job-id]` | Tail of the latest or a specific job log. |
+| `/plan <goal>` | Read-only plan as a markdown file. Creates no job and builds nothing. |
 | `/task <text>` | Fresh `freebuff/<short-id>` branch + worktree, Freebuff in tmux, then review. |
 
 Job results are posted where the job was started, or to `NOTIFY_CHANNEL_ID`.
@@ -242,6 +243,16 @@ arguments (never Discord input).
 - `approve` and `ask_user` post an embed with **Approve** / **Reject** buttons.
   Approve commits the worktree, pushes only `freebuff/<id>` and reports the
   commit. Reject pushes nothing. There is no merge path anywhere in the bot.
+- `/plan <goal>` asks the manager for a plan in the owner's task-document shape:
+  evidence, items in priority order, acceptance per item, out of scope, open
+  decisions. It is given the project block, the tails and error lines of the
+  newest job logs, a shallow file map of the target checkout and the two gap
+  sections of this README, and every claim it writes must be labelled `verified`
+  or `assumed`. The result is wrapped with the goal and a timestamp and saved to
+  `LOG_DIR/plans/<timestamp>.md` (gitignored), then posted as a file. A plan
+  request never creates a job, starts tmux or touches `mac-builder/`; it can only
+  produce text. If the manager is not configured, `/plan` says which variables to
+  set instead of posting an empty file.
 - In `#ai`, the manager answers questions using the queue, the latest job log
   summary and a diff excerpt. It may end a reply with
   `{"proposed_tasks": [...]}`; each proposal gets a **Queue this task** button
@@ -283,6 +294,10 @@ builds throwaway git repos to check the project context, credential redaction an
 every startup refusal, and that the project block reaches the review prompt.
 `tests/test_bot_config.py` keeps `REPO_DIR` defaulted and covers the labels;
 `tests/test_project_commands.py` calls `/project` and `/status` without Discord.
+`tests/test_self_planning.py` calls `/plan` without Discord: the allowlist is
+enforced, no job is created, the file is saved under `logs/plans/`, the prompt
+carries the project block and the error lines from the newest log, and an
+unconfigured manager names the variables to set.
 
 ## What is not verified here
 

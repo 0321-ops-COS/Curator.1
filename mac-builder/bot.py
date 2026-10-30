@@ -40,11 +40,12 @@ from discord import app_commands  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
 import jobs  # noqa: E402
+import planner  # noqa: E402
 import project_context  # noqa: E402
 import rules  # noqa: E402
 from freebuff_runner import FreebuffError, FreebuffRunner  # noqa: E402
 from jobs import Job, ReviewOutcome, tail_text  # noqa: E402
-from manager import Manager  # noqa: E402
+from manager import Manager, ManagerUnavailable  # noqa: E402
 
 log = logging.getLogger("macbuilder")
 
@@ -423,6 +424,13 @@ class MacBuilderBot(discord.Client):
         )
         self.tree.add_command(
             app_commands.Command(
+                name="plan",
+                description="Write a read-only build plan as a markdown file (creates no job)",
+                callback=self.cmd_plan,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
                 name="check",
                 description="Run swift test in HustlerCore (fast, queued)",
                 callback=self.cmd_check,
@@ -540,6 +548,48 @@ class MacBuilderBot(discord.Client):
         ctx = self.settings.project
         text = ctx.summary() if ctx is not None else "Project context is not loaded."
         await interaction.response.send_message("```\n" + text + "\n```", ephemeral=True)
+
+    # ------------------------------------------------------------------ plan
+
+    @app_commands.describe(goal="What you want planned; nothing is built and no job is queued")
+    async def cmd_plan(self, interaction: discord.Interaction, goal: str) -> None:
+        """Text only: no Job, no tmux, no worktree, no edits under mac-builder/."""
+        if not await self.require_allowed(interaction):
+            return
+        await interaction.response.defer(thinking=True)
+        if not self.manager.enabled:
+            await interaction.followup.send(
+                "The AI manager is not configured, so there is no plan to write. Set "
+                "MANAGER_API_BASE, MANAGER_API_KEY and MANAGER_MODEL in `.env`."
+            )
+            return
+        ctx = self.settings.project
+        inputs = planner.gather(
+            goal=goal,
+            project_block=ctx.prompt_block() if ctx is not None else "",
+            log_dir=self.settings.log_dir,
+            target_dir=self.settings.repo_dir,
+            readme=HERE / "README.md",
+        )
+        try:
+            body = await self.manager.plan(inputs)
+        except ManagerUnavailable as exc:
+            await interaction.followup.send(f"Could not write a plan: {exc}")
+            return
+        document = planner.plan_document(
+            goal, body, bot_name=self.settings.bot_name
+        )
+        try:
+            path = planner.write_plan(self.settings.log_dir, document)
+        except OSError as exc:
+            await interaction.followup.send(f"Could not save the plan: {exc}")
+            return
+        await interaction.followup.send(
+            f"Plan for `{inputs.goal[:80]}`. Read-only: no job was created and nothing "
+            f"was built. Saved as `{planner.PLAN_DIR_NAME}/{path.name}`; every claim "
+            "is labelled verified or assumed.",
+            file=discord.File(path, filename=path.name),
+        )
 
     # ----------------------------------------------------------- fixed jobs
 
