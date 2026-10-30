@@ -56,11 +56,15 @@ class ResolveLogTests(unittest.TestCase):
 
     def test_a_valid_id_resolves_inside_the_log_dir(self) -> None:
         path = self.write(f"{JOB_ID}.log")
-        self.assertEqual(self.instance._resolve_log(JOB_ID), path)
+        # _resolve_log returns a resolved path; on macOS TMPDIR is /var, which
+        # resolves to /private/var, so compare like for like.
+        self.assertEqual(self.instance._resolve_log(JOB_ID), Path(path).resolve())
 
     def test_the_dot_log_suffix_is_optional(self) -> None:
         path = self.write(f"{JOB_ID}.log")
-        self.assertEqual(self.instance._resolve_log(f"{JOB_ID}.log"), path)
+        self.assertEqual(
+            self.instance._resolve_log(f"{JOB_ID}.log"), Path(path).resolve()
+        )
 
     def test_a_path_or_a_bad_id_is_refused(self) -> None:
         self.write(f"{JOB_ID}.log")
