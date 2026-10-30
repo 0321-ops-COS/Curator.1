@@ -42,6 +42,7 @@ from dotenv import load_dotenv  # noqa: E402
 import jobs  # noqa: E402
 import planner  # noqa: E402
 import project_context  # noqa: E402
+import repos  # noqa: E402
 import rules  # noqa: E402
 from freebuff_runner import FreebuffError, FreebuffRunner  # noqa: E402
 from jobs import Job, ReviewOutcome, tail_text  # noqa: E402
@@ -134,6 +135,8 @@ class Settings:
     repo_dir: Path
     log_dir: Path
     worktree_root: Path
+    # Where /status looks for the owner's other checkouts; not a build target.
+    repos_root: Path
     notify_channel_id: int | None
     ai_channel_id: int | None
     ai_channel_name: str
@@ -190,6 +193,7 @@ class Settings:
         worktree_root = Path(
             _env("WORKTREE_ROOT", str(Path.home() / "mac-builder-worktrees"))
         ).expanduser().resolve()
+        repos_root = Path(_env("REPOS_ROOT", str(Path.home()))).expanduser().resolve()
 
         max_diff_lines = _env_int("MAX_DIFF_LINES", 400)
         if max_diff_lines < 1:
@@ -208,6 +212,7 @@ class Settings:
             repo_dir=repo_dir,
             log_dir=log_dir,
             worktree_root=worktree_root,
+            repos_root=repos_root,
             notify_channel_id=_env_optional_id("NOTIFY_CHANNEL_ID"),
             ai_channel_id=_env_optional_id("AI_CHANNEL_ID"),
             ai_channel_name=_env("AI_CHANNEL_NAME", "ai").lstrip("#") or "ai",
@@ -656,10 +661,38 @@ class MacBuilderBot(discord.Client):
 
     # ----------------------------------------------------------------- status
 
-    async def cmd_status(self, interaction: discord.Interaction) -> None:
+    @app_commands.describe(repo="Which local checkout to report on; leave empty to see the list")
+    async def cmd_status(
+        self, interaction: discord.Interaction, repo: Optional[str] = None
+    ) -> None:
         if not await self.require_allowed(interaction):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
+        checkouts = repos.discover(self.settings.repos_root)
+        names = ", ".join(item.name for item in checkouts) or "none found"
+        if repo:
+            chosen = repos.find(self.settings.repos_root, repo)
+            if chosen is None:
+                await interaction.followup.send(
+                    f"No checkout named `{repo}` under `{self.settings.repos_root}`. "
+                    f"Which repo? Known: {names}.",
+                    ephemeral=True,
+                )
+                return
+            code, output = await jobs.probe_status(self.settings, repo_dir=chosen.path)
+            lines = [
+                f"repo: {chosen.name} ({chosen.path})",
+                f"branch: {chosen.branch}",
+                f"changed files: {chosen.changed}",
+                f"last commit: {chosen.head}",
+                f"status.sh exit: {code}",
+                "",
+                jobs.tail_text(output, max_lines=40, max_chars=1200),
+            ]
+            await interaction.followup.send(
+                "```\n" + "\n".join(lines) + "\n```", ephemeral=True
+            )
+            return
         code, output = await jobs.probe_status(self.settings)
         snapshot = self.queue.snapshot()
         running = snapshot.get("running") or {}
@@ -677,9 +710,14 @@ class MacBuilderBot(discord.Client):
             ),
             f"authorized branch: {self.settings.authorized_branch}",
             f"manager: {'configured' if self.manager.enabled else 'not configured'}",
+            "",
+            f"which repo? ({len(checkouts)} checkout(s) under {self.settings.repos_root})",
+            *[f"  {item.line()}" for item in checkouts],
+            f"  add repo:<name> to /status for one of them; showing {Path(self.settings.repo_dir).name} below",
+            "",
             f"status.sh exit: {code}",
             "",
-            tail_text(output, max_lines=40, max_chars=1400),
+            tail_text(output, max_lines=40, max_chars=1200),
         ]
         await interaction.followup.send("```\n" + "\n".join(lines) + "\n```", ephemeral=True)
 

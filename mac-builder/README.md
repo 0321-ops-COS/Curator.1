@@ -140,6 +140,7 @@ are kept for inspection.
 | `ALLOWED_USER_IDS` | Comma/space-separated Discord user IDs; required. |
 | `AUTHORIZED_BRANCH` | Base branch for tasks; never `main`/`master`. |
 | `REPO_DIR` | Git checkout to build; default is the one containing `mac-builder/`. |
+| `REPOS_ROOT` | Where `/status` finds your other checkouts (direct children only, git ones only). Default `$HOME`. Read-only: this never changes the build target. |
 | `PROJECT_NAME`, `BUILDER_NAME`, `BOT_NAME` | Labels for `/project` and the manager; default to the target folder name, `Freebuff`, `Melisa`. |
 | `LOG_DIR` | Job logs; default `mac-builder/logs`. |
 | `WORKTREE_ROOT` | Per-task worktrees; default `~/mac-builder-worktrees`. |
@@ -186,7 +187,7 @@ tail -f ~/Hustler/mac-builder/logs/launchd.log
 | Command | What it does |
 |---|---|
 | `/project` | Which repo, branch and project Melisa is working on, plus her own repo. |
-| `/status` | Project, branch, git state, queue length, running job and how long it has been going. Runs `status.sh` directly. |
+| `/status [repo]` | Project, queue and running job, plus every git checkout under `REPOS_ROOT`. `repo:<name>` (or just the name) reports that one instead. Runs `status.sh` directly. |
 | `/cancel [job-id]` | Stops the running job, or one still waiting. The branch is kept; nothing is pushed. |
 | `/check` | `swift test` in HustlerCore. Queued. |
 | `/test` | `xcodegen`, then `xcodebuild test` on one simulator, then shuts it down. Queued. |
@@ -385,7 +386,10 @@ unconfigured manager names the variables to set.
   pushes.
 - Raw terminal escape codes are kept in the job log; Discord tails strip ANSI.
 - `/status` runs a read-only git command outside the queue, so it answers even
-  while a long build runs.
+  while a long build runs. With no `repo:` it lists the checkouts under
+  `REPOS_ROOT` and says which one it is showing; naming another one only reports
+  on it, it never becomes a build target. Cloning the other repositories is up to
+  you (`REPO_DIR` still points at the one she builds).
 - `/cancel` keeps the branch that Freebuff worked on, which is the record of what
   it did, and removes only the worktree and the push guard. Nothing is pushed,
   and a timed-out session is stopped before its changes are counted.

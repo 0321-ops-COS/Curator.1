@@ -264,9 +264,15 @@ async def _exec(
             handle.close()
 
 
-async def probe_status(settings: object) -> tuple[int, str]:
-    """Run status.sh for /status without creating a job."""
-    repo_dir = Path(getattr(settings, "repo_dir"))
+async def probe_status(
+    settings: object, *, repo_dir: Path | None = None
+) -> tuple[int, str]:
+    """Run status.sh for /status without creating a job.
+
+    `repo_dir` lets /status report on one of the owner's other checkouts; the
+    default is the configured build target.
+    """
+    repo_dir = Path(repo_dir or getattr(settings, "repo_dir"))
     outcome = await _exec(
         ["/bin/bash", str(SCRIPT_DIR / "status.sh")],
         cwd=repo_dir,
