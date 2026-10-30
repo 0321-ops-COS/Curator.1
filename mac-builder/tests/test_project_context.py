@@ -14,7 +14,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import manager  # noqa: E402
 import project_context as pc  # noqa: E402
+from manager import ReviewBrief, build_review_messages  # noqa: E402
 
 
 def git(repo: Path, *args: str) -> None:
@@ -188,6 +190,41 @@ class PreflightTests(unittest.TestCase):
         message = str(caught.exception)
         self.assertNotIn("\n", message)
         self.assertIn("not a local branch", message)
+
+
+class PromptTests(unittest.TestCase):
+    def brief(self, **overrides: str) -> ReviewBrief:
+        values = dict(
+            task="Make the scoreboard show net pay per hour.",
+            diff="diff --git a/a.swift b/a.swift\n+let x = 1\n",
+            diff_lines=1,
+            status=" M a.swift",
+            changed_files=("a.swift",),
+            check_state="passed",
+            check_tail="Executed 131 tests",
+            test_state="unavailable (scheme has no test action)",
+            test_tail="scheme has no test action",
+            round_number=0,
+        )
+        values.update(overrides)
+        return ReviewBrief(**values)  # type: ignore[arg-type]
+
+    def test_review_system_prompt_carries_the_project_block(self) -> None:
+        messages = build_review_messages(
+            self.brief(project_context="Target repo: https://github.com/o/Hustler.git")
+        )
+        system = messages[0]["content"]
+        self.assertIn("repo manager", system)
+        self.assertIn("PROJECT\nTarget repo: https://github.com/o/Hustler.git", system)
+
+    def test_review_system_prompt_has_no_project_section_without_a_context(self) -> None:
+        system = build_review_messages(self.brief())[0]["content"]
+        self.assertNotIn("\nPROJECT\n", system)
+
+    def test_chat_prompt_makes_her_the_repo_manager(self) -> None:
+        self.assertIn("repo manager", manager.CHAT_SYSTEM_PROMPT)
+        self.assertIn("mac-builder", manager.CHAT_SYSTEM_PROMPT)
+        self.assertIn("protected", manager.CHAT_SYSTEM_PROMPT)
 
 
 if __name__ == "__main__":

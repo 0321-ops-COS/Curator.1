@@ -704,7 +704,9 @@ class MacBuilderBot(discord.Client):
     def _ai_context(self) -> str:
         snapshot = self.queue.snapshot()
         running = snapshot.get("running") or {}
+        ctx = self.settings.project
         parts = [
+            ctx.prompt_block() if ctx is not None else "",
             f"repository: {self.settings.repo_dir}",
             f"authorized branch: {self.settings.authorized_branch}",
             f"queue waiting: {snapshot['pending']}",
