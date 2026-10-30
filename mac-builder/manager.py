@@ -13,6 +13,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 import httpx
@@ -23,7 +24,7 @@ from planner import PlanInputs
 log = logging.getLogger(__name__)
 
 MAX_CONTEXT_CHARS = 80_000
-MAX_PLAN_CHARS = 60_000
+MAX_PLAN_CHARS = 60_000  # input material; the reply is capped by the token budget
 MAX_CHAT_CHARS = 24_000
 MAX_CHAT_MESSAGES = 12
 MAX_PROPOSED_TASKS = 3
@@ -115,6 +116,23 @@ Rules:
 - Open decisions come last and are questions only the owner can answer.
 - No code block longer than 10 lines. Keep the whole document under 200 lines.
 """
+
+
+@dataclass(frozen=True)
+class PlanResult:
+    """The manager's plan text, and whether its token limit cut the plan off."""
+
+    text: str
+    truncated: bool = False
+
+
+def _reply_and_truncation(data: object) -> tuple[str, bool]:
+    """The reply text, and whether the model stopped at its token limit."""
+    choice = data["choices"][0]  # type: ignore[index]
+    content = choice["message"]["content"]
+    if not isinstance(content, str):
+        raise ManagerUnavailable("manager returned no text content")
+    return content, choice.get("finish_reason") == "length"
 
 
 class ManagerUnavailable(RuntimeError):
@@ -258,9 +276,15 @@ KNOWN GAPS (from the README)
     system = PLAN_SYSTEM_PROMPT
     if inputs.project_block.strip():
         system += "\nPROJECT\n" + inputs.project_block.strip() + "\n"
+    clipped = len(user) > MAX_PLAN_CHARS
+    if clipped:
+        user = _truncate(user, MAX_PLAN_CHARS) + (
+            "\n\n[NOTE: the material above was truncated to fit this request, so some "
+            "job lines are missing. Say so in Evidence if it matters.]\n"
+        )
     return [
         {"role": "system", "content": system},
-        {"role": "user", "content": _truncate(user, MAX_PLAN_CHARS)},
+        {"role": "user", "content": user},
     ]
 
 
@@ -373,6 +397,12 @@ class Manager:
             self._client = None
 
     async def _complete(self, messages: Iterable[dict[str, str]], *, max_tokens: int) -> str:
+        text, _truncated = await self._complete_with_meta(messages, max_tokens=max_tokens)
+        return text
+
+    async def _complete_with_meta(
+        self, messages: Iterable[dict[str, str]], *, max_tokens: int
+    ) -> tuple[str, bool]:
         if not self.enabled:
             raise ManagerUnavailable(
                 "manager is not configured (MANAGER_API_BASE, MANAGER_API_KEY, MANAGER_MODEL)"
@@ -388,11 +418,7 @@ class Manager:
             try:
                 response = await self._http().post(self.endpoint, json=payload)
                 response.raise_for_status()
-                data = response.json()
-                content = data["choices"][0]["message"]["content"]
-                if not isinstance(content, str):
-                    raise ManagerUnavailable("manager returned no text content")
-                return content
+                return _reply_and_truncation(response.json())
             except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
                 last_error = exc
                 if attempt == 0 and _is_retryable(exc):
@@ -417,12 +443,16 @@ class Manager:
             )
         return parse_review(text)
 
-    async def plan(self, inputs: PlanInputs) -> str:
+    async def plan(self, inputs: PlanInputs) -> PlanResult:
         """Write a plan document. Text only: no tools, no jobs, no edits."""
-        text = await self._complete(build_plan_messages(inputs), max_tokens=1800)
+        text, truncated = await self._complete_with_meta(
+            build_plan_messages(inputs), max_tokens=self.max_tokens
+        )
         if not text.strip():
             raise ManagerUnavailable("manager returned an empty plan")
-        return text.strip()
+        if truncated:
+            log.warning("the manager's plan hit the token limit and is incomplete")
+        return PlanResult(text=text.strip(), truncated=truncated)
 
     async def chat(self, messages: Sequence[dict[str, str]], context: str) -> ChatReply:
         trimmed: list[dict[str, str]] = []

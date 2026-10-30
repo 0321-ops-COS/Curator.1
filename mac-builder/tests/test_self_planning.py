@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import bot  # noqa: E402
 import planner  # noqa: E402
 import project_context as pc  # noqa: E402
-from manager import build_plan_messages  # noqa: E402
+from manager import PlanResult, build_plan_messages  # noqa: E402
 
 JOB_ID = "20261030-101500-abcd1234"
 PLAN_BODY = "# Task for Dan — make the queue visible\n\n## Evidence\n- `verified`: queue.py has no listing command.\n"
@@ -94,9 +94,9 @@ class FakeManager:
         self.body = body
         self.inputs: planner.PlanInputs | None = None
 
-    async def plan(self, inputs: planner.PlanInputs) -> str:
+    async def plan(self, inputs: planner.PlanInputs) -> PlanResult:
         self.inputs = inputs
-        return self.body
+        return PlanResult(text=self.body)
 
 
 class CommandTests(unittest.IsolatedAsyncioTestCase):
@@ -234,6 +234,34 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.saved_plans())
 
 
+    async def test_a_token_in_a_log_never_reaches_the_prompt_or_the_plan(self) -> None:
+        token = "ghp_" + "0123456789abcdefghij"
+        api_key = "sk-" + "abcdefghijklmnopqrstu"
+        self.write_log(
+            f"DISCORD_TOKEN={token}\n"
+            f"Authorization: Bearer {api_key}\n"
+            f"error: token {token} was rejected\n"
+        )
+
+        class Echoing(FakeManager):
+            async def plan(self, inputs: planner.PlanInputs) -> PlanResult:
+                self.inputs = inputs
+                # A model may quote its material; the saved file must stay clean.
+                return PlanResult(text=PLAN_BODY + "\n" + "\n".join(inputs.recent))
+
+        manager = Echoing()
+        await self.fake_bot(manager=manager).cmd_plan(FakeInteraction(), "fix the build")
+
+        assert manager.inputs is not None
+        for message in build_plan_messages(manager.inputs):
+            self.assertNotIn(token, message["content"])
+            self.assertNotIn(api_key, message["content"])
+        saved = self.saved_plans()[0].read_text(encoding="utf-8")
+        self.assertNotIn(token, saved)
+        self.assertNotIn(api_key, saved)
+        self.assertIn("[redacted]", saved)
+
+
 class PlannerTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -328,5 +356,61 @@ class PlannerTests(unittest.TestCase):
         self.assertTrue(any("ios-app/" in entry for entry in entries))
 
 
+    def test_a_plan_cut_off_at_the_token_limit_says_so(self) -> None:
+        from datetime import datetime
+
+        when = datetime(2026, 10, 30, 10, 15, 0)
+        body = "# Task for Dan — x\n\n## Items (priority order)\n1. do the first thing"
+        cut = planner.plan_document("x", body, created=when, truncated=True)
+        self.assertIn("cut off at the model's token limit", cut)
+        self.assertIn("Plan truncated", cut)
+        self.assertLess(cut.index("cut off"), cut.index("## Items"))
+        self.assertTrue(cut.rstrip().endswith("before it finished."))
+        whole = planner.plan_document("x", body, created=when)
+        self.assertNotIn("truncated", whole.lower())
+
+    def test_finish_reason_length_is_the_truncation_signal(self) -> None:
+        from manager import _reply_and_truncation
+
+        text, truncated = _reply_and_truncation(
+            {"choices": [{"message": {"content": "half"}, "finish_reason": "length"}]}
+        )
+        self.assertEqual(text, "half")
+        self.assertTrue(truncated)
+        _, stopped = _reply_and_truncation(
+            {"choices": [{"message": {"content": "whole"}, "finish_reason": "stop"}]}
+        )
+        self.assertFalse(stopped)
+
+    def test_a_clipped_prompt_tells_the_model_material_is_missing(self) -> None:
+        from manager import MAX_PLAN_CHARS
+
+        inputs = planner.PlanInputs(
+            goal="x",
+            project_block="",
+            recent=tuple("error: " + "y" * 200 for _ in range(400)),
+            file_map=(),
+            known_gaps=(),
+        )
+        user = build_plan_messages(inputs)[1]["content"]
+        self.assertIn("truncated to fit this request", user)
+        self.assertLessEqual(len(user), MAX_PLAN_CHARS + 400)
+
+    def test_a_goal_cannot_choose_the_plan_filename(self) -> None:
+        from datetime import datetime
+
+        when = datetime(2026, 10, 30, 10, 15, 0)
+        goal = "../../etc/passwd\nrm -rf /"
+        text = planner.plan_document(goal, "## Evidence\n- `assumed`: x", created=when)
+        path = planner.write_plan(self.root / "logs", text, created=when)
+        self.assertEqual(
+            path.parent.resolve(),
+            (self.root / "logs" / planner.PLAN_DIR_NAME).resolve(),
+        )
+        self.assertRegex(path.name, r"^\d{8}-\d{6}(-\d+)?\.md$")
+        self.assertIn("rm -rf /", path.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
+
     unittest.main()

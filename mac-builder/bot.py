@@ -654,22 +654,30 @@ class MacBuilderBot(discord.Client):
             readme=HERE / "README.md",
         )
         try:
-            body = await self.manager.plan(inputs)
+            result = await self.manager.plan(inputs)
         except ManagerUnavailable as exc:
             await interaction.followup.send(f"Could not write a plan: {exc}")
             return
         document = planner.plan_document(
-            goal, body, bot_name=self.settings.bot_name
+            goal,
+            result.text,
+            bot_name=self.settings.bot_name,
+            truncated=result.truncated,
         )
         try:
             path = planner.write_plan(self.settings.log_dir, document)
         except OSError as exc:
             await interaction.followup.send(f"Could not save the plan: {exc}")
             return
+        note = (
+            " It was cut off at the model's token limit, so it is incomplete."
+            if result.truncated
+            else ""
+        )
         await interaction.followup.send(
-            f"Plan for `{inputs.goal[:80]}`. Read-only: no job was created and nothing "
-            f"was built. Saved as `{planner.PLAN_DIR_NAME}/{path.name}`; every claim "
-            "is labelled verified or assumed.",
+            f"Plan for `{inputs.goal[:80]}`.{note} Read-only: no job was created and "
+            f"nothing was built. Saved as `{planner.PLAN_DIR_NAME}/{path.name}`; every "
+            "claim is labelled verified or assumed.",
             file=discord.File(path, filename=path.name),
         )
 

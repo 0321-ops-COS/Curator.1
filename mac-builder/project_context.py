@@ -49,6 +49,33 @@ def redact_remote(url: str) -> str:
     return _CREDENTIALS_RE.sub(r"\g<scheme>", url.strip())
 
 
+_SECRET_RES = (
+    re.compile(r"\b(?:bearer|token|authorization)\s+[A-Za-z0-9._\-]{8,}", re.I),
+    re.compile(r"\b(?:sk|rk|pk)-[A-Za-z0-9_\-]{12,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}"),
+    re.compile(r"\bxox[abprs]-[A-Za-z0-9\-]{8,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(
+        r"(?i)\b[A-Za-z0-9_]*(?:token|api[_-]?key|secret|password|passwd)"
+        r"\s*[:=]\s*[\"']?\S{6,}"
+    ),
+)
+
+
+def redact_secrets(text: str) -> str:
+    """Mask anything shaped like a credential before the text leaves the process.
+
+    A job log can carry a token, an API key or a URL with credentials; the plan
+    prompt and the saved plan file are no place for either.
+    """
+    if not text:
+        return text
+    out = redact_remote(text)
+    for pattern in _SECRET_RES:
+        out = pattern.sub("[redacted]", out)
+    return out
+
+
 def remote_url(repo: Path) -> str:
     code, out = _git(repo, "config", "--get", "remote.origin.url")
     return redact_remote(out) if code == 0 and out else "(no origin remote)"

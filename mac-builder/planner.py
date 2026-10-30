@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+import project_context
+
 PLAN_DIR_NAME = "plans"
 MAX_PLAN_GOAL_CHARS = 500
 MAX_RECENT_JOBS = 6
@@ -55,7 +57,8 @@ def _read_tail(path: Path, limit: int = 40_000) -> str:
             data = handle.read()
     except OSError:
         return ""
-    return ANSI_RE.sub("", data.decode("utf-8", "replace"))
+    # Redact before anything leaves this module: the prompt and the saved plan.
+    return project_context.redact_secrets(ANSI_RE.sub("", data.decode("utf-8", "replace")))
 
 
 def recent_failures(
@@ -138,7 +141,7 @@ def known_gaps(readme: Path) -> tuple[str, ...]:
             collecting = title in wanted
             continue
         if collecting and stripped.startswith("- "):
-            gaps.append(_clip(stripped[2:], 240))
+            gaps.append(_clip(project_context.redact_secrets(stripped[2:]), 240))
     return tuple(gaps)
 
 
@@ -151,7 +154,7 @@ def gather(
     readme: Path,
 ) -> PlanInputs:
     return PlanInputs(
-        goal=(goal or "").strip()[:MAX_PLAN_GOAL_CHARS],
+        goal=project_context.redact_secrets((goal or "").strip())[:MAX_PLAN_GOAL_CHARS],
         project_block=(project_block or "").strip(),
         recent=recent_failures(Path(log_dir)),
         file_map=file_map(Path(target_dir)),
@@ -165,6 +168,7 @@ def plan_document(
     *,
     bot_name: str = "Melisa",
     created: datetime | None = None,
+    truncated: bool = False,
 ) -> str:
     """Wrap the manager's markdown so the file always names the goal and its origin."""
     stamp = (created or datetime.now()).strftime("%Y-%m-%d %H:%M")
@@ -181,7 +185,16 @@ def plan_document(
         f"_Written by {bot_name} on {stamp}. Every claim below is labelled "
         "`verified` or `assumed`; nothing was built or pushed for this plan._\n"
     )
-    return header + ("\n" + body_text if body_text else "") + "\n"
+    if truncated:
+        header += (
+            "\n_This plan was cut off at the model's token limit, so it is incomplete; "
+            "ask for a narrower goal to get a whole one._\n"
+        )
+    document = header + ("\n" + body_text if body_text else "") + "\n"
+    if truncated:
+        # Also at the end, because a tail read is how the owner usually sees it.
+        document += "\n> Plan truncated: the model hit its token limit before it finished.\n"
+    return document
 
 
 def write_plan(log_dir: Path, text: str, *, created: datetime | None = None) -> Path:

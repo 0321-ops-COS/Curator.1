@@ -261,6 +261,12 @@ arguments (never Discord input).
   request never creates a job, starts tmux or touches `mac-builder/`; it can only
   produce text. If the manager is not configured, `/plan` says which variables to
   set instead of posting an empty file.
+  Job-log excerpts, the README gaps and the goal are credential-redacted before
+  they are sent, so a token in a log never reaches the model or the saved file.
+  The file name is the timestamp only (`plans/20261030-101500.md`), never the
+  goal. A prompt that had to be clipped says so to the model, and a plan the
+  model cut off at its token limit is labelled truncated at the top and the
+  bottom instead of reading like a finished document.
 - In `#ai`, the manager answers questions using the queue, the latest job log
   summary and a diff excerpt. It may end a reply with
   `{"proposed_tasks": [...]}`; each proposal gets a **Queue this task** button
@@ -352,3 +358,6 @@ unconfigured manager names the variables to set.
 - `/cancel` keeps the branch that Freebuff worked on, which is the record of what
   it did, and removes only the worktree and the push guard. Nothing is pushed,
   and a timed-out session is stopped before its changes are counted.
+- `/plan` is bounded: at most `MAX_PLAN_CHARS` (60 000 characters) of material
+  goes in, and at most `MANAGER_MAX_TOKENS` (default 4000) comes back. A plan that
+  hits the output limit is labelled incomplete, not presented as whole.
