@@ -49,6 +49,7 @@ mac-builder/
   queue.py            single-worker asyncio FIFO queue
   jobs.py             fixed-script execution + the Freebuff review pipeline
   manager.py          OpenAI-compatible review and planning chat (no tools)
+  project_context.py  which repo/branch/project she builds, plus herself
   rules.py            hard guardrails enforced in code
   freebuff_runner.py  branch + git worktree + tmux + diff collection + push
   scripts/            check.sh test.sh build.sh status.sh
@@ -268,7 +269,7 @@ The guardrails and parsing are testable without a Mac, Discord or a model:
 ```bash
 cd mac-builder
 python3 -m unittest discover -s tests -v
-python3 -m py_compile bot.py queue.py jobs.py rules.py manager.py freebuff_runner.py
+python3 -m py_compile bot.py queue.py jobs.py rules.py manager.py project_context.py freebuff_runner.py
 bash -n scripts/*.sh
 ```
 
@@ -276,7 +277,9 @@ bash -n scripts/*.sh
 protected-path), branch validation and verdict forcing. `tests/test_jobs.py`
 checks that the Discord token and manager key never reach a script environment.
 `tests/test_manager.py` covers JSON extraction, proposal parsing and endpoint
-configuration.
+configuration. `tests/test_project_context.py` builds throwaway git repos to
+check the project context, credential redaction, every startup preflight refusal
+and the project block in the review system prompt.
 
 ## What is not verified here
 
