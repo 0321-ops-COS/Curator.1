@@ -289,6 +289,15 @@ class TaskProposalView(discord.ui.View):
         )
 
 
+def is_approvable(outcome: ReviewOutcome) -> bool:
+    """A failed check or a real test failure removes the Approve button.
+
+    test_ok is None when /test was unavailable (the scheme has no test action),
+    which is reported but must not block a diff.
+    """
+    return outcome.check_ok and outcome.test_ok is not False
+
+
 class ReviewView(discord.ui.View):
     """Approve / Reject. Nothing is pushed until Approve is pressed."""
 
@@ -296,8 +305,15 @@ class ReviewView(discord.ui.View):
         super().__init__(timeout=86400)
         self.bot = bot
         self.outcome = outcome
+        self.approvable = is_approvable(outcome)
         self.resolved = False
         self._lock = asyncio.Lock()
+        if not self.approvable:
+            # A red check or test has nothing safe to approve; Reject remains so
+            # the worktree is not left in limbo.
+            for child in list(self.children):
+                if isinstance(child, discord.ui.Button) and child.label == "Approve":
+                    self.remove_item(child)
 
     def _disable(self) -> None:
         for child in self.children:
@@ -320,6 +336,12 @@ class ReviewView(discord.ui.View):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
         if not await self.bot.require_allowed(interaction):
+            return
+        if not self.approvable:
+            await interaction.response.send_message(
+                "Not approvable: a check or test failed. Fix it and run the task again.",
+                ephemeral=True,
+            )
             return
         async with self._lock:
             if self.resolved:
@@ -799,7 +821,13 @@ class MacBuilderBot(discord.Client):
         embed.add_field(name="Files", value=str(len(outcome.changed_files)), inline=True)
         embed.add_field(name="Job", value=f"`{outcome.job.id}`", inline=True)
         embed.add_field(name="Log", value=f"`{outcome.job.log_path.name}`", inline=False)
-        embed.set_footer(text="Nothing is pushed unless you press Approve.")
+        embed.set_footer(
+            text=(
+                "Nothing is pushed unless you press Approve."
+                if is_approvable(outcome)
+                else "A check or test failed, so there is no Approve button."
+            )
+        )
         await channel.send(embed=embed, view=ReviewView(self, outcome))
 
 
