@@ -1,4 +1,5 @@
 # mac-builder — private Discord build bot
+<!-- Test edit from /dan. Safe to delete. -->
 
 A single-user Discord bot for a headless Mac mini (M1, 8 GB). It queues
 `xcodegen` / `xcodebuild` / `swift test` jobs, runs Freebuff as a supervised
