@@ -124,6 +124,26 @@ def _tail(text: str, limit: int) -> str:
     return "[earlier output omitted]\n" + text[-limit:]
 
 
+def _status_text(response: httpx.Response) -> str:
+    """'HTTP 503 Service Unavailable', without a trailing space when there is no reason."""
+    reason = (response.reason_phrase or "").strip()
+    return f"HTTP {response.status_code}" + (f" {reason}" if reason else "")
+
+
+def describe_error(exc: BaseException | None) -> str:
+    """Name a failure so a message is never a bare 'request failed:'.
+
+    A timeout with an empty message, or a provider that rejects the key, must
+    still say what happened; otherwise the owner sees nothing to act on.
+    """
+    if exc is None:
+        return "unknown error"
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"{type(exc).__name__}: {_status_text(exc.response)}"
+    text = str(exc).strip()
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
 def build_review_messages(brief: ReviewBrief) -> list[dict[str, str]]:
     changed = ", ".join(brief.changed_files[:120]) or "(none)"
     if len(brief.changed_files) > 120:
@@ -279,14 +299,12 @@ class Manager:
             "temperature": 0.1,
             "max_tokens": max_tokens,
         }
-        last_error: Exception | None = None
+        last_error: BaseException | None = None
         for attempt in range(2):
             try:
                 response = await self._http().post(self.endpoint, json=payload)
                 if response.status_code >= 500 and attempt == 0:
-                    last_error = ManagerUnavailable(
-                        f"manager endpoint returned {response.status_code}"
-                    )
+                    last_error = ManagerUnavailable(_status_text(response))
                     continue
                 response.raise_for_status()
                 data = response.json()
@@ -298,7 +316,7 @@ class Manager:
                 last_error = exc
                 if attempt == 0:
                     continue
-        raise ManagerUnavailable(f"manager request failed: {last_error}")
+        raise ManagerUnavailable(f"manager request failed: {describe_error(last_error)}")
 
     async def review(self, brief: ReviewBrief) -> ReviewResult:
         try:
