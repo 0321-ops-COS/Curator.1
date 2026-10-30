@@ -27,6 +27,9 @@ class Job:
     requester_id: int
     log_path: Path
     text: str = ""
+    # A plan the job was started from, when it has one; the manager reads it
+    # before it answers a question.
+    plan: str = ""
     created: float = field(default_factory=time.time)
     started: float | None = None
     finished: float | None = None

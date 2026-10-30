@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import shlex
+import subprocess
 import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
@@ -42,6 +43,7 @@ from dotenv import load_dotenv  # noqa: E402
 import jobs  # noqa: E402
 import planner  # noqa: E402
 import project_context  # noqa: E402
+import questions  # noqa: E402
 import rules  # noqa: E402
 from freebuff_runner import FreebuffError, FreebuffRunner  # noqa: E402
 from jobs import Job, ReviewOutcome, tail_text  # noqa: E402
@@ -55,6 +57,37 @@ LOG_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}$")
 
 class ConfigError(RuntimeError):
     pass
+
+
+def _git_line(root: Path, *args: str) -> str:
+    """One read-only `git -C root` line, or 'unknown'. argv only, never a shell."""
+    try:
+        finished = subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if finished.returncode != 0:
+        return "unknown"
+    return finished.stdout.strip() or "unknown"
+
+
+def code_location(root: Path) -> str:
+    """'branch@short-commit' of the code that is about to run, for the startup log.
+
+    This answers one question at a glance: after a checkout moved (mac-builder
+    out of Hustler into Curator.1) the bot could otherwise run old code from a
+    folder nobody was editing, and nothing said which folder that was.
+    """
+    branch = _git_line(root, "rev-parse", "--abbrev-ref", "HEAD")
+    if branch == "unknown":
+        return "not a git checkout"
+    commit = _git_line(root, "rev-parse", "--short", "HEAD")
+    return f"{branch}@{commit}"
 
 
 def _http_error_text(exc: "discord.HTTPException") -> str:
@@ -93,6 +126,17 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError as exc:
         raise ConfigError(f"{name} must be a number, got {raw!r}") from exc
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = _env(name).lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ConfigError(f"{name} must be 0 or 1, got {raw!r}")
 
 
 def _env_optional_id(name: str) -> int | None:
@@ -165,6 +209,19 @@ class Settings:
     project_name: str = ""
     builder_name: str = "Freebuff"
     bot_name: str = "Melisa"
+    # How long a Freebuff question box may hold a job before it is dismissed
+    # with Esc and the job fails (QUESTION_WAIT_SECONDS).
+    question_wait_seconds: float = 1800.0
+    # The manager may answer a question, but only with high confidence.
+    question_auto_answer: bool = False
+    # At most this many auto-answers per job; then every question goes to you.
+    question_auto_answer_max: int = 3
+    # After a 429 or a timeout, skip manager calls for this long.
+    question_manager_cooldown_seconds: float = 30.0
+    # Post the manager's advice as a follow-up on the question. Never an answer.
+    question_suggest: bool = False
+    # Write the pane to the job log after every key sent to a question box.
+    question_debug: bool = False
     # Filled in by main() after the startup preflight; None before that.
     project: "project_context.ProjectContext | None" = None
 
@@ -239,11 +296,25 @@ class Settings:
             project_name=_env("PROJECT_NAME"),
             builder_name=_env("BUILDER_NAME", "Freebuff"),
             bot_name=_env("BOT_NAME", "Melisa"),
+            question_wait_seconds=_env_float("QUESTION_WAIT_SECONDS", 1800.0),
+            question_auto_answer=_env_bool("QUESTION_AUTO_ANSWER", False),
+            question_auto_answer_max=_env_int("QUESTION_AUTO_ANSWER_MAX", 3),
+            question_manager_cooldown_seconds=_env_float(
+                "QUESTION_MANAGER_COOLDOWN_SECONDS", 30.0
+            ),
+            question_suggest=_env_bool("QUESTION_SUGGEST", False),
+            question_debug=_env_bool("QUESTION_DEBUG", False),
         )
         if settings.max_pending_jobs < 1:
             raise ConfigError("MAX_PENDING_JOBS must be at least 1")
         if settings.manager_max_tokens < 1:
             raise ConfigError("MANAGER_MAX_TOKENS must be at least 1")
+        if settings.question_wait_seconds < 1:
+            raise ConfigError("QUESTION_WAIT_SECONDS must be at least 1")
+        if settings.question_auto_answer_max < 0:
+            raise ConfigError("QUESTION_AUTO_ANSWER_MAX must be 0 or more")
+        if settings.question_manager_cooldown_seconds < 0:
+            raise ConfigError("QUESTION_MANAGER_COOLDOWN_SECONDS must be 0 or more")
         return settings
 
 
@@ -439,6 +510,9 @@ class MacBuilderBot(discord.Client):
             self.freebuff,
             post_job=self._post_job_result,
             post_review=self._post_review,
+            post_question=self._post_question,
+            post_pane=self._post_pane,
+            post_note=self._post_note,
         )
         self.queue = jobs.JobQueue(
             self.runner.run,
@@ -521,6 +595,13 @@ class MacBuilderBot(discord.Client):
                 name="dan",
                 description="Have Dan change my own code on a fresh dan/* branch",
                 callback=self.cmd_dan,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="answer",
+                description="Answer the question Freebuff is waiting on (option number or text)",
+                callback=self.cmd_answer,
             )
         )
         self.tree.interaction_check = self.require_allowed
@@ -677,6 +758,11 @@ class MacBuilderBot(discord.Client):
             ),
             f"authorized branch: {self.settings.authorized_branch}",
             f"manager: {'configured' if self.manager.enabled else 'not configured'}",
+            f"questions: detection on · wait {int(self.settings.question_wait_seconds)}s"
+            f" · auto-answer {'on' if self.settings.question_auto_answer else 'off'}"
+            f" (max {self.settings.question_auto_answer_max}/job)"
+            f" · suggest {'on' if self.settings.question_suggest else 'off'}"
+            f" · debug {'on' if self.settings.question_debug else 'off'}",
             f"status.sh exit: {code}",
             "",
             tail_text(output, max_lines=40, max_chars=1400),
@@ -926,6 +1012,54 @@ class MacBuilderBot(discord.Client):
             ephemeral=True,
         )
 
+    # ------------------------------------------------------------- questions
+
+    @app_commands.describe(text="An option number from the question, or free text")
+    async def cmd_answer(self, interaction: discord.Interaction, text: str) -> None:
+        """Answer the one pending Freebuff question; the allowlist is checked first."""
+        if not await self.require_allowed(interaction):
+            return
+        pending = self.freebuff.pending_question
+        if pending is None:
+            await interaction.response.send_message(
+                "There is no pending question: Freebuff is not waiting on anything.",
+                ephemeral=True,
+            )
+            return
+        answer = questions.flatten_answer(text)
+        if not answer:
+            await interaction.response.send_message(
+                "That answer is empty; send an option number or some text.",
+                ephemeral=True,
+            )
+            return
+        count = len(pending.options)
+        shown = questions.option_number(answer, count)
+        if shown is None and answer.isdigit() and count:
+            # The number must name a row the pane actually shows.
+            await interaction.response.send_message(
+                f"Question {pending.number} has {count} option"
+                f"{'' if count == 1 else 's'}; send 1-{count} or some free text.",
+                ephemeral=True,
+            )
+            return
+        if not await self.freebuff.submit_answer(answer):
+            await interaction.response.send_message(
+                "That question was already answered or is gone.", ephemeral=True
+            )
+            return
+        if shown is not None:
+            detail = f"option {shown} ({pending.options[shown - 1].label})"
+        elif pending.custom_index is not None:
+            detail = "the Custom field"
+        else:
+            detail = "free text"
+        await interaction.response.send_message(
+            f"Answered question {pending.number} of {pending.total} as {detail}: "
+            f"`{answer[:100]}`",
+            ephemeral=True,
+        )
+
     # ----------------------------------------------------------- ai channel
 
     async def on_message(self, message: discord.Message) -> None:
@@ -1001,6 +1135,89 @@ class MacBuilderBot(discord.Client):
         if channel is None and self.settings.notify_channel_id:
             channel = self.get_channel(self.settings.notify_channel_id)
         return channel  # type: ignore[return-value]
+
+    async def _post_question(self, job: Job, question: questions.Question) -> bool:
+        """Post a pending question where the job was started; /answer resolves it."""
+        channel = self._target_channel(job.channel_id)
+        if channel is None:
+            log.warning("no Discord channel for the question in job %s", job.id)
+            return False
+        lines = [f"**{questions.redact(question.text)}**", ""]
+        for index, option in enumerate(question.options, start=1):
+            line = f"`{index}` {questions.redact(option.label)}"
+            if option.description:
+                line += f"\n   {questions.redact(option.description)}"
+            lines.append(line)
+        if question.free_text and not question.options:
+            lines += ["", "This one is free text: send your answer as the text."]
+        lines += ["", "Answer with `/answer <number>` or `/answer <text>`."]
+        embed = discord.Embed(
+            title=(
+                f"❓ Freebuff is waiting for an answer "
+                f"(question {question.number} of {question.total})"
+            ),
+            description="\n".join(lines)[:3900],
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Job", value=f"`{job.id}`", inline=True)
+        embed.add_field(name="Kind", value=job.kind, inline=True)
+        embed.add_field(name="Log", value=f"`{job.log_path.name}`", inline=True)
+        embed.set_footer(
+            text=(
+                "The job is waiting and its idle timer is paused. It answers one "
+                "question at a time and only then presses Submit."
+            )
+        )
+        try:
+            await channel.send(embed=embed)
+        except Exception:
+            log.exception("could not post the question for job %s", job.id)
+            return False
+        return True
+
+    async def _post_note(self, job: Job, text: str) -> None:
+        """A manager line for the owner: an auto-answer record or a suggestion."""
+        channel = self._target_channel(job.channel_id)
+        if channel is None:
+            log.warning("no Discord channel for a manager note in job %s", job.id)
+            return
+        try:
+            await channel.send(questions.redact(text)[:1900])
+        except Exception:
+            log.exception("could not post a manager note for job %s", job.id)
+
+    async def _post_pane(self, job: Job, tail: str) -> bool:
+        """A box that did not parse: show the pane so the owner is never blind."""
+        channel = self._target_channel(job.channel_id)
+        if channel is None:
+            log.warning("no Discord channel for the unreadable box in job %s", job.id)
+            return False
+        pane = questions.redact(tail or "(the pane was empty)").replace("```", "'''")[-1800:]
+        embed = discord.Embed(
+            title="⚠️ Freebuff is on a question box I could not read",
+            description=(
+                "The box is on screen but no numbered question could be parsed from "
+                "it, so nothing was guessed and nothing was typed. The job keeps "
+                "waiting; the pane is below. `/logs` has the same text.\n\n```\n"
+                + pane
+                + "\n```"
+            )[:4000],
+            color=discord.Color.orange(),
+        )
+        embed.add_field(name="Job", value=f"`{job.id}`", inline=True)
+        embed.add_field(name="Log", value=f"`{job.log_path.name}`", inline=True)
+        embed.set_footer(
+            text=(
+                "If it stays unreadable it is dismissed with Esc and the job fails "
+                "after QUESTION_WAIT_SECONDS."
+            )
+        )
+        try:
+            await channel.send(embed=embed)
+        except Exception:
+            log.exception("could not post the pane tail for job %s", job.id)
+            return False
+        return True
 
     async def _post_job_result(self, job: Job, ok: bool, summary: str) -> None:
         if job.status in ("awaiting_review", "blocked"):
@@ -1133,6 +1350,17 @@ def main() -> int:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 1
 
+    # Say which folder this process is really running from, before anything can
+    # hide it: the plist's path, the .env it loaded and where the logs land.
+    env_file = HERE / ".env"
+    log.info(
+        "code: %s [%s] · env: %s · logs: %s",
+        REPO_ROOT,
+        code_location(REPO_ROOT),
+        f"{env_file}{'' if env_file.is_file() else ' (missing)'}",
+        settings.log_dir,
+    )
+
     ctx = project_context.build_context(
         target_dir=settings.repo_dir,
         authorized_branch=settings.authorized_branch,
@@ -1148,6 +1376,17 @@ def main() -> int:
         return 1
     settings = replace(settings, project=ctx)
     log.info("project context:\n%s", ctx.summary())
+    log.info(
+        "question detection enabled: poll %.0fs, wait %.0fs, auto-answer %s "
+        "(max %d/job, cooldown %.0fs), suggest %s, debug %s",
+        settings.freebuff_poll_seconds,
+        settings.question_wait_seconds,
+        "on" if settings.question_auto_answer else "off",
+        settings.question_auto_answer_max,
+        settings.question_manager_cooldown_seconds,
+        "on" if settings.question_suggest else "off",
+        "on" if settings.question_debug else "off",
+    )
 
     settings.log_dir.mkdir(parents=True, exist_ok=True)
     settings.worktree_root.mkdir(parents=True, exist_ok=True)

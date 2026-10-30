@@ -29,7 +29,9 @@ class FakeFreebuff:
             base_branch="freebuff/base",
         )
 
-    async def wait_for_changes(self, env: TaskEnvironment, log_path: Path) -> str:
+    async def wait_for_changes(
+        self, env: TaskEnvironment, log_path: Path, **_kwargs: object
+    ) -> str:
         return self.reason
 
     async def collect(self, env: TaskEnvironment, max_diff_lines: int) -> ChangeSet:

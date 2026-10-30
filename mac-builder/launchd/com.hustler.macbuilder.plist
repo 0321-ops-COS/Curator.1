@@ -7,9 +7,15 @@
     Aqua session. Install to ~/Library/LaunchAgents/ and load with:
       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hustler.macbuilder.plist
 
-    Paths use $HOME so the file works for any account. Edit the Hustler path
-    below if the repository lives somewhere else, then log in (auto-login) and
-    launchd starts the bot.
+    mac-builder/ now lives in the Curator.1 checkout, not in Hustler. MB below is
+    the ONLY place the path appears: it defaults to ~/Curator.1/mac-builder and
+    can be overridden by setting MACBUILDER_DIR in EnvironmentVariables (or by
+    editing that one line). The Label keeps its old com.hustler. name because it
+    is only an identifier; renaming it means bootout + bootstrap again.
+
+    The project she builds is a different checkout, set in .env as REPO_DIR.
+    On startup the bot logs `code: <folder> [<branch>@<commit>] · env: ... · logs:
+    ...` so you can see which folder and commit actually ran.
   -->
   <key>Label</key>
   <string>com.hustler.macbuilder</string>
@@ -18,7 +24,7 @@
   <array>
     <string>/bin/bash</string>
     <string>-lc</string>
-    <string>cd "$HOME/Hustler/mac-builder" &amp;&amp; exec "$HOME/Hustler/mac-builder/.venv/bin/python" bot.py &gt;&gt; "$HOME/Hustler/mac-builder/logs/launchd.log" 2&gt;&amp;1</string>
+    <string>MB="${MACBUILDER_DIR:-$HOME/Curator.1/mac-builder}"; cd "$MB" || exit 1; exec "$MB/.venv/bin/python" "$MB/bot.py" &gt;&gt; "$MB/logs/launchd.log" 2&gt;&amp;1</string>
   </array>
 
   <key>RunAtLoad</key>

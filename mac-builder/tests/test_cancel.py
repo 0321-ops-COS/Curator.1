@@ -192,7 +192,9 @@ class _ReviewingFreebuff:
             base_branch="freebuff/base",
         )
 
-    async def wait_for_changes(self, env: TaskEnvironment, log_path: Path) -> str:
+    async def wait_for_changes(
+        self, env: TaskEnvironment, log_path: Path, **_kwargs: object
+    ) -> str:
         return "idle"
 
     async def collect(self, env: TaskEnvironment, max_diff_lines: int) -> ChangeSet:
@@ -231,7 +233,7 @@ class CancelResultTests(unittest.IsolatedAsyncioTestCase):
                     base_branch="freebuff/base",
                 )
 
-            async def wait_for_changes(self, env, log_path):
+            async def wait_for_changes(self, env, log_path, **_kwargs):
                 started.set()
                 await asyncio.Event().wait()
 
