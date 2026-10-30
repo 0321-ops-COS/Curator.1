@@ -115,7 +115,7 @@ into Freebuff’s terminal via `tmux load-buffer`/`paste-buffer`.
 ```bash
 cd ~/Hustler
 git switch freebuff/ce4b8907c250c30103d8993e
-python3 -m venv mac-builder/.venv
+/opt/homebrew/bin/python3.12 -m venv mac-builder/.venv
 mac-builder/.venv/bin/python -m pip install -r mac-builder/requirements.txt
 cp mac-builder/.env.example mac-builder/.env
 $EDITOR mac-builder/.env
@@ -234,8 +234,10 @@ validates the branch before pushing, and never merges.
 3. Same tmux supervision, idle detection and review as `/task`, with the same
    `MAX_DIFF_LINES` and the same snapshot re-check on Approve.
 4. `/check` and `/test` become Python stages run in the worktree with the bot's
-   own interpreter: `python3 -m unittest discover -s tests -t .`, then
-   `py_compile` over every module and `bash -n scripts/*.sh`. Any failure forces
+   own interpreter (`sys.executable`, i.e. `mac-builder/.venv/bin/python` under
+   the LaunchAgent): `.venv/bin/python -m unittest discover -s tests -t .`, then
+   `py_compile` over every module and `bash -n scripts/*.sh`. Never the system
+   `/usr/bin/python3`, which has none of the dependencies. Any failure forces
    `revise`, exactly as a failing `swift test` does for `/task`.
 5. Approve pushes `dan/<job-id>` and nothing else. Reject pushes nothing.
 6. Restarting the bot is still manual, also for a change that edits her.
@@ -323,8 +325,8 @@ The guardrails and parsing are testable without a Mac, Discord or a model:
 
 ```bash
 cd mac-builder
-python3 -m unittest discover -s tests -v
-python3 -m py_compile bot.py queue.py jobs.py rules.py manager.py project_context.py freebuff_runner.py
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m py_compile bot.py queue.py jobs.py rules.py manager.py project_context.py freebuff_runner.py
 bash -n scripts/*.sh
 ```
 
