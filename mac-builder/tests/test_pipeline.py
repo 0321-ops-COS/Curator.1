@@ -19,7 +19,9 @@ class FakeFreebuff:
         self.reason = reason
         self.aborted = False
 
-    async def start_task(self, *, job_id: str, task_text: str, log_path: Path) -> TaskEnvironment:
+    async def start_task(
+        self, *, job_id: str, task_text: str, log_path: Path, kind: str = "task"
+    ) -> TaskEnvironment:
         return TaskEnvironment(
             branch="freebuff/deadbeef",
             worktree=Path("/nonexistent/worktree"),

@@ -516,6 +516,13 @@ class MacBuilderBot(discord.Client):
                 callback=self.cmd_task,
             )
         )
+        self.tree.add_command(
+            app_commands.Command(
+                name="dan",
+                description="Have Dan change my own code on a fresh dan/* branch",
+                callback=self.cmd_dan,
+            )
+        )
         self.tree.interaction_check = self.require_allowed
         await self.sync_commands()
         if not self._queue_started:
@@ -885,6 +892,37 @@ class MacBuilderBot(discord.Client):
         warning = "" if self.manager.enabled else " (AI manager is not configured.)"
         await interaction.response.send_message(
             f"Queued Freebuff task `{job.id}` (position {position}).{warning}",
+            ephemeral=True,
+        )
+
+    @app_commands.describe(text="What Dan should change in mac-builder/ on a fresh dan/* branch")
+    async def cmd_dan(self, interaction: discord.Interaction, text: str) -> None:
+        """A self-build: her own checkout, branched from a freshly fetched origin/main."""
+        if not await self.require_allowed(interaction):
+            return
+        try:
+            task_text = rules.sanitize_task_text(text)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        job = jobs.make_job(
+            self.settings,
+            kind="dan",
+            title=task_text[:100],
+            channel_id=interaction.channel_id or 0,
+            requester_id=interaction.user.id,
+            text=task_text,
+        )
+        try:
+            position = await self.queue.submit(job)
+        except jobs.QueueFull as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"Queued self-build `{job.id}` (position {position}) on `dan/{job.id}`, "
+            "branched from a freshly fetched origin/main. It may edit `mac-builder/` "
+            "except the guardrail files; nothing is pushed until you press Approve "
+            "(only `dan/*` can be pushed from it).",
             ephemeral=True,
         )
 

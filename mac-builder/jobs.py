@@ -293,15 +293,26 @@ def _log_separator(job: Job, title: str) -> None:
         handle.flush()
 
 
-def build_followup_text(task: str, notes: str) -> str:
+def build_followup_text(task: str, notes: str, *, dan: bool = False) -> str:
+    protected = (
+        "Keep the change focused. mac-builder/ is allowed, but the guardrail files "
+        "are not: mac-builder/rules.py, mac-builder/freebuff_runner.py, the "
+        "allowlist and Approve code in mac-builder/bot.py, and the tests that pin "
+        "them (tests/test_rules.py, tests/test_push_guard.py, tests/test_dan.py, "
+        "tests/test_approve_recheck.py). Also off limits: .env*, .github/, signing "
+        "or provisioning material. Do not push."
+        if dan
+        else "Keep the change focused. Do not touch protected files (project.yml, "
+        "*.xcconfig, .github/, .env*, mac-builder/, signing or provisioning "
+        "material). Do not push."
+    )
     return (
         "Your previous attempt was reviewed and needs changes before it can be approved.\n\n"
         "Reviewer notes:\n"
         f"{notes.strip()}\n\n"
         "The original task is still:\n"
         f"{task}\n\n"
-        "Keep the change focused. Do not touch protected files (project.yml, *.xcconfig, "
-        ".github/, .env*, mac-builder/, signing or provisioning material). Do not push."
+        f"{protected}"
     )
 
 
@@ -339,7 +350,7 @@ class JobRunner:
         ok = False
         summary = ""
         try:
-            if job.kind == "task":
+            if job.kind in ("task", "dan"):
                 ok, summary = await self._run_task(job)
             else:
                 ok, summary = await self._run_script(job)
@@ -426,7 +437,10 @@ class JobRunner:
         env: TaskEnvironment | None = None
         try:
             env = await self.freebuff.start_task(
-                job_id=job.id, task_text=job.text, log_path=job.log_path
+                job_id=job.id,
+                task_text=job.text,
+                log_path=job.log_path,
+                kind=job.kind,
             )
             self._running_env = env
             reason = await self.freebuff.wait_for_changes(env, job.log_path)
@@ -475,6 +489,8 @@ class JobRunner:
                         diff_lines=changes.diff_lines,
                         changed_paths=all_paths,
                         max_diff_lines=int(getattr(self.settings, "max_diff_lines")),
+                        dan=job.kind == "dan",
+                        diff=changes.diff,
                     )
                 )
                 if violations:
@@ -512,7 +528,9 @@ class JobRunner:
                 review = await self.manager.review(brief)
                 verdict = review.verdict
                 notes = review.notes
-                forced = rules.force_revise_reason(check_ok, test_ok)
+                forced = rules.force_revise_reason(
+                    check_ok, test_ok, dan=job.kind == "dan"
+                )
                 if forced:
                     verdict = "revise"
                     notes = forced + (f"\n\n{notes}" if notes else "")
@@ -522,7 +540,9 @@ class JobRunner:
                 ):
                     _log_separator(job, f"revision round {env.round + 1}")
                     followup_reason = await self.freebuff.followup(
-                        env, build_followup_text(job.text, notes), job.log_path
+                        env,
+                        build_followup_text(job.text, notes, dan=job.kind == "dan"),
+                        job.log_path,
                     )
                     reason = followup_reason
                     if followup_reason == "timeout":
@@ -568,8 +588,12 @@ class JobRunner:
     async def _run_stage(
         self, job: Job, env: TaskEnvironment, kind: str
     ) -> tuple[str, str, bool | None]:
-        script = SCRIPT_DIR / f"{kind}.sh"
         _log_separator(job, f"/{kind} in {env.worktree}")
+        if job.kind == "dan":
+            # A self-build ships Python and shell, not Swift: the Mac's
+            # xcodebuild stages would tell her nothing about her own change.
+            return await self._run_dan_stage(job, env, kind)
+        script = SCRIPT_DIR / f"{kind}.sh"
         if not script.is_file():
             return "missing script", f"scripts/{script.name} not found", False
         outcome = await _exec(
@@ -589,3 +613,53 @@ class JobRunner:
             return state, tail, False
         state = "passed" if outcome.code == 0 else f"failed (exit {outcome.code})"
         return state, tail, outcome.code == 0
+
+    async def _run_dan_stage(
+        self, job: Job, env: TaskEnvironment, stage: str
+    ) -> tuple[str, str, bool | None]:
+        """The real stages for a self-build: unittest, then py_compile and bash -n."""
+        root = env.worktree / "mac-builder"
+        cwd = root if root.is_dir() else env.worktree
+        if stage == "check":
+            outcome = await _exec(
+                [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-t", "."],
+                cwd=cwd,
+                env=build_script_env(self.settings, cwd),
+                timeout=_stage_timeout(self.settings, stage),
+                log_path=job.log_path,
+                max_tail=160,
+            )
+            if outcome.timed_out:
+                return "timed out", "\n".join(outcome.tail[-40:]), False
+            state = "passed" if outcome.code == 0 else f"failed (exit {outcome.code})"
+            return state, "\n".join(outcome.tail[-40:]), outcome.code == 0
+
+        modules = sorted(str(path) for path in cwd.glob("*.py"))
+        scripts = sorted(str(path) for path in (cwd / "scripts").glob("*.sh"))
+        if not modules:
+            return "failed (no modules in mac-builder/)", "", False
+        commands = [("py_compile", [sys.executable, "-m", "py_compile", *modules])]
+        if scripts:
+            commands.append(("bash -n", ["/bin/bash", "-n", *scripts]))
+        states: list[str] = []
+        tail: list[str] = []
+        ok = True
+        for label, argv in commands:
+            outcome = await _exec(
+                argv,
+                cwd=cwd,
+                env=build_script_env(self.settings, cwd),
+                timeout=_stage_timeout(self.settings, stage),
+                log_path=job.log_path,
+                max_tail=80,
+            )
+            if outcome.timed_out:
+                states.append(f"{label} timed out")
+                ok = False
+            elif outcome.code != 0:
+                states.append(f"{label} failed (exit {outcome.code})")
+                ok = False
+            else:
+                states.append(f"{label} passed")
+            tail.extend(outcome.tail[-20:])
+        return "; ".join(states), "\n".join(tail), ok

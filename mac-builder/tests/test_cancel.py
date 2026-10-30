@@ -183,7 +183,7 @@ class _ReviewingFreebuff:
     """Delivers a change so the run reaches the review step."""
 
     async def start_task(
-        self, *, job_id: str, task_text: str, log_path: Path
+        self, *, job_id: str, task_text: str, log_path: Path, kind: str = "task"
     ) -> TaskEnvironment:
         return TaskEnvironment(
             branch="freebuff/job1",
@@ -223,7 +223,7 @@ class CancelResultTests(unittest.IsolatedAsyncioTestCase):
         started = asyncio.Event()
 
         class Blocking:
-            async def start_task(self, *, job_id, task_text, log_path):
+            async def start_task(self, *, job_id, task_text, log_path, kind="task"):
                 return TaskEnvironment(
                     branch="freebuff/job1",
                     worktree=Path("/nonexistent/worktree"),

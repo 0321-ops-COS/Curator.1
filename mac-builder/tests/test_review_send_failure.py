@@ -103,7 +103,7 @@ class ReviewSendFailureTests(unittest.IsolatedAsyncioTestCase):
 
 class _Freebuff:
     async def start_task(
-        self, *, job_id: str, task_text: str, log_path: Path
+        self, *, job_id: str, task_text: str, log_path: Path, kind: str = "task"
     ) -> TaskEnvironment:
         return TaskEnvironment(
             branch=BRANCH,

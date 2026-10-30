@@ -123,8 +123,12 @@ class ProjectContext:
             f"{self.bot_name} herself (this bot):",
             f"  repo:   {self.self_remote}",
             f"  folder: {self.self_dir / SELF_FOLDER}",
-            f"  protected: edits under {SELF_FOLDER}/ are always rejected; "
-            "change her through a normal branch and PR.",
+            f"  /task:  never edits {SELF_FOLDER}/; jobs branch from "
+            f"{self.authorized_branch} and push freebuff/* only.",
+            f"  /dan:   edits {SELF_FOLDER}/ on dan/<id>, branched from a fetched "
+            "origin/main, and pushes dan/* only. The guardrails stay off limits: "
+            "rules.py, freebuff_runner.py, the allowlist and Approve code in bot.py, "
+            "and the tests that pin them.",
         ]
         if self.target_is_self:
             lines += [

@@ -194,6 +194,7 @@ tail -f ~/Hustler/mac-builder/logs/launchd.log
 | `/logs [job-id]` | Tail of the latest or a specific job log. |
 | `/plan <goal>` | Read-only plan as a markdown file. Creates no job and builds nothing. |
 | `/task <text>` | Fresh `freebuff/<short-id>` branch + worktree, Freebuff in tmux, then review. |
+| `/dan <text>` | Self-build: `dan/<job-id>` from a freshly fetched `origin/main` in her own checkout, Freebuff in tmux, Python checks instead of Xcode, then review. Approve pushes `dan/*` only. |
 
 Job results are posted where the job was started, or to `NOTIFY_CHANNEL_ID`.
 
@@ -214,11 +215,37 @@ Job results are posted where the job was started, or to `NOTIFY_CHANNEL_ID`.
    change, not the base branch.
 
 A generated `git` shim is placed first on the session `PATH`. It refuses
-`push` unless the current branch is `freebuff/*`, and refuses explicit
-destinations outside `freebuff/*` plus `--force`, `--mirror`, `--all`, `--tags`
-and `--delete`. This is defence in depth, **not a sandbox**: the macOS user
-account is the real boundary, and an agent could call git by absolute path. The
-bot itself also validates the branch before pushing, and never merges.
+`push` unless the current branch is the job's own prefix — `freebuff/*` for a
+`/task`, `dan/*` for a `/dan` — and refuses explicit destinations outside that
+prefix plus `--force`, `--mirror`, `--all`, `--tags` and `--delete`. This is
+defence in depth, **not a sandbox**: the macOS user account is the real
+boundary, and an agent could call git by absolute path. The bot itself also
+validates the branch before pushing, and never merges.
+
+### `/dan` (self-build)
+
+`/dan` is the only path that may change `mac-builder/` itself:
+
+1. `git fetch origin main` in her own checkout (`PROJECT` self repo, i.e. the one
+   holding `mac-builder/`). A failed fetch fails the job; the branch is never
+   created from a stale base.
+2. `git worktree add -b dan/<job-id> <worktree> origin/main`, with a push guard
+   that allows `dan/*` only.
+3. Same tmux supervision, idle detection and review as `/task`, with the same
+   `MAX_DIFF_LINES` and the same snapshot re-check on Approve.
+4. `/check` and `/test` become Python stages run in the worktree with the bot's
+   own interpreter: `python3 -m unittest discover -s tests -t .`, then
+   `py_compile` over every module and `bash -n scripts/*.sh`. Any failure forces
+   `revise`, exactly as a failing `swift test` does for `/task`.
+5. Approve pushes `dan/<job-id>` and nothing else. Reject pushes nothing.
+6. Restarting the bot is still manual, also for a change that edits her.
+
+What `/dan` may never change: `mac-builder/rules.py`,
+`mac-builder/freebuff_runner.py` (the push path and guard), the allowlist and
+Approve code in `mac-builder/bot.py` (checked line by line in the diff), and the
+tests that pin them (`test_rules.py`, `test_push_guard.py`, `test_dan.py`,
+`test_approve_recheck.py`). Each refusal names the file and the reason, so the
+model can move the change somewhere it is allowed.
 
 Freebuff runs in a tmux server on its own socket (`-L macbuilder`) whose
 environment is a copy of the bot environment with `DISCORD_TOKEN` and every
@@ -282,7 +309,9 @@ These run before the manager and cannot be overridden by it:
 | `project.yml`, `*.xcconfig`, `.github/`, `.env*`, `mac-builder/`, signing/provisioning files | Blocked immediately; no model call. |
 | Failing `/check` or a real `/test` failure | Verdict forced to `revise`. |
 | `/test` reports “no test action” | Recorded as unavailable; does not fail the diff. |
-| Any push outside `freebuff/*`, or to `main`/`master` | Refused in code. |
+| `/dan`: `rules.py`, `freebuff_runner.py`, the allowlist or Approve lines in `bot.py`, or the four tests that pin them | Blocked immediately; the detail says why. |
+| `/dan`: `.env*`, `.github/`, `project.yml`, signing material, `main`/`master` | Blocked exactly as for `/task`. |
+| Any push outside `freebuff/*` (task) or `dan/*` (dan), or to `main`/`master` | Refused in code. |
 | Merge to main | No code path exists. |
 
 Oversized and protected-path changes are reported in Discord with no Approve
@@ -358,6 +387,10 @@ unconfigured manager names the variables to set.
 - `/cancel` keeps the branch that Freebuff worked on, which is the record of what
   it did, and removes only the worktree and the push guard. Nothing is pushed,
   and a timed-out session is stopped before its changes are counted.
+- `/dan` may edit `mac-builder/`, which means it can change how she behaves next
+  start; the guardrail files and the allowlist/Approve lines are refused in code,
+  and nothing is pushed until you press Approve. A dan branch that changes her
+  still needs a bot restart to take effect.
 - `/plan` is bounded: at most `MAX_PLAN_CHARS` (60 000 characters) of material
   goes in, and at most `MANAGER_MAX_TOKENS` (default 4000) comes back. A plan that
   hits the output limit is labelled incomplete, not presented as whole.
