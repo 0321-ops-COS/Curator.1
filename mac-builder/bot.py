@@ -522,6 +522,55 @@ class MacBuilderBot(discord.Client):
             self.queue.start()
             self._queue_started = True
 
+    async def _guild_line(self, guild_id: int) -> str:
+        """Name GUILD_ID and say whether the bot can see it, before READY.
+
+        setup_hook runs before the gateway sends READY, so self.guilds and
+        self.get_guild() are still empty there; the REST listing works at that
+        point. A diagnostic that fails must never stop startup, so everything is
+        caught here and only ids and names are logged.
+        """
+        try:
+            guilds = await self.http.get_guilds(200, with_counts=False)
+        except Exception as exc:  # a diagnostic must never stop startup
+            return (
+                f"GUILD_ID={guild_id}; could not list the bot's guilds "
+                f"({type(exc).__name__})"
+            )
+        known = [
+            (int(item["id"]), str(item.get("name") or "?"))
+            for item in guilds or []
+            if item.get("id")
+        ]
+        for known_id, name in known:
+            if known_id == guild_id:
+                return f"guild {name!r} (id={known_id}): visible to the bot"
+        listed = ", ".join(f"{known_id} {name!r}" for known_id, name in known[:10])
+        return (
+            f"GUILD_ID={guild_id} is not one of the {len(known)} guild(s) this bot "
+            f"is in ({listed or 'none'})"
+        )
+
+    def _sync_warning(self, exc: discord.HTTPException, where: str) -> None:
+        """One line for a sync that failed; the bot keeps running regardless."""
+        log.warning(
+            "could not sync application commands%s: %s. The bot keeps running with "
+            "the commands from its last successful sync; code 50001 means it was "
+            "invited without the applications.commands scope, or that GUILD_ID "
+            "names a server it is not in.",
+            where,
+            _http_error_text(exc),
+        )
+
+    async def _sync_global(self) -> None:
+        """Publish globally after a 50001; a failure here is still a warning."""
+        try:
+            synced = await self.tree.sync()
+        except discord.HTTPException as exc:
+            self._sync_warning(exc, " globally")
+            return
+        log.info("published %d application commands globally", len(synced))
+
     async def sync_commands(self) -> None:
         """Publish the slash commands; a failed sync must not stop the bot.
 
@@ -529,25 +578,31 @@ class MacBuilderBot(discord.Client):
         invited without the `applications.commands` scope, or when GUILD_ID names
         a server it cannot see. That used to escape setup_hook and kill the
         process during login, although the commands from the last successful sync
-        still work. It is a warning, not a crash.
+        still work. It is a warning, not a crash, and a guild sync refused with
+        50001 retries once globally so the commands are still published.
         """
         guild_id = self.settings.guild_id
+        if not guild_id:
+            await self._sync_global()
+            return
+        log.info("guild diagnostics: %s", await self._guild_line(guild_id))
+        guild = discord.Object(id=guild_id)
+        self.tree.copy_global_to(guild=guild)
         try:
-            if guild_id:
-                guild = discord.Object(id=guild_id)
-                self.tree.copy_global_to(guild=guild)
-                synced = await self.tree.sync(guild=guild)
-            else:
-                synced = await self.tree.sync()
+            synced = await self.tree.sync(guild=guild)
         except discord.HTTPException as exc:
+            if getattr(exc, "code", None) != 50001:
+                self._sync_warning(exc, f" to guild {guild_id}")
+                return
             log.warning(
-                "could not sync application commands%s: %s. The bot keeps running with "
-                "the commands from its last successful sync; code 50001 means it was "
-                "invited without the applications.commands scope, or that GUILD_ID "
-                "names a server it is not in.",
-                f" to guild {guild_id}" if guild_id else " globally",
+                "guild sync to %s failed with code 50001 (Missing Access): %s. "
+                "Retrying once globally so the commands are still published; "
+                "re-invite the bot with the applications.commands scope to get "
+                "them in the guild immediately.",
+                guild_id,
                 _http_error_text(exc),
             )
+            await self._sync_global()
             return
         log.info("synced %d application commands", len(synced))
 

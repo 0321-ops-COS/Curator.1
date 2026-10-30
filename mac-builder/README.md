@@ -364,4 +364,10 @@ unconfigured manager names the variables to set.
 - A slash-command sync that fails (403 / code 50001 `Missing Access`, usually a bot
   invited without the `applications.commands` scope, or a `GUILD_ID` it cannot see)
   is a warning at startup, not a crash: the bot keeps running with the commands from
-  its last successful sync. Re-invite the bot with that scope to publish changes.
+  its last successful sync. A guild sync refused with 50001 is retried once globally,
+  so the commands are still published somewhere; global commands can take up to an
+  hour to appear, so re-invite the bot with that scope for an immediate guild sync.
+- Startup logs one line naming `GUILD_ID` and whether the bot can see it (ids and
+  names only, no member counts). It uses a REST listing rather than the guild cache,
+  which is still empty in `setup_hook` before READY, and a failure in that diagnostic
+  is logged and never stops startup.
