@@ -57,6 +57,20 @@ class ConfigError(RuntimeError):
     pass
 
 
+def _http_error_text(exc: "discord.HTTPException") -> str:
+    """What went wrong with a Discord HTTP call, in one line and without the token."""
+    parts = [type(exc).__name__]
+    status = getattr(exc, "status", None)
+    code = getattr(exc, "code", None)
+    if status:
+        parts.append(f"HTTP {status}")
+    if code:
+        parts.append(f"code {code}")
+    head = " ".join(parts)
+    text = (getattr(exc, "text", "") or "").strip()
+    return f"{head}: {text[:200]}" if text else head
+
+
 def _env(name: str, default: str = "") -> str:
     return (os.environ.get(name) or default).strip()
 
@@ -503,16 +517,39 @@ class MacBuilderBot(discord.Client):
             )
         )
         self.tree.interaction_check = self.require_allowed
-        if self.settings.guild_id:
-            guild = discord.Object(id=self.settings.guild_id)
-            self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
-        else:
-            synced = await self.tree.sync()
-        log.info("synced %d application commands", len(synced))
+        await self.sync_commands()
         if not self._queue_started:
             self.queue.start()
             self._queue_started = True
+
+    async def sync_commands(self) -> None:
+        """Publish the slash commands; a failed sync must not stop the bot.
+
+        Discord answers 403 with code 50001 (Missing Access) when the bot was
+        invited without the `applications.commands` scope, or when GUILD_ID names
+        a server it cannot see. That used to escape setup_hook and kill the
+        process during login, although the commands from the last successful sync
+        still work. It is a warning, not a crash.
+        """
+        guild_id = self.settings.guild_id
+        try:
+            if guild_id:
+                guild = discord.Object(id=guild_id)
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+            else:
+                synced = await self.tree.sync()
+        except discord.HTTPException as exc:
+            log.warning(
+                "could not sync application commands%s: %s. The bot keeps running with "
+                "the commands from its last successful sync; code 50001 means it was "
+                "invited without the applications.commands scope, or that GUILD_ID "
+                "names a server it is not in.",
+                f" to guild {guild_id}" if guild_id else " globally",
+                _http_error_text(exc),
+            )
+            return
+        log.info("synced %d application commands", len(synced))
 
     async def on_ready(self) -> None:
         log.info(

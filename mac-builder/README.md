@@ -361,3 +361,7 @@ unconfigured manager names the variables to set.
 - `/plan` is bounded: at most `MAX_PLAN_CHARS` (60 000 characters) of material
   goes in, and at most `MANAGER_MAX_TOKENS` (default 4000) comes back. A plan that
   hits the output limit is labelled incomplete, not presented as whole.
+- A slash-command sync that fails (403 / code 50001 `Missing Access`, usually a bot
+  invited without the `applications.commands` scope, or a `GUILD_ID` it cannot see)
+  is a warning at startup, not a crash: the bot keeps running with the commands from
+  its last successful sync. Re-invite the bot with that scope to publish changes.
