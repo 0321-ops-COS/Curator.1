@@ -66,6 +66,7 @@ class JobQueue:
         self._queue: asyncio.Queue[Job] = asyncio.Queue(maxsize=max_pending)
         self._worker: asyncio.Task[None] | None = None
         self._current: Job | None = None
+        self._current_task: asyncio.Task[None] | None = None
         self._max_pending = max_pending
 
     @property
@@ -112,11 +113,52 @@ class JobQueue:
                 "kind": running.kind,
                 "title": running.title,
                 "started": running.started,
+                "elapsed": running.duration,
             }
             if running
             else None,
             "pending": self.pending_count,
         }
+
+    async def cancel(self, job_id: str) -> tuple[str, Job | None]:
+        """Cancel the running job or a waiting one by id.
+
+        Returns ('running' | 'queued' | 'unknown', job). Cancelling the running
+        job waits for its handler to unwind, so the caller can clean up after it
+        without racing it.
+        """
+        running = self._current
+        if running is not None and running.id == job_id:
+            task = self._current_task
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=30)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                except Exception:  # pragma: no cover - defensive
+                    log.exception("job %s failed while being cancelled", job_id)
+            return "running", running
+
+        # asyncio.Queue exposes no removal, so lift the waiting jobs out, skip
+        # the one asked for and put the rest back in the same order.
+        waiting: list[Job] = []
+        found: Job | None = None
+        while not self._queue.empty():
+            job = self._queue.get_nowait()
+            self._queue.task_done()
+            if found is None and job.id == job_id:
+                found = job
+                continue
+            waiting.append(job)
+        for job in waiting:
+            self._queue.put_nowait(job)
+        if found is None:
+            return "unknown", None
+        found.status = "cancelled"
+        found.finished = time.time()
+        log.info("queued job %s was cancelled", job_id)
+        return "queued", found
 
     async def _worker_loop(self) -> None:
         while True:
@@ -125,8 +167,13 @@ class JobQueue:
             job.status = "running"
             job.started = time.time()
             log.info("job %s (%s) started", job.id, job.kind)
+            worker = asyncio.current_task()
+            # The handler runs as its own task so /cancel can stop one job
+            # without touching the worker that owns the queue.
+            task = asyncio.create_task(self._handler(job), name=f"job-{job.id}")
+            self._current_task = task
             try:
-                await self._handler(job)
+                await task
                 # The handler is allowed to mark a job failed (a script exited
                 # non-zero); only a still-running job becomes done here.
                 if job.status == "running":
@@ -134,9 +181,12 @@ class JobQueue:
             except asyncio.CancelledError:
                 job.status = "cancelled"
                 job.finished = time.time()
-                self._current = None
-                self._queue.task_done()
-                raise
+                if worker is not None and worker.cancelling():
+                    # The bot is shutting down: stop the job and the loop.
+                    task.cancel()
+                    raise
+                # /cancel stopped this one job; the queue keeps its place.
+                log.info("job %s was cancelled", job.id)
             except Exception as exc:
                 job.status = "failed"
                 log.exception("job %s crashed", job.id)
@@ -149,6 +199,7 @@ class JobQueue:
                 job.finished = time.time()
             finally:
                 self._current = None
+                self._current_task = None
                 self._queue.task_done()
                 log.info(
                     "job %s finished with status %s in %.1fs",

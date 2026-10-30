@@ -423,6 +423,13 @@ class MacBuilderBot(discord.Client):
         )
         self.tree.add_command(
             app_commands.Command(
+                name="cancel",
+                description="Cancel the running job or a queued one by id",
+                callback=self.cmd_cancel,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
                 name="check",
                 description="Run swift test in HustlerCore (fast, queued)",
                 callback=self.cmd_check,
@@ -525,7 +532,11 @@ class MacBuilderBot(discord.Client):
         lines += [
             f"queue: {snapshot['pending']} waiting",
             f"running: {running.get('id', 'none')}"
-            + (f" ({running.get('kind')})" if running else ""),
+            + (
+                f" ({running.get('kind')}, {jobs.format_elapsed(running.get('elapsed'))})"
+                if running
+                else ""
+            ),
             f"authorized branch: {self.settings.authorized_branch}",
             f"manager: {'configured' if self.manager.enabled else 'not configured'}",
             f"status.sh exit: {code}",
@@ -540,6 +551,46 @@ class MacBuilderBot(discord.Client):
         ctx = self.settings.project
         text = ctx.summary() if ctx is not None else "Project context is not loaded."
         await interaction.response.send_message("```\n" + text + "\n```", ephemeral=True)
+
+    @app_commands.describe(job_id="Job id to cancel; empty cancels the running job")
+    async def cmd_cancel(
+        self, interaction: discord.Interaction, job_id: Optional[str] = None
+    ) -> None:
+        if not await self.require_allowed(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target = (job_id or "").strip()
+        if target.endswith(".log"):
+            target = target[:-4]
+        if not target:
+            snapshot = self.queue.snapshot()
+            running = snapshot.get("running") or {}
+            target = str(running.get("id") or "")
+            if not target:
+                await interaction.followup.send(
+                    "Nothing is running; pass a queued job id to cancel one.",
+                    ephemeral=True,
+                )
+                return
+        if not LOG_ID_RE.match(target):
+            await interaction.followup.send(
+                "That is not a job id; copy it from the job message or /logs.",
+                ephemeral=True,
+            )
+            return
+        state, job = await self.queue.cancel(target)
+        if job is None:
+            await interaction.followup.send(
+                f"No running or queued job `{target}`.", ephemeral=True
+            )
+            return
+        removed = await self.freebuff.cancel_job(target)
+        detail = f" and removed its {', '.join(removed)}" if removed else ""
+        await interaction.followup.send(
+            f"Cancelled the {state} job `{target}`{detail}. Nothing was pushed and "
+            "the branch was left in place.",
+            ephemeral=True,
+        )
 
     # ----------------------------------------------------------- fixed jobs
 
