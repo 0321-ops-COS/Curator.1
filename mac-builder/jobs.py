@@ -81,6 +81,11 @@ PostJob = Callable[[Job, bool, str], Awaitable[None]]
 PostReview = Callable[[ReviewOutcome], Awaitable[None]]
 
 
+def _project_block(settings: object) -> str:
+    ctx = getattr(settings, "project", None)
+    return ctx.prompt_block() if ctx is not None else ""
+
+
 def new_job_id() -> str:
     return time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(4)
 
@@ -443,6 +448,7 @@ class JobRunner:
                     test_state=test_state,
                     test_tail=test_tail,
                     round_number=env.round,
+                    project_context=_project_block(self.settings),
                 )
                 review = await self.manager.review(brief)
                 verdict = review.verdict

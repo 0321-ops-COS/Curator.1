@@ -86,6 +86,7 @@ class ReviewBrief:
     test_state: str
     test_tail: str
     round_number: int = 0
+    project_context: str = ""
 
 
 @dataclass
@@ -124,7 +125,8 @@ def build_review_messages(brief: ReviewBrief) -> list[dict[str, str]]:
     if len(brief.changed_files) > 120:
         changed += f", ... (+{len(brief.changed_files) - 120} more)"
     diff_text = brief.diff.strip() or "(no diff text; see diff line count and status)"
-    user = f"""TASK GIVEN TO THE BUILDER
+    project = f"PROJECT\n{brief.project_context.strip()}\n\n" if brief.project_context.strip() else ""
+    user = f"""{project}TASK GIVEN TO THE BUILDER
 {brief.task}
 
 REVIEW ROUND

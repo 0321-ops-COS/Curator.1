@@ -121,8 +121,11 @@ mkdir -p mac-builder/logs
 mac-builder/.venv/bin/python mac-builder/bot.py
 ```
 
-`REPO_DIR` defaults to the checkout containing `mac-builder/`; leave it empty
-for this layout. `WORKTREE_ROOT` defaults to `~/mac-builder-worktrees`, outside
+`REPO_DIR` is required and must be the checkout of the project Melisa builds.
+At startup the bot refuses to run, with a one-line message, if `REPO_DIR` has no
+`ios-app/project.yml` or `AUTHORIZED_BRANCH` is not a local branch there.
+`/project` shows which repo, branch and project she is on, and herself.
+`WORKTREE_ROOT` defaults to `~/mac-builder-worktrees`, outside
 the repository. Job worktrees stay there until you approve; rejected worktrees
 are kept for inspection.
 
@@ -133,7 +136,8 @@ are kept for inspection.
 | `DISCORD_TOKEN` | Bot token. Never commit it. |
 | `ALLOWED_USER_IDS` | Comma/space-separated Discord user IDs; required. |
 | `AUTHORIZED_BRANCH` | Base branch for tasks; never `main`/`master`. |
-| `REPO_DIR` | Git checkout to build; default is this repository. |
+| `REPO_DIR` | Required. Git checkout of the project to build. |
+| `PROJECT_NAME`, `BUILDER_NAME`, `BOT_NAME` | Labels shown by `/project` and given to the manager; default to the repo folder name, `Freebuff`, `Melisa`. |
 | `LOG_DIR` | Job logs; default `mac-builder/logs`. |
 | `WORKTREE_ROOT` | Per-task worktrees; default `~/mac-builder-worktrees`. |
 | `HUSTLERCORE_DIR` | Swift package path; default `ios-app/HustlerCore`. |
@@ -178,7 +182,8 @@ tail -f ~/Hustler/mac-builder/logs/launchd.log
 
 | Command | What it does |
 |---|---|
-| `/status` | Branch, git state, queue length, running job. Runs `status.sh` directly. |
+| `/project` | Which repo, branch and project Melisa is working on, plus her own repo. |
+| `/status` | Project, branch, git state, queue length, running job. Runs `status.sh` directly. |
 | `/check` | `swift test` in HustlerCore. Queued. |
 | `/test` | `xcodegen`, then `xcodebuild test` on one simulator, then shuts it down. Queued. |
 | `/build` | `xcodegen`, then unsigned `xcodebuild build`. Queued. |
