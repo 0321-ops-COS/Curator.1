@@ -333,7 +333,9 @@ class ReviewView(discord.ui.View):
             return
         message = f"Freebuff task {self.outcome.job.id}: {self.outcome.job.title}"[:200]
         try:
-            sha = await self.bot.freebuff.approve_and_push(env, message=message)
+            sha = await self.bot.freebuff.approve_and_push(
+                env, message=message, expected_snapshot=self.outcome.snapshot
+            )
         except (FreebuffError, ValueError) as exc:
             log.warning("approve failed for %s: %s", env.branch, exc)
             async with self._lock:

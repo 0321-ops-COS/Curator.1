@@ -101,6 +101,12 @@ class FreebuffError(RuntimeError):
     """A Freebuff job could not be started, supervised or collected."""
 
 
+def _snapshot_label(snapshot: str) -> str:
+    """Short 'commit/digest' form for a message, never the full value."""
+    head, _, digest = snapshot.partition(":")
+    return f"{head[:7]}/{digest[:8]}"
+
+
 @dataclass
 class TaskEnvironment:
     branch: str
@@ -119,6 +125,8 @@ class ChangeSet:
     changed_paths: list[str] = field(default_factory=list)
     status: str = ""
     head: str = ""
+    # HEAD plus a digest of the staged change set; see GitRepo.snapshot.
+    snapshot: str = ""
 
     @property
     def empty(self) -> bool:
@@ -271,6 +279,34 @@ class GitRepo:
         head = head_result.stdout.strip()
         status = await self._run(["status", "--porcelain=v1", "-z"], cwd=cwd)
         digest = hashlib.sha256(status.stdout.encode("utf-8", "replace")).hexdigest()
+        return f"{head}:{digest}"
+
+    async def snapshot(self, cwd: Path, base: str) -> str:
+        """HEAD plus a digest of what a push would carry.
+
+        Written for the Approve path: after staging, `--raw` lists the blob ids
+        of every changed path, so an edit made after the review changes the
+        digest even when the line count happens to match, and no diff text has
+        to be loaded on a small machine.
+        """
+        await self.stage_all(cwd)
+        head = await self.head(cwd)
+        result = await self._run(
+            [
+                "diff",
+                "--cached",
+                "--raw",
+                "--no-renames",
+                "--abbrev=40",
+                "--no-color",
+                "--no-ext-diff",
+                base,
+                "--",
+                ".",
+            ],
+            cwd=cwd,
+        )
+        digest = hashlib.sha256(result.stdout.encode("utf-8", "replace")).hexdigest()
         return f"{head}:{digest}"
 
     async def commit_all(self, cwd: Path, message: str) -> str:
@@ -575,17 +611,54 @@ class FreebuffRunner:
                 total,
             )
         head = await self.repo.head(env.worktree)
+        snapshot = await self.repo.snapshot(env.worktree, env.base_branch)
         return ChangeSet(
             diff=diff,
             diff_lines=total,
             changed_paths=paths,
             status=status,
             head=head,
+            snapshot=snapshot,
         )
 
-    async def approve_and_push(self, env: TaskEnvironment, *, message: str) -> str:
-        """Commit the worktree, push only its freebuff/* branch, clean up."""
+    async def approve_and_push(
+        self, env: TaskEnvironment, *, message: str, expected_snapshot: str
+    ) -> str:
+        """Push, but only the change a human approved.
+
+        The review is not the authorization; this is. The Freebuff session is
+        stopped before the final collect so nothing can touch the worktree while
+        it is re-checked, the staged change set must still match what the review
+        saw, and the hard rules run again. Any difference refuses the push and
+        leaves the worktree in place for inspection.
+        """
         branch = rules.validate_push_branch(env.branch)
+        if not expected_snapshot:
+            raise FreebuffError(
+                "no reviewed snapshot was recorded for this job; refusing to push"
+            )
+        await self.abort(env)
+        max_diff_lines = int(getattr(self.settings, "max_diff_lines"))
+        changes = await self.collect(env, max_diff_lines)
+        if changes.snapshot != expected_snapshot:
+            raise FreebuffError(
+                "the branch changed after the review "
+                f"(reviewed {_snapshot_label(expected_snapshot)}, "
+                f"now {_snapshot_label(changes.snapshot)}); nothing was pushed"
+            )
+        all_paths = sorted(
+            set(changes.changed_paths) | set(rules.changed_files_from_diff(changes.diff))
+        )
+        violations = rules.evaluate_change(
+            diff_lines=changes.diff_lines,
+            changed_paths=all_paths,
+            max_diff_lines=max_diff_lines,
+        )
+        if violations:
+            raise FreebuffError(
+                "the change no longer passes the hard rules; nothing was pushed.\n"
+                + rules.protected_summary(violations)
+            )
         await self.repo.stage_all(env.worktree)
         if await self.repo.status_paths(env.worktree):
             sha = await self.repo.commit_all(env.worktree, message)

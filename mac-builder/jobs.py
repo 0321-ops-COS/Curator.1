@@ -66,6 +66,8 @@ class ReviewOutcome:
     test_state: str
     diff_lines: int
     changed_files: tuple[str, ...]
+    # HEAD plus the staged-change digest the review saw; Approve re-checks it.
+    snapshot: str = ""
     violations: tuple[rules.RuleViolation, ...] = ()
 
 
@@ -492,6 +494,7 @@ class JobRunner:
                     test_state=test_state,
                     diff_lines=changes.diff_lines,
                     changed_files=tuple(all_paths),
+                    snapshot=changes.snapshot,
                 )
                 await self.post_review(outcome)
                 return verdict == "approve", f"review: {verdict}"
