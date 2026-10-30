@@ -60,7 +60,8 @@ mac-builder/
 ```
 
 Only one job runs at a time. `/check`, `/test`, `/build` and `/task` are queued;
-`/status` and `/logs` are read-only and answer immediately.
+`/status` and `/logs` are read-only and answer immediately. `/cancel` stops the
+running job or a waiting one, and the queue carries on with the next job.
 
 ## Prerequisites
 
@@ -185,7 +186,8 @@ tail -f ~/Hustler/mac-builder/logs/launchd.log
 | Command | What it does |
 |---|---|
 | `/project` | Which repo, branch and project Melisa is working on, plus her own repo. |
-| `/status` | Project, branch, git state, queue length, running job. Runs `status.sh` directly. |
+| `/status` | Project, branch, git state, queue length, running job and how long it has been going. Runs `status.sh` directly. |
+| `/cancel [job-id]` | Stops the running job, or one still waiting. The branch is kept; nothing is pushed. |
 | `/check` | `swift test` in HustlerCore. Queued. |
 | `/test` | `xcodegen`, then `xcodebuild test` on one simulator, then shuts it down. Queued. |
 | `/build` | `xcodegen`, then unsigned `xcodebuild build`. Queued. |
@@ -289,6 +291,9 @@ protected-path), branch validation and verdict forcing. `tests/test_jobs.py`
 checks that the Discord token and manager key never reach a script environment.
 `tests/test_bot_helpers.py` covers the `/logs` id lookup (including a path that
 is not an id) and message splitting.
+`tests/test_cancel.py` covers `/cancel`, cancelling a running or a waiting job,
+elapsed formatting, and that a cancelled job still posts a result without
+overwriting a review's `awaiting_review` or `blocked` status.
 `tests/test_manager.py` covers JSON extraction, proposal parsing, endpoint
 configuration and that a failed request names what failed. `tests/test_project_context.py`
 builds throwaway git repos to check the project context, credential redaction and
@@ -329,3 +334,6 @@ every startup refusal, and that the project block reaches the review prompt.
 - Raw terminal escape codes are kept in the job log; Discord tails strip ANSI.
 - `/status` runs a read-only git command outside the queue, so it answers even
   while a long build runs.
+- `/cancel` keeps the branch that Freebuff worked on, which is the record of what
+  it did, and removes only the worktree and the push guard. Nothing is pushed,
+  and a timed-out session is stopped before its changes are counted.
