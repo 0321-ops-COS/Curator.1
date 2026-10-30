@@ -145,6 +145,9 @@ class Settings:
     simulator_name: str
     swift_jobs: int
     xcodebuild_jobs: int
+    project_name: str = ""
+    builder_name: str = "Freebuff"
+    bot_name: str = "Melisa"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -213,6 +216,9 @@ class Settings:
             simulator_name=_env("SIMULATOR_NAME", "iPhone 16"),
             swift_jobs=_env_int("SWIFT_JOBS", 2),
             xcodebuild_jobs=_env_int("XCODEBUILD_JOBS", 2),
+            project_name=_env("PROJECT_NAME"),
+            builder_name=_env("BUILDER_NAME", "Freebuff"),
+            bot_name=_env("BOT_NAME", "Melisa"),
         )
         if settings.max_pending_jobs < 1:
             raise ConfigError("MAX_PENDING_JOBS must be at least 1")
