@@ -179,6 +179,57 @@ class OutcomeWordingTests(unittest.TestCase):
         self.assertFalse(manager.called)
         self.assertEqual(posted, [])
 
+    def test_a_timed_out_run_is_stopped_even_if_the_count_fails(self) -> None:
+        class Uncountable(FakeFreebuff):
+            def __init__(self) -> None:
+                super().__init__(
+                    ChangeSet(diff="", diff_lines=0, changed_paths=[]), "timeout"
+                )
+
+            async def collect(
+                self, env: TaskEnvironment, max_diff_lines: int
+            ) -> ChangeSet:
+                raise RuntimeError("git diff failed after the timeout")
+
+        posted: list[str] = []
+        freebuff = Uncountable()
+
+        async def post_review(outcome: jobs.ReviewOutcome) -> None:
+            posted.append("review")
+
+        async def post_job(job: jobs.Job, ok: bool, summary: str) -> None:
+            posted.append(summary)
+
+        runner = jobs.JobRunner(
+            SimpleNamespace(max_diff_lines=400, max_revise_rounds=0),
+            FakeManager(),
+            freebuff,
+            post_job=post_job,
+            post_review=post_review,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            job = jobs.Job(
+                id="20260101-000000-deadbeef",
+                kind="task",
+                title="task",
+                channel_id=1,
+                requester_id=2,
+                log_path=Path(tmp) / "job.log",
+                text="do the thing",
+            )
+            asyncio.run(runner.run(job))
+
+        self.assertTrue(freebuff.aborted, "the session must be stopped regardless")
+        self.assertEqual(len(posted), 1)
+        summary = posted[0]
+        self.assertIn("timed out", summary)
+        self.assertIn("freebuff/deadbeef", summary)
+        self.assertIn("session was stopped", summary)
+        self.assertIn("log: job.log".lower(), summary.lower())
+        self.assertIn("changes could not be counted", summary)
+        self.assertNotIn("crashed", summary)
+        self.assertEqual(job.status, "failed")
+
     def test_an_empty_run_is_not_reported_as_a_timeout(self) -> None:
         ok, summary, _, _ = self.run_blocked(
             ChangeSet(diff="", diff_lines=0, changed_paths=[]), reason="idle"

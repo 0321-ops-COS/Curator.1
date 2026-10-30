@@ -431,15 +431,23 @@ class JobRunner:
             self._running_env = env
             reason = await self.freebuff.wait_for_changes(env, job.log_path)
             if reason == "timeout":
-                changes = await self.freebuff.collect(
-                    env, int(getattr(self.settings, "max_diff_lines"))
-                )
+                # Stop the session before counting: collect() runs git and can
+                # raise, and a timed-out Freebuff must not keep running because
+                # the count failed.
                 await self.freebuff.abort(env)
-                detail = (
-                    f"{changes.diff_lines} changed lines, not reviewed"
-                    if not changes.empty
-                    else "no changes"
-                )
+                try:
+                    changes = await self.freebuff.collect(
+                        env, int(getattr(self.settings, "max_diff_lines"))
+                    )
+                except Exception:
+                    log.exception("could not count the changes for job %s", job.id)
+                    detail = "changes could not be counted"
+                else:
+                    detail = (
+                        f"{changes.diff_lines} changed lines, not reviewed"
+                        if not changes.empty
+                        else "no changes"
+                    )
                 return (
                     False,
                     f"Freebuff timed out on {env.branch} ({detail}); the session was "
