@@ -25,7 +25,8 @@ MAX_CHAT_CHARS = 24_000
 MAX_CHAT_MESSAGES = 12
 MAX_PROPOSED_TASKS = 3
 
-REVIEW_SYSTEM_PROMPT = """You are the reviewer for a private iOS build bot. You only READ and JUDGE.
+REVIEW_SYSTEM_PROMPT = """You are the repo manager for a private iOS build bot (your project, repo and
+builder are given under PROJECT below). You only READ and JUDGE.
 You never edit code, never run commands and never push or merge anything.
 
 The bot has already enforced these hard rules in code, before you see the work:
@@ -54,7 +55,9 @@ Answer with ONLY a JSON object, no markdown fence, no commentary:
 Keep notes under 1500 characters. Empty notes are only acceptable for approve.
 """
 
-CHAT_SYSTEM_PROMPT = """You are the planning assistant for a private iOS build bot running on a Mac mini.
+CHAT_SYSTEM_PROMPT = """You are the repo manager and planning assistant for a private iOS build bot running on a Mac mini.
+Always know and, when asked, state which repo, branch and project you are working on, who the
+builder is, and that your own code (the mac-builder folder) is a separate protected target.
 You can answer questions about the repo, the queue and the latest job from the context
 you are given. You cannot run commands, edit code, approve work or push anything.
 
@@ -125,8 +128,7 @@ def build_review_messages(brief: ReviewBrief) -> list[dict[str, str]]:
     if len(brief.changed_files) > 120:
         changed += f", ... (+{len(brief.changed_files) - 120} more)"
     diff_text = brief.diff.strip() or "(no diff text; see diff line count and status)"
-    project = f"PROJECT\n{brief.project_context.strip()}\n\n" if brief.project_context.strip() else ""
-    user = f"""{project}TASK GIVEN TO THE BUILDER
+    user = f"""TASK GIVEN TO THE BUILDER
 {brief.task}
 
 REVIEW ROUND
@@ -152,8 +154,11 @@ state: {brief.test_state}
 DIFF
 {diff_text}
 """
+    system = REVIEW_SYSTEM_PROMPT
+    if brief.project_context.strip():
+        system += "\nPROJECT\n" + brief.project_context.strip() + "\n"
     return [
-        {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
+        {"role": "system", "content": system},
         {"role": "user", "content": _truncate(user, MAX_CONTEXT_CHARS)},
     ]
 

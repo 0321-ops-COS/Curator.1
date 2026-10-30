@@ -106,12 +106,20 @@ class ReviewPromptTests(unittest.TestCase):
         )
 
     def test_project_context_reaches_the_reviewer(self) -> None:
-        user = build_review_messages(self.brief(project_context="Target repo: X"))[1]["content"]
-        self.assertTrue(user.startswith("PROJECT\nTarget repo: X"))
+        system, user = [
+            m["content"] for m in build_review_messages(self.brief(project_context="Target repo: X"))
+        ]
+        self.assertIn("PROJECT\nTarget repo: X", system)
+        self.assertTrue(user.startswith("TASK GIVEN TO THE BUILDER"))
 
     def test_no_project_section_when_absent(self) -> None:
-        user = build_review_messages(self.brief())[1]["content"]
-        self.assertTrue(user.startswith("TASK GIVEN TO THE BUILDER"))
+        system = build_review_messages(self.brief())[0]["content"]
+        self.assertNotIn("\nPROJECT\n", system)
+
+    def test_chat_prompt_makes_her_the_repo_manager(self) -> None:
+        import manager
+        self.assertIn("repo manager", manager.CHAT_SYSTEM_PROMPT)
+        self.assertIn("repo manager", manager.REVIEW_SYSTEM_PROMPT)
 
 
 if __name__ == "__main__":
