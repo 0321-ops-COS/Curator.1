@@ -6,6 +6,7 @@
 # Runtime output
 logs/*
 !logs/.gitkeep
+logs/plans/
 *.log
 
 # Local Python

@@ -18,10 +18,12 @@ from typing import Iterable, Sequence
 import httpx
 
 import rules
+from planner import PlanInputs
 
 log = logging.getLogger(__name__)
 
 MAX_CONTEXT_CHARS = 80_000
+MAX_PLAN_CHARS = 60_000
 MAX_CHAT_CHARS = 24_000
 MAX_CHAT_MESSAGES = 12
 MAX_PROPOSED_TASKS = 3
@@ -84,6 +86,34 @@ json block like:
 {"proposed_tasks": ["Short task one", "Short task two"]}
 ```
 Propose at most three. The owner must press a confirmation button before any task runs.
+"""
+
+
+PLAN_SYSTEM_PROMPT = """You are the repo manager for a private iOS build bot. Your project, repo and
+builder are given under PROJECT below. You write plans for the builder to execute.
+You never edit code, run commands, push or merge anything, and a plan request never
+builds anything.
+
+Write ONE markdown document with exactly these sections, in this order:
+# Task for Dan — <the goal in one line>
+## Evidence
+## Items (priority order)
+## Acceptance per item
+## Out of scope
+## Open decisions for the owner
+
+Rules:
+- In Evidence, label every claim `verified` (the material below shows it) or
+  `assumed` (you inferred it). Never state a guess as a fact and never say
+  something was run when the material does not show it.
+- Items are concrete, independent and most valuable first; one branch each. Name
+  the file or module it touches and the test that proves it.
+- Acceptance must be a check the owner can run, not a feeling: a command, an
+  observable refusal, a file that exists.
+- Use only paths that appear in the file map. If a path is not there, say the path
+  must be confirmed instead of inventing one.
+- Open decisions come last and are questions only the owner can answer.
+- No code block longer than 10 lines. Keep the whole document under 200 lines.
 """
 
 
@@ -206,6 +236,31 @@ DIFF
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": _truncate(user, MAX_CONTEXT_CHARS)},
+    ]
+
+
+def build_plan_messages(inputs: PlanInputs) -> list[dict[str, str]]:
+    recent = "\n".join(f"- {line}" for line in inputs.recent) or "- (no job logs yet)"
+    files = "\n".join(f"- {entry}" for entry in inputs.file_map) or "- (not listed)"
+    gaps = "\n".join(f"- {line}" for line in inputs.known_gaps) or "- (none recorded)"
+    user = f"""GOAL
+{inputs.goal}
+
+RECENT JOBS AND ERROR LINES (newest first, from LOG_DIR)
+{recent}
+
+FILE MAP (top level of the target checkout)
+{files}
+
+KNOWN GAPS (from the README)
+{gaps}
+"""
+    system = PLAN_SYSTEM_PROMPT
+    if inputs.project_block.strip():
+        system += "\nPROJECT\n" + inputs.project_block.strip() + "\n"
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": _truncate(user, MAX_PLAN_CHARS)},
     ]
 
 
@@ -361,6 +416,13 @@ class Manager:
                 error="unavailable",
             )
         return parse_review(text)
+
+    async def plan(self, inputs: PlanInputs) -> str:
+        """Write a plan document. Text only: no tools, no jobs, no edits."""
+        text = await self._complete(build_plan_messages(inputs), max_tokens=1800)
+        if not text.strip():
+            raise ManagerUnavailable("manager returned an empty plan")
+        return text.strip()
 
     async def chat(self, messages: Sequence[dict[str, str]], context: str) -> ChatReply:
         trimmed: list[dict[str, str]] = []
