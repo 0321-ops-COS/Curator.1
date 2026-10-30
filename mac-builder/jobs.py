@@ -346,6 +346,11 @@ class JobRunner:
         # not overwrite the state the owner still has to act on.
         if job.status not in ("awaiting_review", "blocked"):
             job.status = "done" if ok else "failed"
+        # _post_review can leave a note the result post must keep; never fold in
+        # the same text twice.
+        note = job.summary
+        if note and note not in summary:
+            summary = f"{summary}\n\n{note}" if summary else note
         job.summary = summary
         self._last_summary = f"{job.kind} {job.id}: {summary}"
         try:

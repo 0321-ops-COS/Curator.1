@@ -774,7 +774,10 @@ class MacBuilderBot(discord.Client):
             return
         embed = discord.Embed(
             title=("✅ " if ok else "❌ ") + f"{job.kind} finished",
-            description=tail_text(summary, max_lines=14, max_chars=1800) or "(no output)",
+            # job.summary can carry a note from a review that never reached
+            # Discord; the summary argument alone would not include it.
+            description=tail_text(job.summary or summary, max_lines=14, max_chars=1800)
+            or "(no output)",
             color=discord.Color.green() if ok else discord.Color.red(),
         )
         embed.add_field(name="Job", value=f"`{job.id}`", inline=True)
@@ -798,7 +801,6 @@ class MacBuilderBot(discord.Client):
             log.warning("no Discord channel for review of %s", outcome.job.id)
             return
         if outcome.verdict == "blocked":
-            outcome.job.status = "blocked"
             embed = discord.Embed(
                 title="⛔ Blocked by rules — manager not called",
                 description=outcome.notes[:3500] or "The change violated a hard rule.",
@@ -808,7 +810,8 @@ class MacBuilderBot(discord.Client):
             embed.add_field(name="Changed lines", value=str(outcome.diff_lines), inline=True)
             embed.add_field(name="Log", value=f"`{outcome.job.log_path.name}`", inline=True)
             embed.set_footer(text="Nothing can be pushed from a blocked change.")
-            await channel.send(embed=embed)
+            if await self._send_review(channel, outcome, embed=embed):
+                outcome.job.status = "blocked"
             return
 
         titles = {
@@ -842,8 +845,38 @@ class MacBuilderBot(discord.Client):
                 else "A check or test failed, so there is no Approve button."
             )
         )
-        outcome.job.status = "awaiting_review"
-        await channel.send(embed=embed, view=ReviewView(self, outcome))
+        view = ReviewView(self, outcome)
+        if await self._send_review(channel, outcome, embed=embed, view=view):
+            outcome.job.status = "awaiting_review"
+
+    async def _send_review(
+        self,
+        channel: discord.abc.Messageable,
+        outcome: ReviewOutcome,
+        *,
+        embed: discord.Embed,
+        view: discord.ui.View | None = None,
+    ) -> bool:
+        """Post the review. A Discord failure must not hide the result too."""
+        try:
+            await channel.send(embed=embed, view=view)
+        except Exception as exc:
+            # Exception, not BaseException: a cancellation still propagates.
+            log.exception("could not post review for job %s", outcome.job.id)
+            self._note_review_failure(outcome, exc)
+            return False
+        return True
+
+    def _note_review_failure(self, outcome: ReviewOutcome, exc: BaseException) -> None:
+        """Say on the job that a review is waiting but never reached Discord."""
+        branch = outcome.environment.branch if outcome.environment else "?"
+        note = (
+            f"Review could not be posted to Discord ({type(exc).__name__}). "
+            f"Branch {branch} and its worktree are kept. "
+            "There is no Approve button; inspect the branch or re-run."
+        )
+        existing = (outcome.job.summary or "").strip()
+        outcome.job.summary = f"{existing}\n\n{note}" if existing else note
 
 
 def main() -> int:
