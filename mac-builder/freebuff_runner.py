@@ -673,6 +673,26 @@ class FreebuffRunner:
         self._active = None
         return sha
 
+    async def cancel_job(self, job_id: str) -> list[str]:
+        """Stop a cancelled job's session and remove what it left behind.
+
+        The branch stays: it was never pushed, and it is the only record of what
+        Freebuff did. The worktree and the push guard are disposable.
+        """
+        env = self._active
+        if env is not None and env.worktree.name == job_id:
+            await self.abort(env)
+        removed: list[str] = []
+        worktree = self.worktree_root / job_id
+        if worktree.exists():
+            await self.repo.remove_worktree(worktree)
+            removed.append("worktree")
+        guard = self.worktree_root / f".guard-{job_id}"
+        if guard.exists():
+            shutil.rmtree(guard, ignore_errors=True)
+            removed.append("push guard")
+        return removed
+
     def _remove_guard(self, env: TaskEnvironment) -> None:
         if env.guard_dir is None:
             return

@@ -149,5 +149,63 @@ class ProjectCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("status.sh exit: 0", text)
 
 
+class FakeCancelQueue:
+    def __init__(self, state: str, job: object) -> None:
+        self.state = state
+        self.job = job
+        self.cancelled: list[str] = []
+
+    def snapshot(self) -> dict[str, object]:
+        return {"running": {"id": "20260101-000000-deadbeef", "kind": "task"}, "pending": 0}
+
+    async def cancel(self, job_id: str) -> tuple[str, object]:
+        self.cancelled.append(job_id)
+        return self.state, self.job
+
+
+class FakeCancelFreebuff:
+    def __init__(self) -> None:
+        self.cleaned: list[str] = []
+
+    async def cancel_job(self, job_id: str) -> list[str]:
+        self.cleaned.append(job_id)
+        return ["worktree", "push guard"]
+
+
+class CancelCommandTests(unittest.IsolatedAsyncioTestCase):
+    def bot_with(self, queue: object, freebuff: object) -> "bot.MacBuilderBot":
+        instance = bot.MacBuilderBot.__new__(bot.MacBuilderBot)
+        instance.settings = replace(settings(), allowed_user_ids=frozenset({42}))
+        instance.queue = queue
+        instance.freebuff = freebuff
+        return instance
+
+    async def test_cancel_stops_the_running_job_and_cleans_up(self) -> None:
+        job = SimpleNamespace(id="20260101-000000-deadbeef")
+        queue = FakeCancelQueue("running", job)
+        freebuff = FakeCancelFreebuff()
+        interaction = FakeInteraction()
+
+        await self.bot_with(queue, freebuff).cmd_cancel(interaction, None)
+
+        text = interaction.followup.sent[-1]
+        self.assertIn("Cancelled the running job", text)
+        self.assertIn("worktree", text)
+        self.assertIn("Nothing was pushed", text)
+        self.assertEqual(queue.cancelled, ["20260101-000000-deadbeef"])
+        self.assertEqual(freebuff.cleaned, ["20260101-000000-deadbeef"])
+
+    async def test_cancel_refuses_an_id_that_is_not_a_job_id(self) -> None:
+        queue = FakeCancelQueue("running", SimpleNamespace(id="x"))
+        interaction = FakeInteraction()
+
+        await self.bot_with(queue, FakeCancelFreebuff()).cmd_cancel(
+            interaction, "../../etc/passwd"
+        )
+
+        self.assertIn("not a job id", interaction.followup.sent[-1])
+        self.assertEqual(queue.cancelled, [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -101,6 +101,20 @@ def strip_ansi(text: str) -> str:
     return ANSI_RE.sub("", text)
 
 
+def format_elapsed(seconds: float | None) -> str:
+    """Compact elapsed time for Discord: 9s, 4m12s, 1h02m."""
+    if seconds is None:
+        return "-"
+    total = int(max(0.0, seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
 def tail_text(text: str, *, max_lines: int = 60, max_chars: int = 3500) -> str:
     lines = strip_ansi(text).replace("\r", "").splitlines()
     if len(lines) > max_lines:
@@ -333,7 +347,19 @@ class JobRunner:
             summary = f"{job.kind} failed: {exc}"
             log.warning("job %s: %s", job.id, summary)
         except asyncio.CancelledError:
-            job.status = "cancelled"
+            # A cancel is an outcome the owner must still see, but a review that
+            # already posted owns the status: its embed is the record.
+            if job.status == "running":
+                job.status = "cancelled"
+                job.summary = (
+                    f"{job.kind} was cancelled; nothing was pushed and the "
+                    "branch was left in place."
+                )
+                self._last_summary = f"{job.kind} {job.id}: cancelled"
+                try:
+                    await self.post_job(job, False, job.summary)
+                except Exception:  # pragma: no cover - Discord can fail independently
+                    log.exception("could not post the cancellation for job %s", job.id)
             raise
         except Exception as exc:  # pragma: no cover - defensive
             log.exception("job %s crashed", job.id)
@@ -405,10 +431,19 @@ class JobRunner:
             self._running_env = env
             reason = await self.freebuff.wait_for_changes(env, job.log_path)
             if reason == "timeout":
+                changes = await self.freebuff.collect(
+                    env, int(getattr(self.settings, "max_diff_lines"))
+                )
                 await self.freebuff.abort(env)
+                detail = (
+                    f"{changes.diff_lines} changed lines, not reviewed"
+                    if not changes.empty
+                    else "no changes"
+                )
                 return (
                     False,
-                    f"Freebuff timed out on {env.branch}; the session was stopped. Log: {job.log_path.name}",
+                    f"Freebuff timed out on {env.branch} ({detail}); the session was "
+                    f"stopped. Log: {job.log_path.name}",
                 )
 
             while True:
@@ -418,7 +453,8 @@ class JobRunner:
                     await self.freebuff.abort(env)
                     return (
                         False,
-                        f"Freebuff made no changes on {env.branch} ({reason}). Log: {job.log_path.name}",
+                        f"Freebuff finished on {env.branch} without changes ({reason}); "
+                        f"nothing to review. Log: {job.log_path.name}",
                     )
 
                 # Union the status paths with the paths named by the diff so a

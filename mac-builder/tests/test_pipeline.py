@@ -14,8 +14,9 @@ from freebuff_runner import ChangeSet, TaskEnvironment  # noqa: E402
 
 
 class FakeFreebuff:
-    def __init__(self, changes: ChangeSet) -> None:
+    def __init__(self, changes: ChangeSet, reason: str = "idle") -> None:
         self.changes = changes
+        self.reason = reason
         self.aborted = False
 
     async def start_task(self, *, job_id: str, task_text: str, log_path: Path) -> TaskEnvironment:
@@ -27,7 +28,7 @@ class FakeFreebuff:
         )
 
     async def wait_for_changes(self, env: TaskEnvironment, log_path: Path) -> str:
-        return "idle"
+        return self.reason
 
     async def collect(self, env: TaskEnvironment, max_diff_lines: int) -> ChangeSet:
         return self.changes
@@ -46,9 +47,11 @@ class FakeManager:
 
 
 class BlockedDiffTests(unittest.TestCase):
-    def run_blocked(self, changes: ChangeSet) -> tuple[bool, str, list[jobs.ReviewOutcome], FakeManager]:
+    def run_blocked(
+        self, changes: ChangeSet, reason: str = "idle"
+    ) -> tuple[bool, str, list[jobs.ReviewOutcome], FakeManager]:
         manager = FakeManager()
-        freebuff = FakeFreebuff(changes)
+        freebuff = FakeFreebuff(changes, reason)
         posted: list[jobs.ReviewOutcome] = []
 
         async def post_review(outcome: jobs.ReviewOutcome) -> None:
@@ -152,6 +155,38 @@ class ReviewStatusTests(unittest.TestCase):
             asyncio.run(runner.run(job))
             self.assertEqual(len(posted), 1)
         self.assertEqual(job.status, "awaiting_review")
+
+
+class OutcomeWordingTests(unittest.TestCase):
+    """A timeout and an empty run must not read as the same thing."""
+
+    # Reuse the harness without re-running the blocked-diff tests.
+    run_blocked = BlockedDiffTests.run_blocked
+
+    def test_a_timeout_says_so_and_counts_the_unreviewed_lines(self) -> None:
+        ok, summary, posted, manager = self.run_blocked(
+            ChangeSet(
+                diff="+let x = 1\n",
+                diff_lines=1,
+                changed_paths=["ios-app/RootView.swift"],
+            ),
+            reason="timeout",
+        )
+        self.assertFalse(ok)
+        self.assertIn("timed out", summary)
+        self.assertIn("1 changed lines, not reviewed", summary)
+        self.assertNotIn("without changes", summary)
+        self.assertFalse(manager.called)
+        self.assertEqual(posted, [])
+
+    def test_an_empty_run_is_not_reported_as_a_timeout(self) -> None:
+        ok, summary, _, _ = self.run_blocked(
+            ChangeSet(diff="", diff_lines=0, changed_paths=[]), reason="idle"
+        )
+        self.assertFalse(ok)
+        self.assertIn("without changes", summary)
+        self.assertIn("idle", summary)
+        self.assertNotIn("timed out", summary)
 
 
 if __name__ == "__main__":
