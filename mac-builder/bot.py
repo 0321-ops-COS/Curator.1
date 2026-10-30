@@ -373,6 +373,7 @@ class ReviewView(discord.ui.View):
             if interaction.message is not None:
                 await interaction.message.edit(view=self)
             return
+        self.outcome.job.status = "approved"
         await self._finish(
             interaction,
             f"✅ Approved by <@{interaction.user.id}>. Pushed `{env.branch}` at `{sha[:7]}`. "
@@ -391,6 +392,7 @@ class ReviewView(discord.ui.View):
                 return
             self.resolved = True
         await interaction.response.defer()
+        self.outcome.job.status = "rejected"
         branch = self.outcome.environment.branch if self.outcome.environment else "none"
         await self._finish(
             interaction,
@@ -762,6 +764,10 @@ class MacBuilderBot(discord.Client):
         return channel  # type: ignore[return-value]
 
     async def _post_job_result(self, job: Job, ok: bool, summary: str) -> None:
+        if job.status in ("awaiting_review", "blocked"):
+            # The review embed is this task's result; a second embed would only
+            # repeat it with less information.
+            return
         channel = self._target_channel(job.channel_id)
         if channel is None:
             log.warning("no Discord channel for job %s", job.id)
@@ -792,6 +798,7 @@ class MacBuilderBot(discord.Client):
             log.warning("no Discord channel for review of %s", outcome.job.id)
             return
         if outcome.verdict == "blocked":
+            outcome.job.status = "blocked"
             embed = discord.Embed(
                 title="⛔ Blocked by rules — manager not called",
                 description=outcome.notes[:3500] or "The change violated a hard rule.",
@@ -835,6 +842,7 @@ class MacBuilderBot(discord.Client):
                 else "A check or test failed, so there is no Approve button."
             )
         )
+        outcome.job.status = "awaiting_review"
         await channel.send(embed=embed, view=ReviewView(self, outcome))
 
 

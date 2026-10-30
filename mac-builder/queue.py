@@ -30,7 +30,9 @@ class Job:
     created: float = field(default_factory=time.time)
     started: float | None = None
     finished: float | None = None
-    status: str = "queued"  # queued | running | done | failed | cancelled
+    # queued | running | awaiting_review | approved | rejected | blocked |
+    # done | failed | cancelled
+    status: str = "queued"
     summary: str = ""
 
     @property
