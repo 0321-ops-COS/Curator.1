@@ -106,5 +106,53 @@ class BlockedDiffTests(unittest.TestCase):
         self.assertIn("ios-app/project.yml", posted[0].notes)
 
 
+class ReviewStatusTests(unittest.TestCase):
+    """The queue must not overwrite the state the owner still has to act on."""
+
+    class ReviewingManager:
+        async def review(self, brief: object) -> object:
+            return SimpleNamespace(verdict="approve", notes="Fine.")
+
+    def test_a_job_awaiting_review_keeps_that_status(self) -> None:
+        posted: list[jobs.ReviewOutcome] = []
+
+        async def post_review(outcome: jobs.ReviewOutcome) -> None:
+            outcome.job.status = "awaiting_review"
+            posted.append(outcome)
+
+        async def post_job(job: jobs.Job, ok: bool, summary: str) -> None:
+            return None
+
+        freebuff = FakeFreebuff(
+            ChangeSet(
+                diff="+let x = 1\n",
+                diff_lines=1,
+                changed_paths=["ios-app/RootView.swift"],
+            )
+        )
+        # No revision rounds: the fake stages cannot pass, so the revise path
+        # would need a followup; this test only cares about the final status.
+        runner = jobs.JobRunner(
+            SimpleNamespace(max_diff_lines=400, max_revise_rounds=0),
+            self.ReviewingManager(),
+            freebuff,
+            post_job=post_job,
+            post_review=post_review,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            job = jobs.Job(
+                id="20260101-000000-deadbeef",
+                kind="task",
+                title="task",
+                channel_id=1,
+                requester_id=2,
+                log_path=Path(tmp) / "job.log",
+                text="do the thing",
+            )
+            asyncio.run(runner.run(job))
+            self.assertEqual(len(posted), 1)
+        self.assertEqual(job.status, "awaiting_review")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -336,7 +336,10 @@ class JobRunner:
             job.finished = time.time()
             self._running_env = None
 
-        job.status = "done" if ok else "failed"
+        # A review sets its own status (awaiting_review, blocked); the queue must
+        # not overwrite the state the owner still has to act on.
+        if job.status not in ("awaiting_review", "blocked"):
+            job.status = "done" if ok else "failed"
         job.summary = summary
         self._last_summary = f"{job.kind} {job.id}: {summary}"
         try:
