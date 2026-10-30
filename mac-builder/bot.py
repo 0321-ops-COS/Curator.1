@@ -14,7 +14,7 @@ import re
 import shlex
 import sys
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +40,7 @@ from discord import app_commands  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
 import jobs  # noqa: E402
+import project_context  # noqa: E402
 import rules  # noqa: E402
 from freebuff_runner import FreebuffError, FreebuffRunner  # noqa: E402
 from jobs import Job, ReviewOutcome, tail_text  # noqa: E402
@@ -148,6 +149,8 @@ class Settings:
     project_name: str = ""
     builder_name: str = "Freebuff"
     bot_name: str = "Melisa"
+    # Filled in by main() after the startup preflight; None before that.
+    project: "project_context.ProjectContext | None" = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -794,6 +797,22 @@ def main() -> int:
     except (ConfigError, ValueError) as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 1
+
+    ctx = project_context.build_context(
+        target_dir=settings.repo_dir,
+        authorized_branch=settings.authorized_branch,
+        self_dir=REPO_ROOT,
+        project_name=settings.project_name,
+        builder_name=settings.builder_name,
+        bot_name=settings.bot_name,
+    )
+    try:
+        project_context.preflight(ctx)
+    except project_context.PreflightError as exc:
+        print(f"Preflight failed: {exc}", file=sys.stderr)
+        return 1
+    settings = replace(settings, project=ctx)
+    log.info("project context:\n%s", ctx.summary())
 
     settings.log_dir.mkdir(parents=True, exist_ok=True)
     settings.worktree_root.mkdir(parents=True, exist_ok=True)

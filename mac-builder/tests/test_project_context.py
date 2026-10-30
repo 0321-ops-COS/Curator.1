@@ -134,5 +134,61 @@ class ContextTests(unittest.TestCase):
         self.assertIn("protected", block)
 
 
+class PreflightTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name).resolve()
+        self.bot = make_repo(self.root, "curator", files=("mac-builder/bot.py",))
+        self.app = make_repo(
+            self.root, "Hustler", branch="freebuff/abc", files=("ios-app/project.yml",)
+        )
+
+    def ctx(self, target: Path, *, self_dir: Path | None = None) -> pc.ProjectContext:
+        return pc.build_context(
+            target_dir=target,
+            authorized_branch="freebuff/abc",
+            self_dir=self_dir or self.bot,
+        )
+
+    def test_a_target_with_the_project_and_the_branch_passes(self) -> None:
+        pc.preflight(self.ctx(self.app))
+
+    def test_her_own_checkout_passes_when_it_is_the_project(self) -> None:
+        # The Mac layout: mac-builder/ inside the Hustler checkout. Sharing the
+        # checkout is normal and must not be refused.
+        repo = make_repo(
+            self.root,
+            "Hustler-mac",
+            branch="freebuff/abc",
+            files=("ios-app/project.yml", "mac-builder/bot.py"),
+        )
+        ctx = self.ctx(repo, self_dir=repo)
+        self.assertTrue(ctx.target_is_self)
+        pc.preflight(ctx)
+        self.assertNotIn("nothing to build", ctx.prompt_block())
+        self.assertNotIn("nothing to build", ctx.summary())
+
+    def test_refuses_a_target_without_the_project(self) -> None:
+        with self.assertRaises(pc.PreflightError) as caught:
+            pc.preflight(self.ctx(self.bot))
+        message = str(caught.exception)
+        self.assertNotIn("\n", message)
+        self.assertIn("ios-app/project.yml", message)
+        self.assertIn("point REPO_DIR", message)
+
+    def test_refuses_an_authorized_branch_that_is_not_local(self) -> None:
+        ctx = pc.build_context(
+            target_dir=self.app,
+            authorized_branch="freebuff/not-there",
+            self_dir=self.bot,
+        )
+        with self.assertRaises(pc.PreflightError) as caught:
+            pc.preflight(ctx)
+        message = str(caught.exception)
+        self.assertNotIn("\n", message)
+        self.assertIn("not a local branch", message)
+
+
 if __name__ == "__main__":
     unittest.main()
