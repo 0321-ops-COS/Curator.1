@@ -274,9 +274,15 @@ python3 -m py_compile bot.py queue.py jobs.py rules.py manager.py project_contex
 bash -n scripts/*.sh
 ```
 
+Discovery is automatic: every `tests/test_*.py` runs, so a new file needs no
+registration. All three commands must exit 0 before a push. `discover -s tests -t .`
+is the form that also works from the repository root.
+
 `tests/test_rules.py` covers the deliberately bad diffs (oversized and
 protected-path), branch validation and verdict forcing. `tests/test_jobs.py`
 checks that the Discord token and manager key never reach a script environment.
+`tests/test_bot_helpers.py` covers the `/logs` id lookup (including a path that
+is not an id) and message splitting.
 `tests/test_manager.py` covers JSON extraction, proposal parsing, endpoint
 configuration and that a failed request names what failed. `tests/test_project_context.py`
 builds throwaway git repos to check the project context, credential redaction and
