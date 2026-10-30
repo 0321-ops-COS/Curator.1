@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -10,6 +11,9 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from manager import (  # noqa: E402
+    DEFAULT_MAX_TOKENS,
+    MAX_CONTEXT_CHARS,
+    MAX_LOG_TAIL_CHARS,
     Manager,
     ReviewBrief,
     build_review_messages,
@@ -120,6 +124,23 @@ class PromptTests(unittest.TestCase):
         self.assertIn("revise", system)
         self.assertIn("ask_user", system)
 
+    def test_long_log_tails_are_cut_before_the_diff(self) -> None:
+        runaway = "\n".join(f"log line {i}" for i in range(20000))
+        messages = build_review_messages(
+            brief(
+                check_tail=runaway,
+                test_tail=runaway,
+                diff="diff --git a/a b/a\n+let last = 1\n",
+            )
+        )
+        user = messages[1]["content"]
+        # The diff survives whole and the tails are the part that shrinks.
+        self.assertTrue(user.rstrip().endswith("+let last = 1"))
+        self.assertNotIn("log line 0", user)
+        self.assertLess(len(user), MAX_CONTEXT_CHARS // 2)
+        check_section = user.split("CHECK", 1)[1].split("TEST", 1)[0]
+        self.assertLessEqual(len(check_section), MAX_LOG_TAIL_CHARS + 300)
+
 
 class ManagerConfigTests(unittest.TestCase):
     def test_disabled_without_all_settings(self) -> None:
@@ -182,6 +203,125 @@ class ManagerFailureTests(unittest.IsolatedAsyncioTestCase):
         response = httpx.Response(503, request=request)
         error = httpx.HTTPStatusError("boom", request=request, response=response)
         self.assertIn("HTTP 503", describe_error(error))
+
+
+class ManagerRetryTests(unittest.IsolatedAsyncioTestCase):
+    """Retry only what the same request can survive: 5xx, 429 and timeouts."""
+
+    def manager(
+        self, handler: Callable[[httpx.Request], httpx.Response], **kwargs: object
+    ) -> tuple[Manager, list[int]]:
+        calls: list[int] = []
+
+        def counting(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return handler(request)
+
+        instance = Manager(
+            api_base="https://example.test/v1",
+            api_key="k",
+            model="m",
+            retry_delay_seconds=0.0,
+            **kwargs,  # type: ignore[arg-type]
+        )
+        instance._client = httpx.AsyncClient(transport=httpx.MockTransport(counting))
+        return instance, calls
+
+    async def review_with(
+        self, handler: Callable[[httpx.Request], httpx.Response]
+    ) -> tuple[object, list[int]]:
+        instance, calls = self.manager(handler)
+        try:
+            return await instance.review(brief()), calls
+        finally:
+            await instance.close()
+
+    async def test_a_5xx_is_retried_once_then_given_up(self) -> None:
+        result, calls = await self.review_with(
+            lambda request: httpx.Response(503, request=request)
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertIn("HTTP 503", result.notes)  # type: ignore[attr-defined]
+
+    async def test_a_5xx_can_succeed_on_the_second_attempt(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if len(calls_seen) == 0:
+                calls_seen.append(1)
+                return httpx.Response(500, request=request)
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": '{"verdict": "approve", "notes": "ok"}'}}]},
+                request=request,
+            )
+
+        calls_seen: list[int] = []
+        result, _ = await self.review_with(handler)
+        self.assertEqual(result.verdict, "approve")  # type: ignore[attr-defined]
+
+    async def test_a_429_is_retried(self) -> None:
+        result, calls = await self.review_with(
+            lambda request: httpx.Response(429, request=request)
+        )
+        self.assertEqual(len(calls), 2)
+        self.assertIn("HTTP 429", result.notes)  # type: ignore[attr-defined]
+
+    async def test_a_timeout_is_retried(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("", request=request)
+
+        result, calls = await self.review_with(handler)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("ReadTimeout", result.notes)  # type: ignore[attr-defined]
+
+    async def test_a_401_is_not_retried(self) -> None:
+        result, calls = await self.review_with(
+            lambda request: httpx.Response(401, request=request)
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertIn("HTTP 401", result.notes)  # type: ignore[attr-defined]
+
+    async def test_a_malformed_payload_is_not_retried(self) -> None:
+        result, calls = await self.review_with(
+            lambda request: httpx.Response(200, json={"choices": []}, request=request)
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertIn("IndexError", result.notes)  # type: ignore[attr-defined]
+
+
+class ManagerTokenBudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def payload_for(self, **kwargs: object) -> dict[str, object]:
+        seen: list[dict[str, object]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "hello"}}]},
+                request=request,
+            )
+
+        instance = Manager(
+            api_base="https://example.test/v1",
+            api_key="k",
+            model="m",
+            retry_delay_seconds=0.0,
+            **kwargs,  # type: ignore[arg-type]
+        )
+        instance._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            await instance.chat([{"role": "user", "content": "hi"}], "")
+        finally:
+            await instance.close()
+        return seen[0]
+
+    async def test_the_default_budget_leaves_room_for_reasoning(self) -> None:
+        self.assertGreaterEqual(DEFAULT_MAX_TOKENS, 4000)
+        payload = await self.payload_for()
+        self.assertEqual(payload["max_tokens"], DEFAULT_MAX_TOKENS)
+
+    async def test_an_explicit_budget_reaches_the_payload(self) -> None:
+        payload = await self.payload_for(max_tokens=6000)
+        self.assertEqual(payload["max_tokens"], 6000)
 
 
 if __name__ == "__main__":

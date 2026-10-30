@@ -127,6 +127,7 @@ class Settings:
     manager_api_key: str
     manager_model: str
     manager_timeout_seconds: float
+    manager_max_tokens: int
     max_diff_lines: int
     max_revise_rounds: int
     max_pending_jobs: int
@@ -200,6 +201,7 @@ class Settings:
             manager_api_key=_env("MANAGER_API_KEY"),
             manager_model=_env("MANAGER_MODEL"),
             manager_timeout_seconds=_env_float("MANAGER_TIMEOUT_SECONDS", 120.0),
+            manager_max_tokens=_env_int("MANAGER_MAX_TOKENS", 4000),
             max_diff_lines=max_diff_lines,
             max_revise_rounds=max_revise,
             max_pending_jobs=_env_int("MAX_PENDING_JOBS", 10),
@@ -225,6 +227,8 @@ class Settings:
         )
         if settings.max_pending_jobs < 1:
             raise ConfigError("MAX_PENDING_JOBS must be at least 1")
+        if settings.manager_max_tokens < 1:
+            raise ConfigError("MANAGER_MAX_TOKENS must be at least 1")
         return settings
 
 
@@ -385,6 +389,7 @@ class MacBuilderBot(discord.Client):
             api_key=settings.manager_api_key,
             model=settings.manager_model,
             timeout_seconds=settings.manager_timeout_seconds,
+            max_tokens=settings.manager_max_tokens,
         )
         self.freebuff = FreebuffRunner(settings)
         self.runner = jobs.JobRunner(

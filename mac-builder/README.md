@@ -237,6 +237,12 @@ arguments (never Discord input).
 - Must answer with
   `{"verdict": "approve" | "revise" | "ask_user", "notes": "..."}`.
   Unparseable replies become `ask_user`; the raw reply is kept for inspection.
+- `MANAGER_MAX_TOKENS` (default 4000) is the reply budget. Reasoning models
+  such as Gemini flash spend tokens thinking, so a small budget comes back as an
+  empty or truncated reply. A 5xx, a 429 or a timeout is retried once; a 401, a
+  404 or a malformed body is not.
+- Log tails in the review prompt are capped at 2500 characters each, so a
+  runaway build log cannot push the diff out of the context budget.
 - `revise` sends concrete notes back to Freebuff, re-runs the checks and reviews
   again, up to `MAX_REVISE_ROUNDS` (2). After that the decision goes to you.
 - `approve` and `ask_user` post an embed with **Approve** / **Reject** buttons.
