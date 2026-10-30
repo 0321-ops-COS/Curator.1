@@ -3,6 +3,9 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from typing import Callable
+
+import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -10,6 +13,7 @@ from manager import (  # noqa: E402
     Manager,
     ReviewBrief,
     build_review_messages,
+    describe_error,
     parse_chat_reply,
     parse_review,
 )
@@ -135,6 +139,49 @@ class ManagerConfigTests(unittest.TestCase):
             model="m",
         )
         self.assertEqual(manager.endpoint, "https://example.test/v1/chat/completions")
+
+
+class ManagerFailureTests(unittest.IsolatedAsyncioTestCase):
+    """A failed request must name what failed, even when the message is empty."""
+
+    def manager(self, handler: Callable[[httpx.Request], httpx.Response]) -> Manager:
+        instance = Manager(api_base="https://example.test/v1", api_key="k", model="m")
+        instance._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        return instance
+
+    async def notes_for(self, handler: Callable[[httpx.Request], httpx.Response]) -> str:
+        instance = self.manager(handler)
+        try:
+            return (await instance.review(brief())).notes
+        finally:
+            await instance.close()
+
+    async def test_the_http_status_and_the_class_are_reported(self) -> None:
+        notes = await self.notes_for(lambda request: httpx.Response(401, request=request))
+        self.assertIn("HTTP 401", notes)
+        self.assertIn("HTTPStatusError", notes)
+
+    async def test_an_empty_exception_message_still_names_the_error(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ReadTimeout("", request=request)
+
+        notes = await self.notes_for(handler)
+        self.assertIn("ReadTimeout", notes)
+        self.assertNotIn("failed: .", notes)
+
+    async def test_a_malformed_payload_names_the_error(self) -> None:
+        notes = await self.notes_for(
+            lambda request: httpx.Response(200, json={"choices": []}, request=request)
+        )
+        self.assertIn("IndexError", notes)
+
+    def test_describe_error_covers_status_and_blank_messages(self) -> None:
+        self.assertEqual(describe_error(None), "unknown error")
+        self.assertEqual(describe_error(ValueError("")), "ValueError")
+        request = httpx.Request("POST", "https://example.test/v1/chat/completions")
+        response = httpx.Response(503, request=request)
+        error = httpx.HTTPStatusError("boom", request=request, response=response)
+        self.assertIn("HTTP 503", describe_error(error))
 
 
 if __name__ == "__main__":

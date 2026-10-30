@@ -49,6 +49,7 @@ mac-builder/
   queue.py            single-worker asyncio FIFO queue
   jobs.py             fixed-script execution + the Freebuff review pipeline
   manager.py          OpenAI-compatible review and planning chat (no tools)
+  project_context.py  which repo/branch/project she builds, plus herself
   rules.py            hard guardrails enforced in code
   freebuff_runner.py  branch + git worktree + tmux + diff collection + push
   scripts/            check.sh test.sh build.sh status.sh
@@ -122,7 +123,11 @@ mac-builder/.venv/bin/python mac-builder/bot.py
 ```
 
 `REPO_DIR` defaults to the checkout containing `mac-builder/`; leave it empty
-for this layout. `WORKTREE_ROOT` defaults to `~/mac-builder-worktrees`, outside
+when the bot lives inside the project she builds, as she does on the Mac
+(`~/Desktop/Hustler`). At startup she refuses, in one line, a target without
+`ios-app/project.yml` or without `AUTHORIZED_BRANCH` as a local branch there.
+`/project` shows which repo, branch and project she is on, and herself.
+`WORKTREE_ROOT` defaults to `~/mac-builder-worktrees`, outside
 the repository. Job worktrees stay there until you approve; rejected worktrees
 are kept for inspection.
 
@@ -133,7 +138,8 @@ are kept for inspection.
 | `DISCORD_TOKEN` | Bot token. Never commit it. |
 | `ALLOWED_USER_IDS` | Comma/space-separated Discord user IDs; required. |
 | `AUTHORIZED_BRANCH` | Base branch for tasks; never `main`/`master`. |
-| `REPO_DIR` | Git checkout to build; default is this repository. |
+| `REPO_DIR` | Git checkout to build; default is the one containing `mac-builder/`. |
+| `PROJECT_NAME`, `BUILDER_NAME`, `BOT_NAME` | Labels for `/project` and the manager; default to the target folder name, `Freebuff`, `Melisa`. |
 | `LOG_DIR` | Job logs; default `mac-builder/logs`. |
 | `WORKTREE_ROOT` | Per-task worktrees; default `~/mac-builder-worktrees`. |
 | `HUSTLERCORE_DIR` | Swift package path; default `ios-app/HustlerCore`. |
@@ -178,7 +184,8 @@ tail -f ~/Hustler/mac-builder/logs/launchd.log
 
 | Command | What it does |
 |---|---|
-| `/status` | Branch, git state, queue length, running job. Runs `status.sh` directly. |
+| `/project` | Which repo, branch and project Melisa is working on, plus her own repo. |
+| `/status` | Project, branch, git state, queue length, running job. Runs `status.sh` directly. |
 | `/check` | `swift test` in HustlerCore. Queued. |
 | `/test` | `xcodegen`, then `xcodebuild test` on one simulator, then shuts it down. Queued. |
 | `/build` | `xcodegen`, then unsigned `xcodebuild build`. Queued. |
@@ -263,15 +270,19 @@ The guardrails and parsing are testable without a Mac, Discord or a model:
 ```bash
 cd mac-builder
 python3 -m unittest discover -s tests -v
-python3 -m py_compile bot.py queue.py jobs.py rules.py manager.py freebuff_runner.py
+python3 -m py_compile bot.py queue.py jobs.py rules.py manager.py project_context.py freebuff_runner.py
 bash -n scripts/*.sh
 ```
 
 `tests/test_rules.py` covers the deliberately bad diffs (oversized and
 protected-path), branch validation and verdict forcing. `tests/test_jobs.py`
 checks that the Discord token and manager key never reach a script environment.
-`tests/test_manager.py` covers JSON extraction, proposal parsing and endpoint
-configuration.
+`tests/test_manager.py` covers JSON extraction, proposal parsing, endpoint
+configuration and that a failed request names what failed. `tests/test_project_context.py`
+builds throwaway git repos to check the project context, credential redaction and
+every startup refusal, and that the project block reaches the review prompt.
+`tests/test_bot_config.py` keeps `REPO_DIR` defaulted and covers the labels;
+`tests/test_project_commands.py` calls `/project` and `/status` without Discord.
 
 ## What is not verified here
 
