@@ -416,6 +416,13 @@ class MacBuilderBot(discord.Client):
         )
         self.tree.add_command(
             app_commands.Command(
+                name="project",
+                description="Show which repo, branch and project I work on, and my own code",
+                callback=self.cmd_project,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
                 name="check",
                 description="Run swift test in HustlerCore (fast, queued)",
                 callback=self.cmd_check,
@@ -511,7 +518,11 @@ class MacBuilderBot(discord.Client):
         code, output = await jobs.probe_status(self.settings)
         snapshot = self.queue.snapshot()
         running = snapshot.get("running") or {}
-        lines = [
+        ctx = self.settings.project
+        lines: list[str] = []
+        if ctx is not None:
+            lines += [f"project: {ctx.project_name}", f"target repo: {ctx.target_remote}"]
+        lines += [
             f"queue: {snapshot['pending']} waiting",
             f"running: {running.get('id', 'none')}"
             + (f" ({running.get('kind')})" if running else ""),
@@ -522,6 +533,13 @@ class MacBuilderBot(discord.Client):
             tail_text(output, max_lines=40, max_chars=1400),
         ]
         await interaction.followup.send("```\n" + "\n".join(lines) + "\n```", ephemeral=True)
+
+    async def cmd_project(self, interaction: discord.Interaction) -> None:
+        if not await self.require_allowed(interaction):
+            return
+        ctx = self.settings.project
+        text = ctx.summary() if ctx is not None else "Project context is not loaded."
+        await interaction.response.send_message("```\n" + text + "\n```", ephemeral=True)
 
     # ----------------------------------------------------------- fixed jobs
 
