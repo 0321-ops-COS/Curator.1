@@ -22,9 +22,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Sequence
 
+import questions
 import rules
 from freebuff_runner import FreebuffError, FreebuffRunner, TaskEnvironment
-from manager import Manager, ReviewBrief
+from manager import (
+    Manager,
+    ManagerRateLimited,
+    ManagerUnavailable,
+    ReviewBrief,
+    escalation_reason,
+)
 
 # The repository layout requires queue.py, which shadows the standard library
 # module of the same name. Load it under a private module name so libraries
@@ -85,6 +92,26 @@ class ExecOutcome:
 
 PostJob = Callable[[Job, bool, str], Awaitable[None]]
 PostReview = Callable[[ReviewOutcome], Awaitable[None]]
+PostQuestion = Callable[[Job, questions.Question], Awaitable[bool]]
+PostPane = Callable[[Job, str], Awaitable[bool]]
+# A manager line for the owner: an auto-answer record or a suggestion.
+PostNote = Callable[[Job, str], Awaitable[None]]
+# Reasons from the runner that mean a question box stopped the job.
+QUESTION_REASONS = ("question-timeout", "question-failed")
+# How long advice may take before it is dropped: the question is already posted,
+# so a late line would arrive after the owner had answered.
+SUGGESTION_WINDOW_SECONDS = 15.0
+DIFF_STAT_TIMEOUT_SECONDS = 30.0
+MAX_DIFF_STAT_LINES = 60
+
+
+def _write_job_log(job: Job, text: str) -> None:
+    """One auditable line in the job log."""
+    try:
+        with job.log_path.open("a", encoding="utf-8") as handle:
+            handle.write("\n" + text.rstrip() + "\n")
+    except OSError:  # pragma: no cover - a log write must never stop a job
+        log.debug("could not write to the log for job %s", job.id)
 
 
 def _project_block(settings: object) -> str:
@@ -327,16 +354,30 @@ class JobRunner:
         *,
         post_job: PostJob,
         post_review: PostReview,
+        post_question: PostQuestion | None = None,
+        post_pane: PostPane | None = None,
+        post_note: PostNote | None = None,
     ) -> None:
         self.settings = settings
         self.manager = manager
         self.freebuff = freebuff
         self.post_job = post_job
         self.post_review = post_review
+        self.post_question = post_question
+        self.post_pane = post_pane
+        self.post_note = post_note
         self._last_log: Path | None = None
         self._last_summary = ""
         self._last_diff_excerpt = ""
         self._running_env: TaskEnvironment | None = None
+        # Auto-answers used by each job (QUESTION_AUTO_ANSWER_MAX) and the
+        # moment the manager may be called again after a 429 or a timeout.
+        self._auto_answers: dict[str, int] = {}
+        self._manager_cooldown_until = 0.0
+        # The last parsed answer, reused for a suggestion instead of paying for
+        # a second request for the same question.
+        self._last_answer: tuple[questions.Question, object] | None = None
+        self._suggestion_task: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------------ run
 
@@ -443,7 +484,14 @@ class JobRunner:
                 kind=job.kind,
             )
             self._running_env = env
-            reason = await self.freebuff.wait_for_changes(env, job.log_path)
+            reason = await self.freebuff.wait_for_changes(
+                env,
+                job.log_path,
+                on_question=self._question_handler(job),
+                on_pane=self._pane_handler(job),
+            )
+            if reason in QUESTION_REASONS:
+                return await self._question_stopped(job, env, reason)
             if reason == "timeout":
                 # Stop the session before counting: collect() runs git and can
                 # raise, and a timed-out Freebuff must not keep running because
@@ -543,8 +591,12 @@ class JobRunner:
                         env,
                         build_followup_text(job.text, notes, dan=job.kind == "dan"),
                         job.log_path,
+                        on_question=self._question_handler(job),
+                        on_pane=self._pane_handler(job),
                     )
                     reason = followup_reason
+                    if followup_reason in QUESTION_REASONS:
+                        return await self._question_stopped(job, env, followup_reason)
                     if followup_reason == "timeout":
                         await self.freebuff.abort(env)
                         return (
@@ -584,6 +636,318 @@ class JobRunner:
             if env is not None:
                 await self.freebuff.abort(env)
             return False, f"Freebuff job failed: {exc}"
+
+    # ------------------------------------------------------------- questions
+
+    def _question_handler(self, job: Job):
+        """The callback the runner uses while a question box is open."""
+
+        async def handle(question: questions.Question) -> str | None:
+            return await self._on_question(job, question)
+
+        return handle
+
+    def _pane_handler(self, job: Job):
+        """The callback for a box that did not parse: show its pane, never idle."""
+
+        async def handle(tail: str) -> None:
+            if self.post_pane is None:
+                return
+            try:
+                await self.post_pane(job, tail)
+            except Exception:  # Discord must not kill the job
+                log.exception("could not post the pane tail for job %s", job.id)
+
+        return handle
+
+    async def _question_stopped(
+        self, job: Job, env: TaskEnvironment, reason: str
+    ) -> tuple[bool, str]:
+        """Esc was sent and the job is over: nothing of it is reviewed."""
+        wait = int(float(getattr(self.settings, "question_wait_seconds", 1800)))
+        await self.freebuff.abort(env)
+        log_file = f"Log: {job.log_path.name}"
+        if reason == "question-failed":
+            return (
+                False,
+                "Freebuff's question box did not show the answer where its own pane "
+                "said it should be, so it was dismissed with Esc and the job was "
+                f"stopped on {env.branch}; nothing is reviewed. The pane after every "
+                f"key is in the log when QUESTION_DEBUG=1. {log_file}",
+            )
+        return (
+            False,
+            f"Freebuff asked a question that went unanswered for {wait}s "
+            f"(QUESTION_WAIT_SECONDS). It was dismissed with Esc and the job was "
+            f"stopped on {env.branch}; nothing is reviewed. {log_file}",
+        )
+
+    async def _on_question(self, job: Job, question: questions.Question) -> str | None:
+        """Auto-answer when the manager is sure, otherwise post it for the owner.
+
+        None means the owner has to answer with /answer; the runner then waits
+        for at most QUESTION_WAIT_SECONDS.
+        """
+        auto = await self._auto_answer(job, question)
+        if auto is not None:
+            _log_separator(job, "question auto-answered")
+            log.info("job %s: auto-answered %r with %r", job.id, question.text, auto)
+            return auto
+        if self.post_question is None:
+            log.warning("job %s: no Discord channel for its question", job.id)
+            return None
+        try:
+            posted = await self.post_question(job, question)
+        except Exception:  # Discord can fail without stopping the job
+            log.exception("could not post the question for job %s", job.id)
+            posted = False
+        if not posted:
+            log.warning(
+                "job %s: the question did not reach Discord; it will expire", job.id
+            )
+            return None
+        # The question is already posted: advice may follow it, and that advice
+        # can never hold the question up, block /answer or reach the pane.
+        self._schedule_suggestion(job, question)
+        return None
+
+    @staticmethod
+    def _option_lines(question: questions.Question) -> list[str]:
+        return [
+            f"{option.label} — {option.description}"
+            if option.description
+            else option.label
+            for option in question.options
+        ]
+
+    def _manager_name(self) -> str:
+        """The manager's name from BOT_NAME, never a hardcoded one."""
+        return str(getattr(self.settings, "bot_name", "") or "the manager")
+
+    def _start_cooldown(self, job: Job, exc: BaseException) -> None:
+        seconds = float(
+            getattr(self.settings, "question_manager_cooldown_seconds", 30.0)
+        )
+        self._manager_cooldown_until = time.monotonic() + max(0.0, seconds)
+        log.warning(
+            "job %s: manager throttled (%s); no manager calls for %.0fs",
+            job.id,
+            exc,
+            seconds,
+        )
+        _write_job_log(
+            job,
+            f"[manager throttled for {int(seconds)}s; questions go to the owner]",
+        )
+
+    async def _current_diff_stat(self) -> str:
+        """A short tail of the running job's diff stat; empty when there is none."""
+        env = self._running_env
+        if env is None:
+            return ""
+        outcome = await _exec(
+            ["git", "-C", str(env.worktree), "--no-pager", "diff", "--stat"],
+            cwd=env.worktree,
+            env=build_script_env(self.settings, env.worktree),
+            timeout=DIFF_STAT_TIMEOUT_SECONDS,
+            max_tail=MAX_DIFF_STAT_LINES,
+        )
+        return "\n".join(outcome.tail)
+
+    async def _audit_answer(
+        self, job: Job, question: questions.Question, answer: str, result: object
+    ) -> None:
+        """Record which option the manager took and why, in Discord and the log."""
+        number = questions.option_number(answer, len(question.options))
+        if number is not None:
+            what = f"option {number}"
+        else:
+            what = f'"{questions.redact(answer[:120])}"'
+        confidence = getattr(result, "confidence", "low")
+        reason = questions.redact(str(getattr(result, "reason", "") or "")[:200])
+        line = f"{self._manager_name()} answered {what} (confidence {confidence})"
+        if reason:
+            line += f": {reason}"
+        _write_job_log(job, line)
+        if self.post_note is None:
+            return
+        try:
+            await self.post_note(job, line)
+        except Exception:  # Discord must not kill the job
+            log.exception("could not post the auto-answer note for job %s", job.id)
+
+    async def _auto_answer(self, job: Job, question: questions.Question) -> str | None:
+        """The manager's high-confidence answer, or None when a human must answer.
+
+        Off unless QUESTION_AUTO_ANSWER=1. The order is fixed: the code gate in
+        ``manager.escalation_reason`` on the question and the options, then the
+        cooldown and the per-job cap, then the manager call, then the same gate
+        on the chosen answer, then the audit post, and only then is the answer
+        returned to be typed. Every answer has to clear the gate whatever the
+        confidence, at most QUESTION_AUTO_ANSWER_MAX answers are taken per job,
+        and a 429 or a timeout stops manager calls for
+        QUESTION_MANAGER_COOLDOWN_SECONDS. A malformed reply or anything below
+        high confidence falls back to the owner instead of guessing.
+        """
+        self._last_answer = None
+        if not bool(getattr(self.settings, "question_auto_answer", False)):
+            return None
+        if not getattr(self.manager, "enabled", False):
+            return None
+        options = self._option_lines(question)
+        # The question side of the gate runs first, before the cooldown and the
+        # cap: an escalated question never spends a manager call and is never
+        # counted as throttled.
+        reason = escalation_reason(question.text, *options)
+        if reason:
+            log.info(
+                "job %s: question %d escalated (%s); asking the owner",
+                job.id,
+                question.number,
+                reason,
+            )
+            _write_job_log(
+                job,
+                f"[question {question.number} is the owner's call: it mentions "
+                f"{reason!r}]",
+            )
+            return None
+        if time.monotonic() < self._manager_cooldown_until:
+            log.info("job %s: manager cooldown is on; asking the owner", job.id)
+            return None
+        cap = int(getattr(self.settings, "question_auto_answer_max", 3))
+        used = self._auto_answers.get(job.id, 0)
+        if used >= cap:
+            log.info("job %s: auto-answer cap reached; asking the owner", job.id)
+            _write_job_log(
+                job,
+                f"[auto-answer cap of {cap} reached; question {question.number} "
+                "goes to the owner]",
+            )
+            return None
+        try:
+            result = await self.manager.answer_question(
+                task=job.text,
+                text=question.text,
+                options=options,
+                plan=str(getattr(job, "plan", "") or ""),
+                diff_stat=await self._current_diff_stat(),
+                number=question.number,
+                total=question.total,
+            )
+        except ManagerRateLimited as exc:
+            self._start_cooldown(job, exc)
+            return None
+        except ManagerUnavailable as exc:
+            log.warning("job %s: auto-answer unavailable: %s", job.id, exc)
+            return None
+        except Exception as exc:  # an endpoint failure must never kill the job
+            log.warning("job %s: auto-answer failed: %s", job.id, exc)
+            return None
+        self._last_answer = (question, result)
+        if not getattr(result, "ok", True):
+            log.info("job %s: auto-answer did not parse; asking the owner", job.id)
+            return None
+        if not getattr(result, "confident", False):
+            log.info(
+                "job %s: auto-answer was %s confidence; asking the owner",
+                job.id,
+                getattr(result, "confidence", "low"),
+            )
+            return None
+        answer = questions.validate_answer(result.answer, question.labels)
+        if answer is None:
+            log.info("job %s: the auto-answer did not fit the box; asking the owner", job.id)
+            return None
+        chosen = question.labels[int(answer) - 1] if answer.isdigit() else answer
+        reason = escalation_reason(chosen)
+        if reason:
+            log.info(
+                "job %s: answer to question %d escalated (%s); asking the owner",
+                job.id,
+                question.number,
+                reason,
+            )
+            _write_job_log(
+                job,
+                f"[the manager's answer to question {question.number} is the "
+                f"owner's call: it mentions {reason!r}]",
+            )
+            return None
+        self._auto_answers[job.id] = used + 1
+        await self._audit_answer(job, question, answer, result)
+        return answer
+
+    def _schedule_suggestion(self, job: Job, question: questions.Question) -> None:
+        """Start the advice line in the background: it never delays anything."""
+        if not bool(getattr(self.settings, "question_suggest", False)):
+            return
+        if not getattr(self.manager, "enabled", False):
+            return
+        self._suggestion_task = asyncio.get_running_loop().create_task(
+            self._suggest(job, question)
+        )
+
+    async def _suggest(self, job: Job, question: questions.Question) -> None:
+        """Post advice for the owner, once, inside a short window.
+
+        Never an answer: the line goes to Discord and the job log only, is
+        never returned to the runner and is never typed into the pane.
+        """
+        if time.monotonic() < self._manager_cooldown_until:
+            return
+        cached = self._last_answer
+        try:
+            if cached is not None and cached[0] is question:
+                result = cached[1]
+            else:
+                result = await asyncio.wait_for(
+                    self.manager.answer_question(
+                        task=job.text,
+                        text=question.text,
+                        options=self._option_lines(question),
+                        plan=str(getattr(job, "plan", "") or ""),
+                        diff_stat=await self._current_diff_stat(),
+                        number=question.number,
+                        total=question.total,
+                    ),
+                    timeout=SUGGESTION_WINDOW_SECONDS,
+                )
+        except (asyncio.TimeoutError, ManagerUnavailable) as exc:
+            log.info("job %s: no suggestion: %s", job.id, exc)
+            return
+        except Exception as exc:
+            log.warning("job %s: suggestion failed: %s", job.id, exc)
+            return
+        line = self._suggestion_line(question, result)
+        if line is None or self.post_note is None:
+            return
+        _write_job_log(job, line)
+        try:
+            await self.post_note(job, line)
+        except Exception:  # Discord must not kill the job
+            log.exception("could not post a suggestion for job %s", job.id)
+
+    def _suggestion_line(
+        self, question: questions.Question, result: object
+    ) -> str | None:
+        """'<BOT_NAME> suggests option N: ... (suggestion only, you decide)'."""
+        if not getattr(result, "ok", True):
+            return None
+        raw = str(getattr(result, "answer", "") or "")
+        answer = questions.validate_answer(raw, question.labels)
+        if answer is None:
+            return None
+        number = questions.option_number(answer, len(question.options))
+        if number is not None:
+            what = f"option {number}"
+        else:
+            what = f'"{questions.redact(answer[:120])}"'
+        reason = questions.redact(str(getattr(result, "reason", "") or "")[:200])
+        line = f"{self._manager_name()} suggests {what}"
+        if reason:
+            line += f": {reason}"
+        return f"{line} (suggestion only, you decide)"
 
     async def _run_stage(
         self, job: Job, env: TaskEnvironment, kind: str

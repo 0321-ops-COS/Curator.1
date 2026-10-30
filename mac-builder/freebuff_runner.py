@@ -28,7 +28,9 @@ import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Awaitable, Callable
 
+import questions
 import rules
 
 log = logging.getLogger(__name__)
@@ -36,6 +38,19 @@ log = logging.getLogger(__name__)
 GIT_TIMEOUT = 120
 TMUX_TIMEOUT = 30
 TMUX_SOCKET = "macbuilder"
+# capture-pane history for question detection; the log already holds the run.
+# A tall box plus its ad strip must fit, so this is generous.
+PANE_LINES = 120
+# Repaint time after every key sent to a question box.
+KEY_DELAY_SECONDS = 0.4
+# How much of the pane QUESTION_DEBUG writes to the log after every key.
+DEBUG_PANE_CHARS = 4000
+# Steps in one box: each question costs a few, and a box that never settles is
+# a failure, not a reason to keep typing.
+MAX_BOX_STEPS = 24
+# Enter, read the chosen row, correct, read again.
+CHOICE_ATTEMPTS = 3
+SUBMIT_ATTEMPTS = 3
 # A dan branch always starts from the fetched remote, never a stale local main.
 DAN_BASE_BRANCH = "origin/main"
 
@@ -383,6 +398,14 @@ class GitRepo:
         return True
 
 
+def _arrow_keys(start: int | None, target: int) -> list[str]:
+    """Arrow presses that take the focus from `start` to `target`."""
+    if start is None or start == target:
+        return []
+    delta = target - start
+    return ["Down"] * delta if delta > 0 else ["Up"] * (-delta)
+
+
 class FreebuffRunner:
     """Supervises the Freebuff process for one job at a time."""
 
@@ -395,6 +418,13 @@ class FreebuffRunner:
         self.repo = GitRepo(self.repo_dir, self.git_bin)
         self._self_git: GitRepo | None = None
         self._active: TaskEnvironment | None = None
+        # The one question open right now, and the future /answer resolves.
+        self._question: questions.Question | None = None
+        self._answer_future: asyncio.Future[str] | None = None
+        # Boxes already driven to Submit, so one that lingers is not asked twice,
+        # and the last titled box that did not parse (posted once, never idled).
+        self._handled_boxes: set[str] = set()
+        self._broken_box = ""
         # The tmux server inherits this environment, so the builder never sees
         # the bot's Discord or manager credentials. Everything else (PATH,
         # SSH_AUTH_SOCK, Freebuff's own configuration) is preserved.
@@ -627,7 +657,7 @@ class FreebuffRunner:
             "-o",
             "-t",
             env.session,
-            f"cat >> {shlex.quote(str(log_path))}",
+            "cat >> " + shlex.quote(str(log_path)),
         )
         if pipe.code != 0:
             raise FreebuffError(f"could not capture tmux output: {pipe.stderr.strip()}")
@@ -665,17 +695,452 @@ class FreebuffRunner:
         if sent.code != 0:
             raise FreebuffError(f"could not submit task text: {sent.stderr.strip()}")
 
-    async def wait_for_changes(
-        self, env: TaskEnvironment, log_path: Path, *, timeout: float | None = None
+    async def _pane(self, session: str) -> str:
+        """The visible pane, read only for question detection."""
+        result = await self._tmux(
+            "capture-pane", "-p", "-J", "-t", session, "-S", f"-{PANE_LINES}"
+        )
+        return result.stdout if result.code == 0 else ""
+
+    @property
+    def pending_question(self) -> questions.Question | None:
+        """The question /answer resolves, or None when nothing is waiting."""
+        return self._question
+
+    @property
+    def _question_debug(self) -> bool:
+        return bool(getattr(self.settings, "question_debug", False))
+
+    async def _read_box(self, session: str) -> questions.QuestionBox | None:
+        """Capture the pane and parse the box, if there is one."""
+        return questions.parse_pane(await self._pane(session))
+
+    async def _press(
+        self, session: str, key: str, log_path: Path | None = None
+    ) -> None:
+        """One key, then the pane again: QUESTION_DEBUG writes every step."""
+        result = await self._tmux("send-keys", "-t", session, key)
+        if result.code != 0:
+            raise FreebuffError(
+                f"could not send {key} to the question box: {result.stderr.strip()}"
+            )
+        await asyncio.sleep(KEY_DELAY_SECONDS)
+        if self._question_debug and log_path is not None:
+            pane = await self._pane(session)
+            self._append_log(
+                log_path,
+                f"\n[pane after {key}]\n{questions.redact(pane[-DEBUG_PANE_CHARS:])}\n",
+            )
+
+    async def _dismiss(self, session: str, log_path: Path | None = None) -> None:
+        """Esc, best effort: a session that is already gone needs no dismissal."""
+        try:
+            await self._press(session, "Escape", log_path)
+        except FreebuffError as exc:
+            log.warning("could not dismiss the question box: %s", exc)
+
+    async def submit_answer(self, text: str) -> bool:
+        """Hand an answer to the waiting job. False when nothing is waiting."""
+        future = self._answer_future
+        answer = (text or "").strip()
+        if self._question is None or future is None or future.done() or not answer:
+            return False
+        future.set_result(answer)
+        return True
+
+    async def _wait_unparsed(
+        self,
+        env: TaskEnvironment,
+        box: questions.QuestionBox,
+        log_path: Path,
+        on_pane: Callable[[str], Awaitable[None]] | None,
     ) -> str:
-        """Return 'idle', 'exited' or 'timeout'.
+        """A titled box that did not parse: show it, never idle, never guess.
+
+        The sanitized pane tail goes to the job log and to Discord once per
+        distinct box so the owner is never blind, then the wait is capped like a
+        question: Esc and 'expired' when it stays unreadable. 'again' means the
+        box changed and the caller should look at it once more.
+        """
+        cap = float(getattr(self.settings, "question_wait_seconds", 1800.0))
+        poll = max(0.05, float(getattr(self.settings, "freebuff_poll_seconds", 10)))
+        if box.key != self._broken_box:
+            self._broken_box = box.key
+            tail = box.sanitized_tail()
+            self._append_log(
+                log_path,
+                "\n[question box found but no questions parsed; pane follows]\n"
+                f"{tail}\n",
+            )
+            log.warning("a question box did not parse; the pane tail is in the log")
+            if on_pane is not None:
+                try:
+                    await on_pane(tail)
+                except Exception:  # Discord must not kill the job
+                    log.exception("could not post the unparsed question box")
+        deadline = time.monotonic() + max(1.0, cap)
+        while time.monotonic() < deadline:
+            await asyncio.sleep(poll)
+            current = await self._read_box(env.session)
+            if current is None:
+                return "done"
+            if current.survey:
+                await self._dismiss(env.session, log_path)
+                return "done"
+            if current.questions or current.key != box.key:
+                return "again"
+        await self._dismiss(env.session, log_path)
+        return "expired"
+
+    async def _drive_box(
+        self,
+        env: TaskEnvironment,
+        box: questions.QuestionBox,
+        log_path: Path,
+        on_question: Callable[[questions.Question], Awaitable[str | None]] | None,
+        on_pane: Callable[[str], Awaitable[None]] | None,
+    ) -> str:
+        """Own one box until Submit: 'done', 'expired' or 'failed'.
+
+        Every key is followed by a fresh capture, and a state that is not the
+        expected one sends Esc and fails the job instead of guessing. Nothing is
+        answered by counting keystrokes from an assumed starting point.
+        """
+        session = env.session
+        for _step in range(MAX_BOX_STEPS):
+            if box is None:
+                self._append_log(log_path, "\n[question box closed]\n")
+                return "done"
+            if box.survey:
+                self._append_log(log_path, "\n[survey popup dismissed with Esc]\n")
+                await self._dismiss(session, log_path)
+                return "done"
+            if not box.questions:
+                outcome = await self._wait_unparsed(env, box, log_path, on_pane)
+                if outcome != "again":
+                    return outcome
+                box = await self._read_box(session)
+                continue
+            question = box.active
+            if question is None or box.all_answered:
+                if await self._submit(session, log_path):
+                    return "done"
+                self._append_log(
+                    log_path,
+                    f"\n[Submit was not confirmed within {SUBMIT_ATTEMPTS} attempts; "
+                    "sending Esc and failing the job]\n",
+                )
+                await self._dismiss(session, log_path)
+                return "failed"
+            answer = await self._ask(env, box, question, log_path, on_question)
+            if answer is None:
+                self._append_log(
+                    log_path,
+                    f"\n[question {question.number} was not answered; sending Esc]\n",
+                )
+                await self._dismiss(session, log_path)
+                return "expired"
+            outcome = await self._apply(session, question, answer, log_path)
+            if outcome == "closed":
+                self._append_log(
+                    log_path,
+                    f"\n[the box closed while question {question.number} was being "
+                    "answered; the answer was not confirmed]\n",
+                )
+                return "failed"
+            if outcome != "ok":
+                self._append_log(
+                    log_path,
+                    f"\n[the answer for question {question.number} was not confirmed "
+                    f"on the pane; sending Esc and failing the job]\n",
+                )
+                await self._dismiss(session, log_path)
+                return "failed"
+            box = await self._read_box(session)
+        self._append_log(
+            log_path,
+            f"\n[the box did not settle within {MAX_BOX_STEPS} steps; sending Esc]\n",
+        )
+        await self._dismiss(session, log_path)
+        return "failed"
+
+    async def _ask(
+        self,
+        env: TaskEnvironment,
+        box: questions.QuestionBox,
+        question: questions.Question,
+        log_path: Path,
+        on_question: Callable[[questions.Question], Awaitable[str | None]] | None,
+    ) -> str | None:
+        """Offer question `n` of `total` and wait for one answer.
+
+        None means no answer arrived (QUESTION_WAIT_SECONDS expired) or the job
+        was stopped while the question was open: the caller dismisses the box
+        and the job fails. /answer resolves the future through submit_answer;
+        the callback may also answer directly (the manager's high-confidence
+        auto-answer) and skip the wait.
+        """
+        if self._question is not None:
+            # One box, one owner: a second question must never steal /answer.
+            self._append_log(
+                log_path,
+                f"\n[question {question.number} arrived while question "
+                f"{self._question.number} was still open; refusing it]\n",
+            )
+            return None
+        cap = max(1.0, float(getattr(self.settings, "question_wait_seconds", 1800.0)))
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        self._question = question
+        self._answer_future = future
+        self._append_log(
+            log_path,
+            f"\n[question {question.number} of {box.total}]\n"
+            f"{questions.redact(question.numbered())}\n",
+        )
+        try:
+            if on_question is not None:
+                try:
+                    auto = await on_question(question)
+                except Exception:  # a Discord failure must not kill the job
+                    log.exception("could not ask the owner the question")
+                    auto = None
+                if auto:
+                    self._append_log(
+                        log_path, f"\n[auto-answer] {questions.redact(auto[:200])}\n"
+                    )
+                    return auto
+            deadline = time.monotonic() + cap
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                # A bounded wait so a stopped job is noticed without /answer
+                # and the future is never cancelled by a timeout.
+                done, _pending = await asyncio.wait({future}, timeout=min(1.0, remaining))
+                if done:
+                    answer = future.result()
+                    if answer:
+                        return answer
+                    self._append_log(
+                        log_path,
+                        f"\n[the job stopped while question {question.number} was "
+                        "open]\n",
+                    )
+                    return None
+                if self._question is not question:
+                    self._append_log(
+                        log_path,
+                        f"\n[question {question.number} was dropped when the job "
+                        "stopped]\n",
+                    )
+                    return None
+            self._append_log(
+                log_path,
+                f"\n[no answer within {int(cap)}s for question {question.number}]\n",
+            )
+            return None
+        finally:
+            self._question = None
+            self._answer_future = None
+
+    async def _apply(
+        self, session: str, question: questions.Question, answer: str, log_path: Path
+    ) -> str:
+        """Turn one Discord answer into keys and confirm the box took it."""
+        if not question.expanded:
+            # A collapsed question is opened first: Enter on its header opens it,
+            # and that is confirmed before any answer key is sent.
+            await self._press(session, "Enter", log_path)
+            box = await self._read_box(session)
+            if box is None:
+                return "closed"
+            opened = box.question(question.number)
+            if opened is None or not opened.expanded:
+                return "mismatch"
+            question = opened
+        choice = questions.option_number(answer, len(question.options))
+        if choice is not None:
+            return await self._choose(session, question, choice - 1, log_path)
+        text = questions.flatten_answer(answer)
+        if not text:
+            return "mismatch"
+        if question.options:
+            custom = question.custom_index
+            if custom is None:
+                return "mismatch"
+            opened = await self._choose(session, question, custom, log_path)
+            if opened != "ok":
+                return opened
+            box = await self._read_box(session)
+            if box is None:
+                return "closed"
+            question = box.question(question.number) or question
+        return await self._type_text(session, question, text, log_path)
+
+    async def _choose(
+        self, session: str, question: questions.Question, target: int, log_path: Path
+    ) -> str:
+        """Select option `target` (0-based) and confirm it is the chosen row.
+
+        The focus is usually drawn outside the captured text, so the first key
+        is a probe: Enter accepts whatever row is focused and the pane then
+        shows which row is chosen. From then on every move is computed from the
+        row the pane reports and confirmed on the next capture. A probe that
+        lands on another row is corrected only while that question is still the
+        one on screen; if the box moved on, no key is safe and it is a mismatch.
+        Keys are never sent because a count said so.
+        """
+        for attempt in range(CHOICE_ATTEMPTS):
+            box = await self._read_box(session)
+            if box is None:
+                return "closed"
+            current = box.question(question.number)
+            if current is None:
+                # The question vanished from the box: never press a key into
+                # whatever is on screen now.
+                return "mismatch"
+            if current.chosen_index == target:
+                return "ok"
+            focus = current.cursor_index
+            if focus is not None:
+                # The pane draws the focus: every arrow must move it by one.
+                moved = focus
+                step = 1 if target > focus else -1
+                for key in _arrow_keys(focus, target):
+                    await self._press(session, key, log_path)
+                    after = await self._read_box(session)
+                    if after is None:
+                        return "closed"
+                    moved += step
+                    current = after.question(question.number)
+                    if current is None or current.cursor_index != moved:
+                        return "mismatch"
+                await self._press(session, "Enter", log_path)
+                continue
+            still_open = current.expanded and not any(
+                other.expanded
+                for other in box.questions
+                if other.number != current.number
+            )
+            if current.chosen_index is None:
+                if attempt or not still_open:
+                    return "mismatch"
+                # The probe: one Enter, on the question the pane says is open.
+                await self._press(session, "Enter", log_path)
+                continue
+            if not still_open:
+                self._append_log(
+                    log_path,
+                    f"\n[the probe selected row {current.chosen_index + 1} and the "
+                    "box moved on, so the answer cannot be corrected without "
+                    f"touching question {question.number} blindly]\n",
+                )
+                return "mismatch"
+            # A row other than the answer is chosen: correct it in place.
+            self._append_log(
+                log_path,
+                f"\n[the probe selected row {current.chosen_index + 1} of "
+                f"question {question.number}; moving it to row {target + 1}]\n",
+            )
+            for key in _arrow_keys(current.chosen_index, target):
+                await self._press(session, key, log_path)
+                if await self._read_box(session) is None:
+                    return "closed"
+            await self._press(session, "Enter", log_path)
+        box = await self._read_box(session)
+        if box is None:
+            return "ok"
+        current = box.question(question.number)
+        if current is not None and current.chosen_index == target:
+            return "ok"
+        return "mismatch"
+
+    async def _type_text(
+        self, session: str, question: questions.Question, text: str, log_path: Path
+    ) -> str:
+        """Paste free text through tmux, then confirm the box took it."""
+        await self._send_text(session, text)
+        if self._question_debug:
+            pane = await self._pane(session)
+            self._append_log(
+                log_path,
+                f"\n[pane after typing]\n{questions.redact(pane[-DEBUG_PANE_CHARS:])}\n",
+            )
+        box = await self._read_box(session)
+        if box is None:
+            return "ok"
+        after = box.question(question.number)
+        if after is None or box.all_answered:
+            return "ok"
+        if after.answered:
+            return "ok"
+        first_word = text.split()[0].lower()
+        if after.answer_hint and first_word in after.answer_hint.lower():
+            return "ok"
+        return "mismatch"
+
+    async def _submit(self, session: str, log_path: Path) -> bool:
+        """Press Enter only once a fresh capture shows Submit has the focus.
+
+        After the last answer the focus can still be on an option row, where
+        Enter would select it, so the focus is first moved with Down (which never
+        selects) and confirmed on the pane. When the pane does not show which
+        element is focused, Enter is not sent at all.
+        """
+        for attempt in range(SUBMIT_ATTEMPTS):
+            box = await self._read_box(session)
+            if box is None:
+                self._append_log(log_path, "\n[Submit closed the box]\n")
+                return True
+            focused = box.submit_focused
+            if focused is None:
+                self._append_log(
+                    log_path,
+                    "\n[no Submit row with a focus marker on the pane, so the focus "
+                    "cannot be confirmed and Enter is not sent]\n",
+                )
+                return False
+            if not focused:
+                if attempt:
+                    self._append_log(
+                        log_path,
+                        "\n[Submit never took the focus, so Enter is not sent on an "
+                        "option row]\n",
+                    )
+                    return False
+                await self._press(session, "Down", log_path)
+                continue
+            await self._press(session, "Enter", log_path)
+            if await self._read_box(session) is None:
+                self._append_log(log_path, "\n[Submit closed the box]\n")
+                return True
+            self._append_log(log_path, "\n[Enter on Submit did not close the box]\n")
+        return False
+
+    async def wait_for_changes(
+        self,
+        env: TaskEnvironment,
+        log_path: Path,
+        *,
+        timeout: float | None = None,
+        on_question: Callable[[questions.Question], Awaitable[str | None]] | None = None,
+        on_pane: Callable[[str], Awaitable[None]] | None = None,
+    ) -> str:
+        """Return 'idle', 'exited', 'timeout', 'question-timeout' or 'question-failed'.
 
         'idle' means the worktree was changed at least once and then stopped
         changing for the idle window; this is the normal success signal.
+
+        A question box pauses the idle timer and pushes the hard deadline out by
+        however long the box was open, because a job waiting for the owner has
+        not finished and must not be killed. Freebuff's own survey popup is
+        dismissed with Esc and never forwarded. 'question-timeout' means the wait
+        expired with no answer; 'question-failed' means the box did not respond
+        to an answer the way the pane said it should.
         """
         timeout = float(timeout or getattr(self.settings, "freebuff_timeout_seconds"))
         idle = float(getattr(self.settings, "freebuff_idle_seconds"))
-        poll = max(1.0, float(getattr(self.settings, "freebuff_poll_seconds")))
+        poll = max(0.05, float(getattr(self.settings, "freebuff_poll_seconds")))
         deadline = time.monotonic() + timeout
         last_signature = env.signature_at_start or await self.repo.signature(env.worktree)
         last_change: float | None = None
@@ -685,6 +1150,20 @@ class FreebuffRunner:
             if not await self._session_alive(env.session):
                 self._append_log(log_path, "\n[tmux session exited]\n")
                 return "exited"
+            box = await self._read_box(env.session)
+            if box is not None and box.key not in self._handled_boxes:
+                opened = time.monotonic()
+                outcome = await self._drive_box(env, box, log_path, on_question, on_pane)
+                # Waiting for the owner is neither idle time nor job time.
+                deadline += time.monotonic() - opened
+                if outcome == "expired":
+                    return "question-timeout"
+                if outcome == "failed":
+                    return "question-failed"
+                self._remember_box(box.key)
+                last_signature = await self.repo.signature(env.worktree)
+                last_change = time.monotonic()
+                continue
             signature = await self.repo.signature(env.worktree)
             now = time.monotonic()
             if signature != last_signature:
@@ -700,7 +1179,15 @@ class FreebuffRunner:
         self._append_log(log_path, f"\n[Freebuff timed out after {int(timeout)}s]\n")
         return "timeout"
 
-    async def followup(self, env: TaskEnvironment, text: str, log_path: Path) -> str:
+    async def followup(
+        self,
+        env: TaskEnvironment,
+        text: str,
+        log_path: Path,
+        *,
+        on_question: Callable[[questions.Question], Awaitable[str | None]] | None = None,
+        on_pane: Callable[[str], Awaitable[None]] | None = None,
+    ) -> str:
         """Send reviewer notes to Freebuff and wait again."""
         env.round += 1
         self._append_log(log_path, f"\n--- round {env.round}: reviewer notes sent ---\n{text}\n---\n")
@@ -708,7 +1195,9 @@ class FreebuffRunner:
             await self._start_session(env, self._freebuff_argv(), log_path)
         env.signature_at_start = await self.repo.signature(env.worktree)
         await self._send_text(env.session, text)
-        return await self.wait_for_changes(env, log_path)
+        return await self.wait_for_changes(
+            env, log_path, on_question=on_question, on_pane=on_pane
+        )
 
     async def collect(self, env: TaskEnvironment, max_diff_lines: int) -> ChangeSet:
         await self.repo.stage_all(env.worktree)
@@ -832,10 +1321,32 @@ class FreebuffRunner:
             return
         shutil.rmtree(env.guard_dir, ignore_errors=True)
 
+    def _remember_box(self, key: str) -> None:
+        """Remember a box already driven to Submit, so it is not asked twice."""
+        if len(self._handled_boxes) > 32:
+            self._handled_boxes.clear()
+        self._handled_boxes.add(key)
+
+    def _forget_question(self) -> None:
+        """Drop the open question so a late /answer finds nothing waiting."""
+        future = self._answer_future
+        self._question = None
+        self._answer_future = None
+        if future is not None and not future.done():
+            # Unblocks _ask; an empty answer can never come from /answer.
+            future.set_result("")
+
     async def abort(self, env: TaskEnvironment | None = None) -> None:
+        waiting = self._question is not None
+        self._forget_question()
+        self._handled_boxes.clear()
+        self._broken_box = ""
         target = env or self._active
         if target is None:
             return
+        if waiting:
+            # No box outlives its session: dismiss it before the pane is gone.
+            await self._dismiss(target.session)
         if await self._session_alive(target.session):
             await self._tmux("kill-session", "-t", target.session)
         self._active = None
