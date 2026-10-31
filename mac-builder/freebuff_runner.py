@@ -22,6 +22,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -398,12 +399,59 @@ class GitRepo:
         return True
 
 
+def _hint_matches(hint: str, label: str) -> bool:
+    """Whether a collapsed question's `↳ "<value>"` line shows this option label.
+
+    Freebuff commits a row on Enter, collapses the question and draws the value
+    it took as `↳ "Formal"`, so that line is the confirmation for an option.
+    """
+    def norm(text: str) -> str:
+        return " ".join(text.strip().strip("\"'\u201c\u201d\u2018\u2019").split()).casefold()
+
+    return bool(hint) and norm(hint) == norm(label)
+
+
 def _arrow_keys(start: int | None, target: int) -> list[str]:
     """Arrow presses that take the focus from `start` to `target`."""
     if start is None or start == target:
         return []
     delta = target - start
     return ["Down"] * delta if delta > 0 else ["Up"] * (-delta)
+
+
+_SGR_RE = re.compile(r"\x1b\[([0-9;:]*)m")
+
+
+def styled_submit_focus(styled: str) -> bool | None:
+    """Whether the Submit button is drawn focused in a `capture-pane -e` capture.
+
+    Freebuff draws the focused Submit in bold (ESC[1m) and the unfocused one in
+    plain grey, both inside a box whose plain text is identical, so the colour
+    codes are the only evidence. None: no Submit row, or nothing to go on.
+    """
+    for line in styled.splitlines():
+        at = line.find("Submit")
+        if at < 0:
+            continue
+        bold = False
+        for match in _SGR_RE.finditer(line[:at]):
+            params = [part for part in re.split(r"[;:]", match.group(1))]
+            index = 0
+            while index < len(params):
+                code = params[index] or "0"
+                if code in ("38", "48"):
+                    # 38;2;r;g;b or 38;5;n: the numbers after it are a colour
+                    index += 4 if index + 1 < len(params) and params[index + 1] == "2" else 2
+                    continue
+                if code == "0":
+                    bold = False
+                elif code == "1":
+                    bold = True
+                elif code == "22":
+                    bold = False
+                index += 1
+        return bold
+    return None
 
 
 class FreebuffRunner:
@@ -702,6 +750,53 @@ class FreebuffRunner:
         )
         return result.stdout if result.code == 0 else ""
 
+    async def _log_styled_submit(
+        self, session: str, key: str, log_path: Path
+    ) -> None:
+        """QUESTION_DEBUG only: the Submit rows with their colour codes visible.
+
+        The plain capture cannot show which button has the focus when that is
+        only a colour. ESC is written as `<ESC>` so the codes survive in the log.
+        """
+        result = await self._tmux(
+            "capture-pane", "-e", "-p", "-J", "-t", session, "-S", f"-{PANE_LINES}"
+        )
+        if result.code != 0:
+            return
+        lines = result.stdout.splitlines()
+        keep: list[str] = []
+        for index, line in enumerate(lines):
+            if "Submit" in line:
+                for near in lines[max(0, index - 1) : index + 2]:
+                    if near not in keep:
+                        keep.append(near)
+        if not keep:
+            return
+        styled = "\n".join(keep).replace("\x1b", "<ESC>")
+        self._append_log(
+            log_path,
+            f"\n[styled Submit rows after {key}]\n"
+            f"{questions.redact(styled[-DEBUG_PANE_CHARS:])}\n",
+        )
+
+    async def _styled_pane(self, session: str) -> str | None:
+        """The pane with colour codes, for the one thing plain text cannot show."""
+        result = await self._tmux(
+            "capture-pane", "-e", "-p", "-J", "-t", session, "-S", f"-{PANE_LINES}"
+        )
+        return result.stdout if result.code == 0 else None
+
+    async def _submit_focus(
+        self, session: str, box: questions.QuestionBox
+    ) -> bool | None:
+        """Whether Submit has the focus: the colour codes first, the text marker after."""
+        styled = await self._styled_pane(session)
+        if styled:
+            focus = styled_submit_focus(styled)
+            if focus is not None:
+                return focus
+        return box.submit_focused
+
     @property
     def pending_question(self) -> questions.Question | None:
         """The question /answer resolves, or None when nothing is waiting."""
@@ -731,6 +826,7 @@ class FreebuffRunner:
                 log_path,
                 f"\n[pane after {key}]\n{questions.redact(pane[-DEBUG_PANE_CHARS:])}\n",
             )
+            await self._log_styled_submit(session, key, log_path)
 
     async def _dismiss(self, session: str, log_path: Path | None = None) -> None:
         """Esc, best effort: a session that is already gone needs no dismissal."""
@@ -1001,6 +1097,18 @@ class FreebuffRunner:
                 return "mismatch"
             if current.chosen_index == target:
                 return "ok"
+            if _hint_matches(current.answer_hint, question.options[target].label):
+                return "ok"
+            if current.answer_hint and not current.expanded and not _hint_matches(
+                current.answer_hint, question.options[target].label
+            ):
+                # Freebuff committed a different row; it cannot be corrected.
+                self._append_log(
+                    log_path,
+                    f"\n[question {question.number} took {current.answer_hint!r} "
+                    f"instead of {question.options[target].label!r}]\n",
+                )
+                return "mismatch"
             focus = current.cursor_index
             if focus is not None:
                 # The pane draws the focus: every arrow must move it by one.
@@ -1025,7 +1133,12 @@ class FreebuffRunner:
             if current.chosen_index is None:
                 if attempt or not still_open:
                     return "mismatch"
-                # The probe: one Enter, on the question the pane says is open.
+                # The focus is not drawn and Enter commits the focused row, so
+                # there is no probe. The box starts on the first row: move down
+                # to the target, press Enter once, then confirm on the pane that
+                # the collapsed question shows the label that was meant.
+                for _ in range(target):
+                    await self._press(session, "Down", log_path)
                 await self._press(session, "Enter", log_path)
                 continue
             if not still_open:
@@ -1092,7 +1205,7 @@ class FreebuffRunner:
             if box is None:
                 self._append_log(log_path, "\n[Submit closed the box]\n")
                 return True
-            focused = box.submit_focused
+            focused = await self._submit_focus(session, box)
             if focused is None:
                 self._append_log(
                     log_path,

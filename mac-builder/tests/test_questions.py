@@ -281,7 +281,12 @@ class FakeBox:
         draw_cursor: bool = True,
         advance_on_choose: bool = True,
         submit_focus: str = "after_answer",
+        collapse_to_hint: bool = False,
+        colour_focus: bool = False,
     ) -> None:
+        self.collapse_to_hint = collapse_to_hint
+        # Real Freebuff: the plain text of Submit is identical focused or not.
+        self.colour_focus = colour_focus
         self.questions = questions
         self.obey = obey
         self.draw_cursor = draw_cursor
@@ -318,6 +323,16 @@ class FakeBox:
         for question in self.questions:
             mark = "▼" if question.expanded else "▶"
             lines.append(f"│ {mark} {question.number}. {question.text}")
+            if (
+                self.collapse_to_hint
+                and not question.expanded
+                and question.chosen is not None
+            ):
+                # Real Freebuff: a committed question collapses to the value
+                # it took and no longer lists its rows.
+                label = question.options[question.chosen][0]
+                lines.append(f'│   ↳ "{label}"')
+                continue
             for index, (label, description) in enumerate(question.options):
                 if question.chosen == index:
                     circle = "◉"
@@ -335,7 +350,7 @@ class FakeBox:
         if self.submit_focus == "no_row":
             # A box whose Submit row never made it into the capture.
             lines.append("│      ↑↓ navigate • Enter select")
-        elif self.submit_focused:
+        elif self.submit_focused and not self.colour_focus:
             lines.append("│ ❯ Submit │   ↑↓ navigate • Enter select")
         else:
             lines.append("│ │ Submit │   ↑↓ navigate • Enter select")
@@ -650,6 +665,81 @@ class BoxLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[pane after Enter]", log)
 
 
+    # The two Submit rows exactly as `capture-pane -e` returned them on the
+    # Mac (job 20261031-113115-13391ac2): ESC[1m in front of the word is focus.
+    UNFOCUSED_SUBMIT = (
+        "│\x1b[38;2;172;179;191m│\x1b[38;2;255;255;255m  "
+        "\x1b[38;2;172;179;191mSubmit\x1b[38;2;255;255;255m  "
+        "\x1b[38;2;172;179;191m│\x1b[38;2;255;255;255m    ↑↓ navigate"
+    )
+    FOCUSED_SUBMIT = (
+        "││\x1b[38;2;255;255;255m  \x1b[1m\x1b[38;2;158;252;98mSubmit"
+        "\x1b[0m\x1b[38;2;255;255;255m  \x1b[38;2;158;252;98m│"
+        "\x1b[38;2;255;255;255m    ↑↓ navigate"
+    )
+
+    def test_the_real_colour_codes_tell_focused_from_unfocused_submit(self) -> None:
+        from freebuff_runner import styled_submit_focus
+
+        self.assertIs(styled_submit_focus(self.UNFOCUSED_SUBMIT), False)
+        self.assertIs(styled_submit_focus(self.FOCUSED_SUBMIT), True)
+        self.assertIsNone(styled_submit_focus("no button on this pane"))
+        self.assertIsNone(styled_submit_focus(""))
+
+    def test_bold_ended_before_the_word_is_not_focus(self) -> None:
+        from freebuff_runner import styled_submit_focus
+
+        reset = "\x1b[1mx\x1b[0m \x1b[38;2;1;2;3mSubmit"
+        self.assertIs(styled_submit_focus(reset), False)
+
+    def colour_terminal(self, box: FakeBox) -> FakeTerminal:
+        spec = self
+
+        class Coloured(FakeTerminal):
+            async def _styled_pane(self, session: str) -> str | None:
+                return (
+                    spec.FOCUSED_SUBMIT
+                    if self.box.submit_focused
+                    else spec.UNFOCUSED_SUBMIT
+                )
+
+        runner = Coloured(runner_settings(), box)
+        runner.repo = _SignatureRepo("b")
+        return runner
+
+    async def test_submit_already_focused_by_colour_gets_one_enter_and_no_down(self) -> None:
+        # Freebuff moves the focus onto Submit itself after the last answer, and
+        # the plain text cannot show it: only the colour does.
+        box = self.single_question(submit_focus="after_answer", colour_focus=True)
+        runner = self.colour_terminal(box)
+
+        async def on_question(question: Question) -> str:
+            return "1"
+
+        reason = await asyncio.wait_for(
+            runner.wait_for_changes(task_env(), self.log_path, on_question=on_question),
+            timeout=15,
+        )
+        self.assertEqual(reason, "idle")
+        self.assertTrue(box.closed)
+        self.assertEqual(box.stray_enters, 0)
+        self.assertEqual(runner.keys[-1:], ["Enter"])
+        self.assertNotIn("Down", runner.keys[-2:], "no Down once colour shows focus")
+
+    async def test_colour_focus_that_never_arrives_sends_no_enter(self) -> None:
+        box = self.single_question(submit_focus="never", colour_focus=True)
+        runner = self.colour_terminal(box)
+
+        async def on_question(question: Question) -> str:
+            return "1"
+
+        reason = await asyncio.wait_for(
+            runner.wait_for_changes(task_env(), self.log_path, on_question=on_question),
+            timeout=15,
+        )
+        self.assertEqual(reason, "question-failed")
+        self.assertEqual(box.stray_enters, 0)
+
     def single_question(self, **overrides: object) -> FakeBox:
         return FakeBox(
             [BoxQuestion(1, "Which screen?", ["Home", "Settings", "Profile"])],
@@ -712,30 +802,47 @@ class BoxLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Submit never took the focus", log)
         self.assertNotIn("Enter on Submit", log)
 
-    async def test_a_wrong_probe_is_corrected_and_verified(self) -> None:
-        # A box that keeps its question on screen after a pick, so a wrong row
-        # can be corrected in place instead of the answer being lost.
+    def real_box(self, cursor: int = 0) -> FakeBox:
+        # What the live capture showed: no focus drawn, Enter commits the
+        # focused row, the question collapses to `↳ "<label>"`.
         box = FakeBox(
-            [BoxQuestion(1, "Which screen?", ["Home", "Settings", "Profile"])],
+            [
+                BoxQuestion(1, "Which tone?", ["Formal", "Casual", "Technical"]),
+                BoxQuestion(2, "Which name?", ["A", "B"], expanded=False),
+            ],
             draw_cursor=False,
-            advance_on_choose=False,
+            collapse_to_hint=True,
         )
-        box.questions[0].cursor = 2  # the real focus, invisible in the capture
+        box.questions[0].cursor = cursor
+        return box
+
+    async def _choose_on(self, box: FakeBox, number: int) -> tuple[str, FakeTerminal]:
         runner = FakeTerminal(runner_settings(), box)
         parsed = questions.parse_pane(box.render())
         assert parsed is not None and parsed.active is not None
+        outcome = await runner._choose("s", parsed.active, number - 1, self.log_path)
+        return outcome, runner
 
-        outcome = await runner._choose("s", parsed.active, 1, self.log_path)
-
+    async def test_row_one_is_picked_with_a_single_enter(self) -> None:
+        box = self.real_box()
+        outcome, runner = await self._choose_on(box, 1)
         self.assertEqual(outcome, "ok")
-        self.assertEqual(
-            box.questions[0].chosen, 1, "the answer must win over the probe"
-        )
-        # Probe, correction, confirmation: nothing is left to a count.
-        self.assertEqual(runner.keys, ["Enter", "Up", "Enter"])
-        self.assertIn(
-            "the probe selected row 3", self.log_path.read_text(encoding="utf-8")
-        )
+        self.assertEqual(box.questions[0].chosen, 0)
+        self.assertEqual(runner.keys, ["Enter"])
+
+    async def test_a_later_row_is_reached_with_down_before_the_only_enter(self) -> None:
+        box = self.real_box()
+        outcome, runner = await self._choose_on(box, 3)
+        self.assertEqual(outcome, "ok")
+        self.assertEqual(box.questions[0].chosen, 2)
+        self.assertEqual(runner.keys, ["Down", "Down", "Enter"])
+
+    async def test_a_focus_that_does_not_start_on_row_one_fails_safely(self) -> None:
+        box = self.real_box(cursor=2)  # invisible; Down wraps to row 1
+        outcome, runner = await self._choose_on(box, 2)
+        self.assertEqual(outcome, "mismatch")
+        self.assertEqual(runner.keys, ["Down", "Enter"], "no second Enter, no guessing")
+        self.assertIn("instead of", self.log_path.read_text(encoding="utf-8"))
 
     async def test_a_probe_that_moves_the_box_on_fails_instead_of_typing(self) -> None:
         box = self.two_questions()
