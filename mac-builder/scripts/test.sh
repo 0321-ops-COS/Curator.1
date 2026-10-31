@@ -77,7 +77,7 @@ status=${PIPESTATUS[0]}
 set -e
 
 if [ "$status" -ne 0 ]; then
-  if grep -q "not configured for the test action" "$build_log"; then
+  if grep -q "configured for the test action" "$build_log"; then
     echo "[test] scheme '$SCHEME' has no test action." >&2
     echo "[test] The Swift tests live in HustlerCore and run via /check." >&2
     echo "[test] exit 78 = test stage unavailable (not a diff failure)." >&2
