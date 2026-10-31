@@ -324,5 +324,57 @@ class ManagerTokenBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["max_tokens"], 6000)
 
 
+class ManagerFallbackModelTests(unittest.IsolatedAsyncioTestCase):
+    """Fallbacks are an extra "models" list; without them the payload is unchanged."""
+
+    async def payload_for(self, **kwargs: object) -> dict[str, object]:
+        seen: list[dict[str, object]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(json.loads(request.content.decode("utf-8")))
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "hello"}}]},
+                request=request,
+            )
+
+        instance = Manager(
+            api_base="https://example.test/v1",
+            api_key="k",
+            model="primary",
+            retry_delay_seconds=0.0,
+            **kwargs,  # type: ignore[arg-type]
+        )
+        instance._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            await instance.chat([{"role": "user", "content": "hi"}], "")
+        finally:
+            await instance.close()
+        return seen[0]
+
+    async def test_no_fallbacks_keeps_the_payload_exactly_as_before(self) -> None:
+        payload = await self.payload_for()
+        self.assertNotIn("models", payload)
+        self.assertEqual(
+            set(payload), {"model", "messages", "temperature", "max_tokens"}
+        )
+        self.assertEqual(payload["model"], "primary")
+
+    async def test_fallbacks_follow_the_primary_in_order(self) -> None:
+        payload = await self.payload_for(fallback_models=("backup-a", "backup-b"))
+        self.assertEqual(payload["model"], "primary")
+        self.assertEqual(payload["models"], ["primary", "backup-a", "backup-b"])
+
+    async def test_entries_are_trimmed_and_blanks_dropped(self) -> None:
+        payload = await self.payload_for(
+            fallback_models=(" backup-a ", "", "   ", "backup-b")
+        )
+        self.assertEqual(payload["models"], ["primary", "backup-a", "backup-b"])
+
+    async def test_only_blank_entries_leave_no_list(self) -> None:
+        payload = await self.payload_for(fallback_models=("", "  "))
+        self.assertNotIn("models", payload)
+
+
 if __name__ == "__main__":
     unittest.main()
