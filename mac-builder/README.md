@@ -162,7 +162,7 @@ are kept for inspection.
 | `QUESTION_MANAGER_COOLDOWN_SECONDS` | After a 429 or a timeout from the manager, skip manager calls for this long and ask you instead. Default 30. |
 | `QUESTION_SUGGEST` | `1` posts the manager's advice as a follow-up under the question ("suggestion only, you decide"). Never an answer, never typed. Default `0`. |
 | `QUESTION_DEBUG` | `1` writes the whole pane to the job log after every key sent to a question box. Default `0`; turn it on once to learn the real box. |
-| `MANAGER_API_BASE`, `MANAGER_API_KEY`, `MANAGER_MODEL` | Any OpenAI-compatible chat endpoint. |
+| `MANAGER_API_BASE`, `MANAGER_API_KEY`, `MANAGER_MODEL` | Any OpenAI-compatible chat endpoint. `MANAGER_MODEL` defaults to `openrouter/free`, which needs the OpenRouter base URL. |
 | `MAX_DIFF_LINES` | Hard diff limit, default 400. |
 | `MAX_REVISE_ROUNDS` | Automatic revision rounds, default 2. |
 | `MAX_PENDING_JOBS` | Queue cap, default 10. |
@@ -593,6 +593,11 @@ branch and short commit of the code that is running.
 - `/plan` is bounded: at most `MAX_PLAN_CHARS` (60 000 characters) of material
   goes in, and at most `MANAGER_MAX_TOKENS` (default 4000) comes back. A plan that
   hits the output limit is labelled incomplete, not presented as whole.
+- **Free models are retired without notice.** The default `MANAGER_MODEL` is
+  `openrouter/free`; when OpenRouter stops serving it the manager answers HTTP
+  404 with that reason in the body (now shown in the log and in Discord) or
+  returns an empty reply. A paid model is the reliable choice for a bot that
+  must answer questions unattended.
 - The manager is told `(no plan)` for every question: `Job.plan` exists and the
   answer prompt reads it, but nothing sets it yet — a `/plan` creates a document,
   not a job — so plan wiring has deliberately not been built.

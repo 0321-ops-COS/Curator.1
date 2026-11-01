@@ -657,5 +657,88 @@ class CooldownScopeTests(Harness):
         self.assertEqual(fake.calls, 2)
 
 
+# ---------------------------------------------------------- error reporting
+
+
+class ManagerErrorTests(unittest.IsolatedAsyncioTestCase):
+    """A failure has to say why, and an empty reply is never a message."""
+
+    def manager_with(self, handler) -> manager.Manager:
+        instance = manager.Manager(
+            api_base="https://example.test/v1",
+            api_key="k",
+            model="openrouter/free",
+            timeout_seconds=5.0,
+            retry_delay_seconds=0.0,
+        )
+        instance._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        self.addAsyncCleanup(instance.close)
+        return instance
+
+    async def test_a_404_reports_the_provider_message(self) -> None:
+        reason = (
+            "openrouter/free is no longer available on OpenRouter: no provider "
+            "serves this model anymore"
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"error": {"message": reason}})
+
+        with self.assertRaises(ManagerUnavailable) as caught:
+            await self.manager_with(handler).answer_question(task="t", text="q")
+        message = str(caught.exception)
+        self.assertIn("HTTP 404", message)
+        self.assertIn("no provider serves this model anymore", message)
+
+    async def test_the_provider_message_is_redacted_and_capped(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                404, json={"error": {"message": f"gone {TOKEN} " + "x" * 4000}}
+            )
+
+        with self.assertRaises(ManagerUnavailable) as caught:
+            await self.manager_with(handler).answer_question(task="t", text="q")
+        message = str(caught.exception)
+        self.assertNotIn(TOKEN, message, "the body is quoted back, so it is redacted")
+        self.assertIn("[redacted]", message)
+        self.assertLessEqual(len(message), 400)
+
+    async def test_an_plain_http_error_body_is_used_when_not_json(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(503, text="upstream is down")
+
+        with self.assertRaises(ManagerUnavailable) as caught:
+            await self.manager_with(handler).answer_question(task="t", text="q")
+        self.assertIn("upstream is down", str(caught.exception))
+
+    async def test_an_empty_reply_names_the_reasoning_budget(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"content": None}, "finish_reason": "length"}
+                    ]
+                },
+            )
+
+        with self.assertRaises(ManagerUnavailable) as caught:
+            await self.manager_with(handler).answer_question(task="t", text="q")
+        self.assertIn(
+            "empty reply (token budget used by reasoning)", str(caught.exception)
+        )
+
+    async def test_an_empty_reply_without_truncation_is_unavailable(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]},
+            )
+
+        with self.assertRaises(ManagerUnavailable) as caught:
+            await self.manager_with(handler).answer_question(task="t", text="q")
+        self.assertIn("no text content", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

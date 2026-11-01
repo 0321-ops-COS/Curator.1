@@ -247,9 +247,15 @@ def _reply_and_truncation(data: object) -> tuple[str, bool]:
     """The reply text, and whether the model stopped at its token limit."""
     choice = data["choices"][0]  # type: ignore[index]
     content = choice["message"]["content"]
-    if not isinstance(content, str):
+    truncated = choice.get("finish_reason") == "length"
+    if not isinstance(content, str) or not content.strip():
+        # A reasoning model can spend the whole budget thinking and come back
+        # with content null and finish_reason "length". That is not an answer,
+        # and posting it as one would be a blank message.
+        if truncated:
+            raise ManagerUnavailable("empty reply (token budget used by reasoning)")
         raise ManagerUnavailable("manager returned no text content")
-    return content, choice.get("finish_reason") == "length"
+    return content, truncated
 
 
 class ManagerUnavailable(RuntimeError):
@@ -350,16 +356,53 @@ def _status_text(response: httpx.Response) -> str:
     return f"HTTP {response.status_code}" + (f" {reason}" if reason else "")
 
 
+# An error body is quoted back to the owner, so it is capped: enough for the
+# provider's sentence, never a page of JSON.
+MAX_ERROR_DETAIL_CHARS = 200
+
+
+def _provider_message(response: httpx.Response) -> str:
+    """The provider's own words from an error body, redacted and capped.
+
+    A 404 from OpenRouter explains itself in the body ("... is no longer
+    available on OpenRouter: no provider serves this model anymore"); the
+    status line alone left the owner with nothing to act on.
+    """
+    try:
+        raw = response.text
+    except Exception:  # an unread body must never mask the status
+        return ""
+    detail = ""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        error = data.get("error")
+        if isinstance(error, dict):
+            detail = str(error.get("message") or "")
+        elif isinstance(error, str):
+            detail = error
+        if not detail:
+            detail = str(data.get("message") or "")
+    detail = " ".join((detail or raw).split())
+    return project_context.redact_secrets(detail)[:MAX_ERROR_DETAIL_CHARS]
+
+
 def describe_error(exc: BaseException | None) -> str:
     """Name a failure so a message is never a bare 'request failed:'.
 
     A timeout with an empty message, or a provider that rejects the key, must
-    still say what happened; otherwise the owner sees nothing to act on.
+    still say what happened; otherwise the owner sees nothing to act on. For an
+    HTTP error the body's own message is included, because the reason a model
+    stopped working is rarely in the status line.
     """
     if exc is None:
         return "unknown error"
     if isinstance(exc, httpx.HTTPStatusError):
-        return f"{type(exc).__name__}: {_status_text(exc.response)}"
+        status = f"{type(exc).__name__}: {_status_text(exc.response)}"
+        detail = _provider_message(exc.response)
+        return f"{status}: {detail}" if detail else status
     text = str(exc).strip()
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
