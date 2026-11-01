@@ -1480,5 +1480,158 @@ class RedactionSinkTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[redacted]", embed.description)
 
 
+# The status bar Freebuff draws under the box, exactly as the failing job's log
+# captured it (20261031-123834-e07e83ac), with the worktree path replaced.
+STATUS_BAR = "Freebuff • high · ~/mac-builder-worktrees/<job-id> · /model to switch"
+
+
+class StatusBarParserTests(unittest.TestCase):
+    """The status bar is not content: not an option, not a description."""
+
+    def pane(self, extra: str = "") -> str:
+        return (
+            "╭──── Some questions for you ────╮\n"
+            "│                        Close ✕ │\n"
+            "│ ▼ 1. Which tone should the project description use?\n"
+            "│     ○ Formal\n"
+            "│       Polished, professional wording suitable for documentation\n"
+            "│       or stakeholders.\n"
+            "│     ○ Casual\n"
+            "│     ○ Custom\n"
+            f"{extra}"
+            "│ │ Submit │   ↑↓ navigate • Enter select\n"
+            "╰────────────────────────────────╯\n"
+        )
+
+    def test_the_status_bar_is_not_an_option_description(self) -> None:
+        box = questions.parse_pane(self.pane(f"│ {STATUS_BAR}\n"))
+        assert box is not None
+        question = box.questions[0]
+        self.assertEqual(question.labels, ("Formal", "Casual", "Custom"))
+        self.assertEqual(
+            question.options[2].description, "", "the footer is not Custom's text"
+        )
+        for option in question.options:
+            self.assertNotIn("Freebuff", option.description)
+            self.assertNotIn("/model", option.description)
+        self.assertNotIn("Freebuff", question.text)
+
+    def test_a_real_description_still_attaches_to_its_option(self) -> None:
+        box = questions.parse_pane(self.pane())
+        assert box is not None
+        self.assertEqual(
+            box.questions[0].options[0].description,
+            "Polished, professional wording suitable for documentation or "
+            "stakeholders.",
+        )
+
+    def test_the_status_bar_does_not_change_the_box_identity(self) -> None:
+        # The key is what stops a closed box being answered twice; a drifting
+        # status bar must not mint a new one.
+        plain = questions.parse_pane(self.pane())
+        with_bar = questions.parse_pane(self.pane(f"│ {STATUS_BAR}\n"))
+        assert plain is not None and with_bar is not None
+        self.assertEqual(plain.key, with_bar.key)
+
+
+class AlreadyAnswered(FakeBox):
+    """A box whose answers are all in, so the focus already sits on Submit."""
+
+    @property
+    def active(self):
+        if all(question.answered for question in self.questions):
+            return None
+        return super().active
+
+
+class LingeringTerminal(FakeTerminal):
+    """Submit closes the box, then the answered box stays drawn above the prompt.
+
+    That is what the real terminal shows: the box remains in the transcript and
+    the status bar under it keeps changing. ``_pane`` reports the close exactly
+    once, so Submit can be confirmed, and the leftover afterwards.
+    """
+
+    def __init__(self, settings: object, box: FakeBox, leftover: str) -> None:
+        super().__init__(settings, box)
+        self.leftover = leftover
+        self.reads_after_close = 0
+
+    async def _pane(self, session: str) -> str:
+        if not self.box.closed:
+            return self.box.render()
+        self.reads_after_close += 1
+        if self.reads_after_close == 1:
+            return "> done\n"
+        return self.leftover.format(step=self.reads_after_close)
+
+
+class JobEndTests(unittest.IsolatedAsyncioTestCase):
+    """A box that is closed must let the job finish by the normal idle rule."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.log_path = Path(self.tmp.name) / "job.log"
+        patcher = mock.patch.object(freebuff_runner, "KEY_DELAY_SECONDS", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def answered_box(self) -> FakeBox:
+        question = BoxQuestion(
+            1,
+            "Which tone should the project description use?",
+            ["Formal", "Casual", "Custom"],
+        )
+        question.chosen = 0
+        return AlreadyAnswered([question], submit_focus="after_down")
+
+    def leftover(self) -> str:
+        return (
+            "╭──── Some questions for you ────╮\n"
+            "│                        Close ✕ │\n"
+            "│ ▼ 1. Which tone should the project description use?\n"
+            "│     ◉ Formal\n"
+            "│     ○ Casual\n"
+            "│     ○ Custom\n"
+            f"│ {STATUS_BAR} · {{{{step}}}}\n"
+            "╰────────────────────────────────╯\n"
+            "> \n"
+        )
+
+    async def test_a_box_that_lingers_after_submit_does_not_restart_the_job(self) -> None:
+        runner = LingeringTerminal(runner_settings(), self.answered_box(), self.leftover())
+        runner.repo = _SignatureRepo("b")
+        asked: list[int] = []
+
+        async def on_question(question: Question) -> str:
+            asked.append(question.number)
+            return "1"
+
+        reason = await asyncio.wait_for(
+            runner.wait_for_changes(task_env(), self.log_path, on_question=on_question),
+            timeout=15,
+        )
+        self.assertEqual(reason, "idle", "the job must end, not wait again")
+        self.assertEqual(asked, [], "an answered box is never asked again")
+        self.assertTrue(runner.box.closed)
+
+    async def test_an_idle_prompt_with_no_box_ends_the_job(self) -> None:
+        pane = f"Enter a coding task or / for commands\n{STATUS_BAR}\n> \n"
+        runner = StaticTerminal(runner_settings(freebuff_idle_seconds=0.1), pane)
+        runner.repo = _SignatureRepo("b")
+        asked: list[Question] = []
+
+        async def on_question(question: Question) -> None:
+            asked.append(question)
+
+        reason = await asyncio.wait_for(
+            runner.wait_for_changes(task_env(), self.log_path, on_question=on_question),
+            timeout=15,
+        )
+        self.assertEqual(reason, "idle")
+        self.assertEqual(asked, [], "an idle prompt is not a question")
+
+
 if __name__ == "__main__":
     unittest.main()

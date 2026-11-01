@@ -154,9 +154,15 @@ class Question:
 
     @property
     def key(self) -> str:
-        """Stable identity of this question's visible content."""
+        """Stable identity of this question's visible content.
+
+        Descriptions are deliberately not part of the key. They are cosmetic,
+        and the text under an option can drift (the status bar used to join
+        itself onto the last option), which made a closed box look like a new
+        question every poll and kept the job waiting for nobody.
+        """
         body = f"{self.number}\x00{self.text}\x00" + "\x00".join(
-            option.label + "\x01" + option.description for option in self.options
+            option.label for option in self.options
         )
         return hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()[:16]
 
@@ -281,6 +287,23 @@ def _is_footer(line: str) -> bool:
     return lowered.strip("[](){}<>_ •") == "submit"
 
 
+def _is_status_bar(line: str) -> bool:
+    """Freebuff's own status bar, which is never a question or a description.
+
+    It starts with the product name and the model badge
+    (``Freebuff • high · ~/mac-builder-worktrees/<job-id> · /model to ...``) and
+    sits under the box. It used to be joined onto the last option as that
+    option's description, which also made the box's key change between reads.
+    """
+    text = line.strip()
+    lowered = text.lower()
+    if lowered.startswith("freebuff") and ("•" in text or "·" in text):
+        return True
+    if "mac-builder-worktrees/" in lowered:
+        return True
+    return "/model to" in lowered
+
+
 def _title_index(rows: Sequence[str]) -> int | None:
     wanted = QUESTION_TITLE.lower()
     for index, line in enumerate(rows):
@@ -318,9 +341,10 @@ def _questions_from(rows: Sequence[str]) -> list[Question]:
     free_text = False
     hint = ""
     started = False
+    sealed = False
 
     def finish() -> None:
-        nonlocal text, options, expanded, free_text, hint, number
+        nonlocal text, options, expanded, free_text, hint, number, sealed
         if not started:
             return
         body = " ".join(part for part in text if part).strip()
@@ -337,6 +361,7 @@ def _questions_from(rows: Sequence[str]) -> list[Question]:
             )
         )
         text, options, expanded, free_text, hint = [], [], True, False, ""
+        sealed = False
 
     for line in rows:
         if RULE_RE.match(line) or CLOSE_LINE_RE.match(line):
@@ -355,8 +380,13 @@ def _questions_from(rows: Sequence[str]) -> list[Question]:
             continue
         if _is_footer(line):
             continue
+        if _is_status_bar(line):
+            # Nothing below the status bar belongs to an option above it.
+            sealed = True
+            continue
         option = _option(line)
         if option is not None:
+            sealed = False
             options.append(option)
             continue
         hint_match = HINT_LINE_RE.match(line)
@@ -372,6 +402,8 @@ def _questions_from(rows: Sequence[str]) -> list[Question]:
             continue
         if CLICK_HINT_RE.search(line):
             free_text = True
+            continue
+        if sealed:
             continue
         if options:
             # A line directly under an option, inside its block, is that
