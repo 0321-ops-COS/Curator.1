@@ -139,6 +139,11 @@ def _env_bool(name: str, default: bool = False) -> bool:
     raise ConfigError(f"{name} must be 0 or 1, got {raw!r}")
 
 
+def _env_models(name: str) -> tuple[str, ...]:
+    """A comma-separated list of model ids, trimmed, empty entries dropped."""
+    return tuple(part.strip() for part in _env(name).split(",") if part.strip())
+
+
 def _env_optional_id(name: str) -> int | None:
     raw = _env(name)
     if not raw:
@@ -185,6 +190,7 @@ class Settings:
     manager_api_base: str
     manager_api_key: str
     manager_model: str
+    manager_fallback_models: tuple[str, ...]
     manager_timeout_seconds: float
     manager_max_tokens: int
     max_diff_lines: int
@@ -272,6 +278,7 @@ class Settings:
             manager_api_base=_env("MANAGER_API_BASE"),
             manager_api_key=_env("MANAGER_API_KEY"),
             manager_model=_env("MANAGER_MODEL"),
+            manager_fallback_models=_env_models("MANAGER_FALLBACK_MODELS"),
             manager_timeout_seconds=_env_float("MANAGER_TIMEOUT_SECONDS", 120.0),
             manager_max_tokens=_env_int("MANAGER_MAX_TOKENS", 4000),
             max_diff_lines=max_diff_lines,
@@ -500,6 +507,7 @@ class MacBuilderBot(discord.Client):
             api_base=settings.manager_api_base,
             api_key=settings.manager_api_key,
             model=settings.manager_model,
+            fallback_models=settings.manager_fallback_models,
             timeout_seconds=settings.manager_timeout_seconds,
             max_tokens=settings.manager_max_tokens,
         )

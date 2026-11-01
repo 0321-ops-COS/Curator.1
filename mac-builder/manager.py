@@ -587,6 +587,7 @@ class Manager:
         api_base: str = "",
         api_key: str = "",
         model: str = "",
+        fallback_models: Iterable[str] = (),
         timeout_seconds: float = 120.0,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         retry_delay_seconds: float = RETRY_DELAY_SECONDS,
@@ -594,6 +595,14 @@ class Manager:
         self.api_base = (api_base or "").strip().rstrip("/")
         self.api_key = (api_key or "").strip()
         self.model = (model or "").strip()
+        # Comma-separated in the environment, already trimmed by Settings; a
+        # blank or non-string entry here would be sent to the provider as a
+        # model id, so both are dropped.
+        self.fallback_models = tuple(
+            value.strip()
+            for value in fallback_models
+            if isinstance(value, str) and value.strip()
+        )
         self.timeout_seconds = float(timeout_seconds)
         self.max_tokens = int(max_tokens)
         self.retry_delay_seconds = float(retry_delay_seconds)
@@ -636,12 +645,17 @@ class Manager:
             raise ManagerUnavailable(
                 "manager is not configured (MANAGER_API_BASE, MANAGER_API_KEY, MANAGER_MODEL)"
             )
-        payload = {
+        payload: dict[str, object] = {
             "model": self.model,
             "messages": list(messages),
             "temperature": 0.1,
             "max_tokens": max_tokens,
         }
+        if self.fallback_models:
+            # OpenRouter falls through this list on a 429 or a provider error;
+            # "model" stays for every other OpenAI-compatible endpoint. With no
+            # fallbacks the payload is exactly what it was before.
+            payload["models"] = [self.model, *self.fallback_models]
         last_error: BaseException | None = None
         for attempt in range(2):
             try:

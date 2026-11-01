@@ -163,6 +163,7 @@ are kept for inspection.
 | `QUESTION_SUGGEST` | `1` posts the manager's advice as a follow-up under the question ("suggestion only, you decide"). Never an answer, never typed. Default `0`. |
 | `QUESTION_DEBUG` | `1` writes the whole pane to the job log after every key sent to a question box. Default `0`; turn it on once to learn the real box. |
 | `MANAGER_API_BASE`, `MANAGER_API_KEY`, `MANAGER_MODEL` | Any OpenAI-compatible chat endpoint. |
+| `MANAGER_FALLBACK_MODELS` | Optional comma-separated fallback model ids. When set, requests also send `"models": [MANAGER_MODEL, ...]` so OpenRouter falls through on a 429 or provider error; empty leaves the payload unchanged. |
 | `MAX_DIFF_LINES` | Hard diff limit, default 400. |
 | `MAX_REVISE_ROUNDS` | Automatic revision rounds, default 2. |
 | `MAX_PENDING_JOBS` | Queue cap, default 10. |
