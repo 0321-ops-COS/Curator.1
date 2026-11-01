@@ -48,7 +48,7 @@ trap cleanup EXIT INT TERM
 
 xcrun simctl list devices available > "$sim_log"
 if [ -n "$WANTED_SIMULATOR" ]; then
-  udid="$(grep -F "    $WANTED_SIMULATOR (" "$sim_log" | head -n 1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')"
+  udid="$(grep -F "    $WANTED_SIMULATOR (" "$sim_log" | head -n 1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/' || true)"
 fi
 if [ -z "$udid" ]; then
   udid="$(grep -E '^[[:space:]]+iPhone .*\([0-9A-Fa-f-]{36}\)' "$sim_log" | head -n 1 | sed -E 's/.*\(([0-9A-Fa-f-]{36})\).*/\1/')"

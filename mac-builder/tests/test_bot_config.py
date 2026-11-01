@@ -58,6 +58,20 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(bot.ConfigError):
             settings_from(QUESTION_MANAGER_COOLDOWN_SECONDS="-5")
 
+    def test_manager_fallback_models_default_to_empty(self) -> None:
+        self.assertEqual(settings_from().manager_fallback_models, ())
+
+    def test_manager_fallback_models_are_trimmed_and_blanks_dropped(self) -> None:
+        settings = settings_from(MANAGER_FALLBACK_MODELS=" backup-a , ,backup-b ")
+        self.assertEqual(settings.manager_fallback_models, ("backup-a", "backup-b"))
+
+
+class ManagerFallbackWiringTests(unittest.TestCase):
+    def test_the_bot_hands_the_fallbacks_to_the_manager(self) -> None:
+        settings = settings_from(MANAGER_FALLBACK_MODELS="backup-a,backup-b")
+        instance = bot.MacBuilderBot(settings)
+        self.assertEqual(instance.manager.fallback_models, ("backup-a", "backup-b"))
+
 
 class LaunchAgentTests(unittest.TestCase):
     """The plist must run the folder that holds this code, and say which it is."""
