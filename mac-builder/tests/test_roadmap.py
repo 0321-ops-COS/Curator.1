@@ -13,6 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import bot  # noqa: E402
+import roadmap  # noqa: E402
 
 SHEET = """# Build sheet
 ## Job
@@ -98,7 +99,7 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._roadmap_tick()
         second = self.bot.queue.submitted[1]
         self.assertEqual((second.kind, second.text), ("dan", "Refactor the parser."))
-        saved = json.loads((Path(self._tmp.name) / "roadmap.json").read_text("utf-8"))
+        saved = json.loads((Path(self._tmp.name) / "roadmap.json").read_text("utf-8"))["steps"]
         self.assertEqual([item["kind"] for item in saved], ["task", "dan"])
         second.status = "approved"
         await self.bot._roadmap_tick()
@@ -114,7 +115,7 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
                           "failed" in ping, self.bot._roadmap_steps), (1, True, True, []))
         await self.start(SHEET)
         self.assertIn("1 job", self.bot._roadmap_stop())
-        self.assertEqual(json.loads((Path(self._tmp.name) / "roadmap.json").read_text()), [])
+        self.assertEqual(json.loads((Path(self._tmp.name) / "roadmap.json").read_text())["steps"], [])
         self.bot.queue.submitted[1].status = "approved"
         await self.bot._roadmap_tick()
         self.assertEqual(len(self.bot.queue.submitted), 2)
@@ -194,6 +195,31 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((self.channel.send.await_count, len(self.bot.queue.submitted)),
                              (2, 2))
 
+    def test_a_saved_roadmap_loads_back_with_its_channel(self) -> None:
+        path = Path(self._tmp.name) / "roadmap.json"
+        steps = [roadmap.Step("Add a button.", "task"), roadmap.Step("Refactor.", "dan", "j1")]
+        roadmap.save(path, steps, channel_id=7, requester_id=42)
+        loaded, channel_id, requester_id = roadmap.load(path)
+        self.assertEqual(([step.text for step in loaded], channel_id, requester_id),
+                         (["Add a button.", "Refactor."], 7, 42))
+        self.assertEqual(loaded[1].job_id, "j1")
+
+    def test_a_missing_or_corrupt_roadmap_file_is_ignored(self) -> None:
+        path = Path(self._tmp.name) / "roadmap.json"
+        self.assertEqual(roadmap.load(path), ([], 0, 0), "no file at all")
+        for text in ("", "{not json", "{}", '{"steps": [{"kind": "task"}]}',
+                     '{"steps": [{"text": "x", "kind": "evil"}]}'):
+            path.write_text(text, "utf-8")
+            self.assertEqual(roadmap.load(path), ([], 0, 0), text)
+
+    def test_a_restored_roadmap_adopts_its_queued_job(self) -> None:
+        job = SimpleNamespace(id="j1", status="approved")
+        self.bot.queue.running = None
+        self.bot.queue.waiting = lambda: [job]
+        self.bot._roadmap_steps = [roadmap.Step("One.", "task", "j1")]
+        self.bot._roadmap_job = None
+        self.assertIs(self.bot._roadmap_adopt(), job)
+
     async def test_a_denied_user_queues_nothing(self) -> None:
         denied = await self.start(user_id=7)
         self.assertIn("allowlist", denied.response.send_message.await_args.args[0])
@@ -244,7 +270,7 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.on_message(message)
         self.assertIn("Roadmap queued: 2 job(s)", message.reply.await_args.args[0])
         self.assertEqual(len(self.bot.queue.submitted), 1, "one job at a time")
-        saved = json.loads((Path(self._tmp.name) / "roadmap.json").read_text("utf-8"))
+        saved = json.loads((Path(self._tmp.name) / "roadmap.json").read_text("utf-8"))["steps"]
         self.assertEqual([item["text"] for item in saved], ["Add a button.",
                                                             "Refactor the parser."])
         self.assertEqual(self.bot._roadmap_waiting, {})

@@ -685,11 +685,12 @@ class MacBuilderBot(discord.Client):
         # The reviewed jobs /merge may gate, by id, newest last.
         self._merge_jobs: dict[str, Job] = {}
         self._board_ticker: asyncio.Task[None] | None = None
-        self._roadmap_steps: list[roadmap.Step] = []
         self._roadmap_jobs: dict[str, Job] = {}
         self._roadmap_job: Job | None = None
-        self._roadmap_channel_id = 0
-        self._roadmap_requester_id = 0
+        # A roadmap saved before the last restart is resumed, not forgotten.
+        self._roadmap_steps, self._roadmap_channel_id, self._roadmap_requester_id = (
+            roadmap.load(self._roadmap_path()))
+        self._roadmap_restored = len(self._roadmap_steps)
         # When each waiting job was last reminded of, or is next due one.
         self._roadmap_reminder: dict[str, float] = {}
         # Requester id -> (channel id, mode, expiry) for a sheet still to arrive.
@@ -938,6 +939,15 @@ class MacBuilderBot(discord.Client):
             log.warning(
                 "manager is not configured; reviews will ask for a human decision"
             )
+        if self._roadmap_restored:
+            channel = self._target_channel(self._roadmap_channel_id)
+            try:
+                if channel is not None:
+                    await channel.send(
+                        f"Roadmap restored: {self._roadmap_restored} job(s) left")
+                    self._roadmap_restored = 0
+            except Exception:
+                log.warning("could not announce the restored roadmap")
 
     async def close(self) -> None:
         tickers = [self._board_ticker, self._heartbeat_ticker]
@@ -1704,7 +1714,8 @@ class MacBuilderBot(discord.Client):
         if job is None:
             self._roadmap_steps = []
             return "The queue is full; nothing was queued."
-        roadmap.save(self._roadmap_path(), steps)
+        roadmap.save(self._roadmap_path(), steps, channel_id=channel_id,
+                     requester_id=requester_id)
         return _clip_reply(
             f"Roadmap queued: {len(steps)} job(s), first is `{job.id}` ({steps[0].kind}). "
             "Each still waits for your Approve; nothing is pushed or merged.")
@@ -1754,6 +1765,8 @@ class MacBuilderBot(discord.Client):
 
     async def _roadmap_tick(self) -> None:
         """Queue the next job only after the current one is approved; status only."""
+        if not self._roadmap_job and self._roadmap_steps:
+            self._roadmap_job = self._roadmap_adopt()
         current = self._roadmap_job
         if current is None or not self._roadmap_steps:
             return
@@ -1765,9 +1778,21 @@ class MacBuilderBot(discord.Client):
             if step is None:
                 await self._roadmap_finish("roadmap done")
             elif await self._queue_roadmap_step(step) is not None:
-                roadmap.save(self._roadmap_path(), self._roadmap_steps)
+                roadmap.save(self._roadmap_path(), self._roadmap_steps,
+                             channel_id=self._roadmap_channel_id,
+                             requester_id=self._roadmap_requester_id)
         elif current.status == "awaiting_review":
             await self._roadmap_remind(current)
+
+    def _roadmap_adopt(self) -> Job | None:
+        """After a restart: the roadmap's own job, if the queue still has it."""
+        ids = {step.job_id for step in self._roadmap_steps if step.job_id}
+        running = getattr(self.queue, "running", None)
+        running = running() if callable(running) else running
+        for job in [running, *self.queue.waiting()]:
+            if job is not None and job.id in ids:
+                return job
+        return None
 
     async def _roadmap_remind(self, job: Job) -> None:
         """One ping every ROADMAP_PING_SECONDS while the review waits on Approve."""
