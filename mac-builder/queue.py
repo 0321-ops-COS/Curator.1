@@ -43,6 +43,12 @@ class Job:
     branch: str = ""
     commit_label: str = ""
     elapsed_label: str = ""
+    base: str = ""
+    repo_slug: str = ""  # OWNER/REPO the branch can be merged in
+    check_state: str = ""
+    diff_lines: int = 0
+    changed_paths: tuple[str, ...] = ()
+    merge_dry_run_sha: str = ""  # the PR head a dry run saw
 
     @property
     def duration(self) -> float | None:

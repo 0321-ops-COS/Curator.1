@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, Sequence
 
+import merge_command
 import questions
 import rules
 import screens
@@ -738,6 +739,9 @@ class JobRunner:
                 if env.base_commit
                 else env.base_branch
             )
+            # What the gated /merge reads: the real base and repo, never guessed.
+            job.base = env.base_branch
+            job.repo_slug = merge_command.repo_slug_for(self.settings, job.kind)
             self._stage(
                 job, status_board.FREEBUFF_WORKING, f"launched from {job.base_label}"
             )
@@ -893,6 +897,9 @@ class JobRunner:
                 # Approve pushes long after this run returns, so the branch is
                 # kept: it is what names this job when the runner reports PUSHED.
                 self._remember_review(job, env)
+                job.check_state = check_state
+                job.diff_lines = changes.diff_lines
+                job.changed_paths = tuple(all_paths)
                 await self.freebuff.abort(env)
                 outcome = ReviewOutcome(
                     job=job,
