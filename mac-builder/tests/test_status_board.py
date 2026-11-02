@@ -18,6 +18,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import bot  # noqa: E402
+import freebuff_runner  # noqa: E402
 import jobs  # noqa: E402
 import screens  # noqa: E402
 import status_board  # noqa: E402
@@ -496,6 +497,180 @@ class StageHookTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn(status_board.TIMED_OUT, stages)
         self.assertIn(status_board.FAILED, stages)
+
+
+# ------------------------------------------------- the push after Approve
+
+
+class _ReviewFreebuff:
+    """A runner with the real stage hook: that hook is what the board uses."""
+
+    # The real property and method, so the test runs the wiring the push path
+    # uses instead of a copy of it.
+    status_reporter = freebuff_runner.FreebuffRunner.status_reporter
+    report_stage = freebuff_runner.FreebuffRunner.report_stage
+    _status_reporter = None
+
+    def __init__(self, env: freebuff_runner.TaskEnvironment) -> None:
+        self.env = env
+        self.screen_reporter = None
+        self.aborts = 0
+
+    async def start_task(
+        self, *, job_id: str, task_text: str, log_path: Path, kind: str = "task"
+    ) -> freebuff_runner.TaskEnvironment:
+        return self.env
+
+    async def wait_for_changes(
+        self, env: object, log_path: Path, **kwargs: object
+    ) -> str:
+        return "exited"
+
+    async def collect(
+        self, env: object, max_diff_lines: int
+    ) -> freebuff_runner.ChangeSet:
+        return freebuff_runner.ChangeSet(
+            diff=(
+                "diff --git a/ios-app/RootView.swift b/ios-app/RootView.swift\n"
+                "--- a/ios-app/RootView.swift\n"
+                "+++ b/ios-app/RootView.swift\n"
+                "@@ -1 +1 @@\n-let a = 1\n+let a = 2\n"
+            ),
+            diff_lines=2,
+            changed_paths=["ios-app/RootView.swift"],
+            status=" M ios-app/RootView.swift",
+            head="a" * 40,
+            snapshot="a" * 40 + ":b2c3",
+        )
+
+    async def abort(self, env: object | None = None) -> None:
+        self.aborts += 1
+
+
+class _ApprovingManager:
+    enabled = False
+
+    async def review(self, brief: object) -> SimpleNamespace:
+        return SimpleNamespace(verdict="approve", notes="looks right")
+
+
+class ApprovePushTests(unittest.IsolatedAsyncioTestCase):
+    """An approved push ends the board, ten minutes later included."""
+
+    def setUp(self) -> None:
+        self.clock = Clock()
+        self.wall = Clock(0.0)
+        self.transport = FakeTransport()
+        self.publisher = status_board.BoardPublisher(
+            self.transport,
+            edit_min_seconds=15.0,
+            stall_ping_seconds=600.0,
+            pings=True,
+            now=self.clock,
+            wall=self.wall,
+        )
+        self.tasks: list[asyncio.Task[None]] = []
+        self.reviews: list[object] = []
+
+    def on_stage(self, job: jobs.Job, stage: str, detail: str = "") -> None:
+        """The bot's hook: report as its own task, never delay the job."""
+        screen_kind = detail if stage == status_board.WAITING_ON_YOU else ""
+        self.tasks.append(
+            asyncio.create_task(
+                self.publisher.report(
+                    job.id,
+                    stage,
+                    "" if screen_kind else detail,
+                    screen_kind=screen_kind,
+                )
+            )
+        )
+
+    async def flush(self) -> None:
+        pending, self.tasks = self.tasks, []
+        if pending:
+            await asyncio.gather(*pending)
+
+    async def post_review(self, outcome: object) -> None:
+        self.reviews.append(outcome)
+
+    async def test_an_approved_push_moves_the_board_and_stops_the_stall_ping(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            scripts = root / "scripts"
+            scripts.mkdir()
+            # The real /check and /test are Xcode: only the failure mode matters.
+            for name in ("check.sh", "test.sh"):
+                (scripts / name).write_text("exit 0\n", encoding="utf-8")
+            env = freebuff_runner.TaskEnvironment(
+                branch="freebuff/a1b2c3d4",
+                worktree=worktree,
+                session="macbuilder-test",
+                base_branch="freebuff/base",
+            )
+            freebuff = _ReviewFreebuff(env)
+            job = jobs.Job(
+                id=JOB_ID,
+                kind="task",
+                title="make the card bigger",
+                channel_id=99,
+                requester_id=OWNER,
+                log_path=root / "job.log",
+                text="make the card bigger",
+            )
+
+            async def post_job(_job: jobs.Job, ok: bool, summary: str) -> None:
+                return None
+
+            runner = jobs.JobRunner(
+                SimpleNamespace(
+                    max_diff_lines=400,
+                    max_revise_rounds=0,
+                    question_wait_seconds=1800,
+                    question_auto_answer=False,
+                    project=None,
+                ),
+                _ApprovingManager(),
+                freebuff,
+                post_job=post_job,
+                post_review=self.post_review,
+                on_stage=self.on_stage,
+            )
+            self.publisher.track(
+                JOB_ID,
+                channel_id=99,
+                requester_id=OWNER,
+                kind="task",
+                project="Hustler",
+            )
+
+            with mock.patch.object(jobs, "SCRIPT_DIR", scripts):
+                await runner.run(job)
+            await self.flush()
+
+            board = self.publisher.board_for(JOB_ID)
+            assert board is not None
+            self.assertEqual(board.stage, status_board.AWAITING_APPROVE)
+            self.assertEqual(len(self.reviews), 1, "the review Approve acts on")
+
+            # Approve pushes, and approve_and_push ends with exactly this report,
+            # long after the job's own run returned.
+            freebuff.report_stage(status_board.PUSHED, f"{env.branch} at abc1234")
+            await self.flush()
+
+            board = self.publisher.board_for(JOB_ID)
+            assert board is not None
+            self.assertEqual(board.stage, status_board.PUSHED)
+
+            # Ten minutes later the stall timer elapses: nothing has stalled.
+            self.clock.advance(601)
+            await self.publisher.tick()
+            stalled = [ping for ping in self.transport.pings if "has not moved" in ping]
+            self.assertEqual(stalled, [], "a pushed job is never a stalled one")
 
 
 # --------------------------------------------------------------------- bot
