@@ -310,6 +310,15 @@ def stalled_ping(board: Board) -> str:
     )
 
 
+def digest_text(board: Board, now: float | None = None) -> str:
+    """The periodic while-it-works ping: real stage, real elapsed time."""
+    when = time.time() if now is None else now
+    text = f"⏱ `{board.job_id}` {board.position}/{len(PROGRESS_STAGES)} {stage_title(board.stage)}"
+    if board.started_at is not None:
+        text += f" · {format_elapsed(when - board.started_at)}"
+    return text + (f" · last event: {truncate(board.detail)}" if board.detail else "")
+
+
 # ------------------------------------------------------------- the publisher
 
 
@@ -342,6 +351,7 @@ class _Tracked:
     last_change_at: float = 0.0
     pings_sent: set[str] = field(default_factory=set)
     stall_pinged: bool = False
+    last_digest_at: float = 0.0
     post_failed_at: float | None = None
     # A stage changed while the edit was throttled: the next tick draws it.
     dirty: bool = False
@@ -362,6 +372,7 @@ class BoardPublisher:
         edit_min_seconds: float = 15.0,
         stall_ping_seconds: float = 600.0,
         pings: bool = True,
+        digest_seconds: float = 0.0,
         now: Callable[[], float] = time.monotonic,
         wall: Callable[[], float] = time.time,
     ) -> None:
@@ -369,6 +380,8 @@ class BoardPublisher:
         self.edit_min_seconds = max(0.0, float(edit_min_seconds))
         self.stall_ping_seconds = float(stall_ping_seconds)
         self.pings = bool(pings)
+        # STATUS_DIGEST_SECONDS: off unless the bot passes the interval.
+        self.digest_seconds = max(0.0, float(digest_seconds))
         self.now = now
         self.wall = wall
         self._jobs: dict[str, _Tracked] = {}
@@ -411,6 +424,7 @@ class BoardPublisher:
             channel_id=channel_id,
             requester_id=requester_id,
             last_change_at=when,
+            last_digest_at=when,
         )
         return board
 
@@ -472,6 +486,7 @@ class BoardPublisher:
         ):
             tracked.last_change_at = when
             tracked.stall_pinged = False
+            tracked.last_digest_at = when
         tracked.board = new
         if pingable:
             await self._maybe_ping(tracked, new)
@@ -581,6 +596,19 @@ class BoardPublisher:
                     tracked.board = replace(board, queue_position=position)
                     board = tracked.board
                     changed = True
+            if (
+                self.pings
+                and board.stage == FREEBUFF_WORKING
+                and 0 < self.digest_seconds <= when - tracked.last_digest_at
+            ):
+                tracked.last_digest_at = when
+                mention = f"<@{tracked.requester_id}> " if tracked.requester_id else ""
+                try:
+                    await self.transport.send(
+                        tracked.channel_id, mention + digest_text(board, now=self.wall())
+                    )
+                except Exception:  # a digest must never touch the job
+                    pass
             if (
                 board.terminal
                 or board.waiting
