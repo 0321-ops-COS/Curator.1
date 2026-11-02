@@ -88,7 +88,36 @@ def preview(steps: list[Step]) -> str:
     return "\n".join(lines)
 
 
-def save(path: Path, steps: list[Step]) -> None:
-    """Write the roadmap, so a restart can say what was queued."""
+def save(path: Path, steps: list[Step], *, channel_id: int = 0,
+         requester_id: int = 0) -> None:
+    """Write the roadmap and where it started, so a restart can resume it."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps([asdict(step) for step in steps], indent=2), "utf-8")
+    payload = {
+        "channel_id": int(channel_id),
+        "requester_id": int(requester_id),
+        "steps": [asdict(step) for step in steps],
+    }
+    path.write_text(json.dumps(payload, indent=2), "utf-8")
+
+
+def load(path: Path) -> tuple[list[Step], int, int]:
+    """The saved roadmap, its channel and requester: ([], 0, 0) if unusable."""
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return [], 0, 0
+    items = data.get("steps") if isinstance(data, dict) else data  # a bare list is an old file
+    if not isinstance(items, list):
+        return [], 0, 0
+    steps: list[Step] = []
+    for item in items:
+        text = item.get("text") if isinstance(item, dict) else None
+        kind = (item.get("kind") if isinstance(item, dict) else None) or "task"
+        if (not isinstance(text, str) or not text.strip()
+                or len(text) > MAX_TASK_CHARS or kind not in ("task", "dan")):
+            return [], 0, 0
+        steps.append(Step(text, kind, str(item.get("job_id") or "")))
+    try:
+        return steps, int(data.get("channel_id") or 0), int(data.get("requester_id") or 0)
+    except (AttributeError, TypeError, ValueError):
+        return steps, 0, 0
