@@ -45,6 +45,7 @@ import compare_link  # noqa: E402
 import github_client  # noqa: E402
 import jobs  # noqa: E402
 import merge_command  # noqa: E402
+import test_card  # noqa: E402
 import planner  # noqa: E402
 import project_context  # noqa: E402
 import questions  # noqa: E402
@@ -279,6 +280,8 @@ class Settings:
     status_edit_min_seconds: float = 15.0
     status_stall_ping_seconds: float = 600.0
     status_pings: bool = True
+    # While Freebuff works, one short digest ping this often; 0 turns it off.
+    status_digest_seconds: float = 900.0
     # Filled in by main() after the startup preflight; None before that.
     project: "project_context.ProjectContext | None" = None
 
@@ -366,6 +369,7 @@ class Settings:
             status_edit_min_seconds=_env_float("STATUS_EDIT_MIN_SECONDS", 15.0),
             status_stall_ping_seconds=_env_float("STATUS_STALL_PING_SECONDS", 600.0),
             status_pings=_env_bool("STATUS_PINGS", True),
+            status_digest_seconds=_env_float("STATUS_DIGEST_SECONDS", 900.0),
         )
         if settings.max_pending_jobs < 1:
             raise ConfigError("MAX_PENDING_JOBS must be at least 1")
@@ -383,6 +387,8 @@ class Settings:
             raise ConfigError("STATUS_EDIT_MIN_SECONDS must be 0 or more")
         if settings.status_stall_ping_seconds < 1:
             raise ConfigError("STATUS_STALL_PING_SECONDS must be at least 1")
+        if settings.status_digest_seconds < 0:
+            raise ConfigError("STATUS_DIGEST_SECONDS must be 0 or more")
         return settings
 
 
@@ -466,6 +472,40 @@ def review_compare_url(settings: object, outcome: ReviewOutcome) -> str | None:
     if base.startswith("origin/"):
         base = base[len("origin/"):]
     return compare_link.compare_url(remote, base, env.branch)
+
+
+# Stages no builder job runs: a live Discord and GitHub call, and the simulator
+# needs a booted GUI session. The report names them instead of implying they ran.
+UNVERIFIED_STAGES = ("live Discord", "live GitHub", "simulator")
+
+
+def dan_report_text(outcome: ReviewOutcome) -> str:
+    """What the job recorded, with what was not verified named.
+
+    Every value is a recorded fact (repo and branch from the runner, commit from
+    the review's snapshot, counts from the change set, the check stage's state);
+    a value nobody recorded says so, and the builder's summary is no evidence.
+    """
+    job, env = outcome.job, outcome.environment
+    branch = getattr(env, "branch", "") or job.branch or "not recorded"
+    head = outcome.snapshot.partition(":")[0]
+    files = outcome.changed_files
+    names = ", ".join(f"`{name}`" for name in files[:3])
+    if len(files) > 3:
+        names += f" and {len(files) - 3} more"
+    check = outcome.check_state or "not recorded"
+    check += f" · test {outcome.test_state}" if outcome.test_state else ""
+    lines = [
+        f"**Report — `{job.id}`**",
+        f"Repo: `{job.repo_slug or 'not recorded'}`",
+        f"Branch: `{branch}`",
+        f"Commit: `{head or 'not recorded'}`",
+        f"Files changed: {len(files)}" + (f" — {names}" if names else ""),
+        f"Diff lines: {outcome.diff_lines}",
+        f"Check: {check}",
+        "Not verified: " + ", ".join(UNVERIFIED_STAGES),
+    ]
+    return "\n".join(lines)[:1900]
 
 
 def is_approvable(outcome: ReviewOutcome) -> bool:
@@ -599,6 +639,7 @@ class MacBuilderBot(discord.Client):
             edit_min_seconds=settings.status_edit_min_seconds,
             stall_ping_seconds=settings.status_stall_ping_seconds,
             pings=settings.status_pings,
+            digest_seconds=settings.status_digest_seconds,
         )
         self._board_tasks: set[asyncio.Task[None]] = set()
         # The reviewed jobs /merge may gate, by id, newest last.
@@ -1778,12 +1819,21 @@ class MacBuilderBot(discord.Client):
             f"See `{job.log_path.name}`."
         )
 
+    async def _post_report(self, channel: object, outcome: ReviewOutcome) -> None:
+        """The job's report, then its test card: two plain messages, no embed."""
+        for text in (dan_report_text(outcome), test_card.card(outcome.job.text)):
+            try:
+                await channel.send(text)
+            except Exception:  # a report may never fail a review
+                log.exception("could not post a report line for job %s", outcome.job.id)
+
     async def _post_review(self, outcome: ReviewOutcome) -> None:
         self._remember_merge_job(outcome.job)
         channel = self._target_channel(outcome.job.channel_id)
         if channel is None:
             log.warning("no Discord channel for review of %s", outcome.job.id)
             return
+        await self._post_report(channel, outcome)
         if outcome.verdict == "blocked":
             embed = discord.Embed(
                 title="⛔ Blocked by rules — manager not called",

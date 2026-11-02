@@ -275,6 +275,7 @@ are kept for inspection.
 | `STATUS_EDIT_MIN_SECONDS` | Minimum seconds between edits of one status board message, so Discord is never rate-limited. Default 15. |
 | `STATUS_STALL_PING_SECONDS` | A running job with no stage change for this long earns one "has not moved" ping per stall. Default 600. |
 | `STATUS_PINGS` | `1` (default) sends the short pings that need you; `0` keeps the quietly edited board and sends none. |
+| `STATUS_DIGEST_SECONDS` | While Freebuff works, one short progress ping (job, stage n/7, elapsed, last event) this often. Default 900; `0` turns it off. |
 | `FREEBUFF_TIMEOUT_SECONDS` | Hard stop per Freebuff round. |
 | `QUESTION_WAIT_SECONDS` | How long a Freebuff question box may hold a job waiting for `/answer`; after that it is dismissed with `Esc` and the job fails. Default 1800. |
 | `QUESTION_AUTO_ANSWER` | `1` lets the manager answer a question, only when it replies with high confidence. Default `0`: the manager is rate limited and off by default. |
@@ -588,6 +589,10 @@ last event: branch freebuff/9a1c ready
   out. A stage that has not changed for `STATUS_STALL_PING_SECONDS` pings once
   per stall. Routine stages never ping, and a wait screen pings once per kind,
   not once per pane repaint. `STATUS_PINGS=0` keeps the board and sends nothing.
+- **One digest while Freebuff works:** every `STATUS_DIGEST_SECONDS` (default
+  900) one short ping names the job, its stage as n/7, the elapsed time and the
+  last event, so a long build is not silence. `STATUS_PINGS=0` and
+  `STATUS_DIGEST_SECONDS=0` both turn it off.
 - **`/board`** posts a fresh board for the running job. Script jobs (`/check`,
   `/test`, `/build`) keep their existing result embed and are listed by
   `/status` only: they are not builder stages, so they get no bar.
@@ -654,6 +659,12 @@ arguments (never Discord input).
   request still goes through the one retry and then falls back to you.
 - `revise` sends concrete notes back to Freebuff, re-runs the checks and reviews
   again, up to `MAX_REVISE_ROUNDS` (2). After that the decision goes to you.
+- Every review posts two plain messages before that embed. The **report** names
+  the repo, branch, commit SHA, files, diff lines and check state the job
+  recorded, and ends `Not verified: live Discord, live GitHub, simulator`. The
+  **test card** quotes at most five steps from the task's own "Accept"/"Test"
+  heading or `Test:` lines, or says `No test steps in the task`. No model is
+  called and no step is invented.
 - `approve` and `ask_user` post an embed with **Approve** / **Reject** buttons.
   Approve commits the worktree, pushes only `freebuff/<id>` and reports the
   commit. Reject pushes nothing. Only the gated `/merge` merges: every gate must
