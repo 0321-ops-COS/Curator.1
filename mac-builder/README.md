@@ -273,7 +273,8 @@ are kept for inspection.
 | `FREEBUFF_POLL_SECONDS` | How often the pane is captured to look for a question or a stuck screen; default 10. |
 | `STALL_SECONDS` | A pane and a worktree both unchanged this long is a screen, not progress: it is posted once, the clocks pause, and `/screen`, `/key` and `/send` become available. Default 90. |
 | `STATUS_EDIT_MIN_SECONDS` | Minimum seconds between edits of one status board message, so Discord is never rate-limited. Default 15. |
-| `STATUS_STALL_PING_SECONDS` | A running job with no stage change for this long earns one "has not moved" ping per stall. Default 600. |
+| `HEARTBEAT_PING_SECONDS` | While a job's tmux pane keeps changing, one "still working" message this often. Default 600; 0 turns it off. |
+| `STALL_NO_OUTPUT_SECONDS` | The only silence that counts as stuck: the pane unchanged this long earns one "possibly stuck" message per stall. Default 300. |
 | `STATUS_PINGS` | `1` (default) sends the short pings that need you; `0` keeps the quietly edited board and sends none. |
 | `STATUS_DIGEST_SECONDS` | While Freebuff works, one short progress ping (job, stage n/7, elapsed, last event) this often. Default 900; `0` turns it off. |
 | `FREEBUFF_TIMEOUT_SECONDS` | Hard stop per Freebuff round. |
@@ -586,11 +587,19 @@ last event: branch freebuff/9a1c ready
   `/screen`. It is always worded `looks like: <kind>`, because the patterns are
   not verified against the real binary.
 - **Queue position** (`queued #2`) is refreshed when the queue moves.
-- **Pings** are separate short messages, so the phone actually notifies: a job
-  waiting on you, a review ready to Approve, and a job finished, failed or timed
-  out. A stage that has not changed for `STATUS_STALL_PING_SECONDS` pings once
-  per stall. Routine stages never ping, and a wait screen pings once per kind,
-  not once per pane repaint. `STATUS_PINGS=0` keeps the board and sends nothing.
+- **Pings** are separate short messages, so the phone actually notifies: every
+  stage change (`<id> <bar> n/7 <stage> · <elapsed>`), a job waiting on you, a
+  review ready to Approve, and a job finished, failed or timed out. Routine
+  stages never ping, and a wait screen pings once per kind, not once per pane
+  repaint. `STATUS_PINGS=0` keeps the board and sends nothing.
+- **The pane heartbeat** captures the working job's pane every 20 seconds and
+  ignores what changes on its own — timers, the spinner, `working…` lines, the
+  ad box — then hashes the rest, so the board's last line can say
+  `last activity 12s ago` from Freebuff's own output. A pane that keeps changing
+  earns one `still working … · last activity Ns ago` message every
+  `HEARTBEAT_PING_SECONDS`, and only a pane that has not changed for
+  `STALL_NO_OUTPUT_SECONDS` is called possibly stuck, once per stall. A stage
+  that sits still while Freebuff keeps printing is never a stall.
 - **One digest while Freebuff works:** every `STATUS_DIGEST_SECONDS` (default
   900) one short ping names the job, its stage as n/7, the elapsed time and the
   last event, so a long build is not silence. `STATUS_PINGS=0` and

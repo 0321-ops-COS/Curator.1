@@ -188,6 +188,8 @@ class Board:
     # The bar position; the stage's own number unless a terminal stage kept the
     # last stage it reached.
     progress: int = 0
+    # The heartbeat's line: how long since the pane itself last changed.
+    activity: str = ""
 
     @property
     def pipeline(self) -> bool:
@@ -242,6 +244,8 @@ def render(board: Board, now: float | None = None) -> str:
         )
     if board.detail:
         lines.append(f"last event: {truncate(board.detail)}")
+    if board.activity:
+        lines.append(board.activity)
     return "\n".join(lines)
 
 
@@ -437,6 +441,19 @@ class BoardPublisher:
 
     def forget(self, job_id: str) -> None:
         self._jobs.pop(job_id, None)
+
+    def channel_for(self, job_id: str) -> int:
+        """The channel this job's board and its messages go to."""
+        tracked = self._jobs.get(job_id)
+        return tracked.channel_id if tracked is not None else 0
+
+    async def set_activity(self, job_id: str, text: str) -> None:
+        """Draw the heartbeat's last-activity line under the board, throttled."""
+        tracked = self._jobs.get(job_id)
+        if tracked is None or tracked.board.activity == text:
+            return
+        tracked.board = replace(tracked.board, activity=text)
+        await self._draw(tracked)
 
     # -------------------------------------------------------------- reporting
 
