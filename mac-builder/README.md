@@ -341,6 +341,7 @@ tail -f ~/Curator.1/mac-builder/logs/launchd.log
 | `/send <text>` | Pastes text into a stuck screen and submits it, the way `/task` does. At most 500 characters. |
 | `/board` | Re-posts the running job's status board if the message was lost. |
 | `/merge [job-id] [dry-run]` | Gates an approved review (allowlist, check, diff size, protected paths, PR, CI, unchanged head); merges only if every gate passes. Dry run by default. |
+| `/roadmap [sheet] [action]` | Queues one `.md` build sheet: each `## Job` heading is one job (max 8, 6000 chars each), `kind: task`/`kind: dan` picks the type. One at a time; the next queues only after you Approve, a failure stops it and pings. `action: status` lists it, `stop` drops the rest. Never approves, pushes or merges. |
 
 Job results are posted where the job was started, or to `NOTIFY_CHANNEL_ID`.
 
