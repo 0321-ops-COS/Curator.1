@@ -132,12 +132,27 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((self.channel.send.await_count, len(self.bot.queue.submitted)),
                              (2, 2))
 
-    async def test_a_ninth_job_and_a_denied_user_queue_nothing(self) -> None:
-        fake = await self.start("".join(f"## Job\nTask {n}.\n" for n in range(9)))
+    async def test_a_denied_user_queues_nothing(self) -> None:
         denied = await self.start(user_id=7)
-        self.assertIn("limit is 8", fake.response.send_message.await_args.args[0])
         self.assertIn("allowlist", denied.response.send_message.await_args.args[0])
         self.assertEqual(self.bot.queue.submitted, [])
+
+    async def test_a_sheet_of_nine_jobs_parses_in_order(self) -> None:
+        await self.start("".join(f"## Job\nTask {n}.\n" for n in range(9)))
+        self.assertEqual([step.text for step in self.bot._roadmap_steps],
+                         [f"Task {n}." for n in range(9)])
+        self.assertEqual(len(self.bot.queue.submitted), 1, "still one job at a time")
+
+    async def test_a_sheet_of_thirty_jobs_parses_in_order(self) -> None:
+        await self.start("".join(f"## Job\nTask {n}.\n" for n in range(30)))
+        self.assertEqual([step.text for step in self.bot._roadmap_steps],
+                         [f"Task {n}." for n in range(30)])
+        self.assertEqual(len(self.bot.queue.submitted), 1, "still one job at a time")
+
+    async def test_an_empty_sheet_is_still_rejected(self) -> None:
+        fake = await self.start("# Build sheet\nNothing under a heading.\n")
+        self.assertIn('no "## Job" heading', fake.response.send_message.await_args.args[0])
+        self.assertEqual((self.bot.queue.submitted, self.bot._roadmap_steps), ([], []))
 
 
 if __name__ == "__main__":

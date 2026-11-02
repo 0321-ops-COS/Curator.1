@@ -10,7 +10,6 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-MAX_JOBS = 8
 MAX_TASK_CHARS = 6000
 HEADING = "## job"
 # A job that ended without an approval stops the roadmap.
@@ -56,8 +55,6 @@ def parse(sheet: str) -> list[Step]:
 
     if not steps:
         raise RoadmapError('no "## Job" heading with a task under it')
-    if len(steps) > MAX_JOBS:
-        raise RoadmapError(f"{len(steps)} jobs in the sheet; the limit is {MAX_JOBS}")
     for number, step in enumerate(steps, start=1):
         if len(step.text) > MAX_TASK_CHARS:
             raise RoadmapError(f"job {number} is {len(step.text)} chars; limit {MAX_TASK_CHARS}")
