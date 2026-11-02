@@ -1106,14 +1106,54 @@ class MacBuilderBot(discord.Client):
 
     # ---------------------------------------------------------------- tasks
 
-    @app_commands.describe(text="What Freebuff should do on a fresh freebuff/* branch")
-    async def cmd_task(self, interaction: discord.Interaction, text: str) -> None:
-        if not await self.require_allowed(interaction):
-            return
+    async def _task_text(
+        self,
+        interaction: discord.Interaction,
+        text: str,
+        attachment: Optional[discord.Attachment],
+    ) -> str | None:
+        """Typed text plus an attached .txt/.md file; None after saying why not."""
         try:
-            task_text = rules.sanitize_task_text(text)
+            typed = rules.sanitize_task_text(text) if (text or "").strip() else ""
+            attached = ""
+            if attachment is not None:
+                try:
+                    data = await attachment.read()
+                except discord.HTTPException:
+                    await interaction.response.send_message(
+                        "I could not read that attachment; post the file again.",
+                        ephemeral=True,
+                    )
+                    return None
+                attached = rules.attachment_task_text(
+                    getattr(attachment, "filename", ""), data
+                )
+            combined = rules.combine_task_text(typed, attached)
         except ValueError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
+            return None
+        if not combined:
+            await interaction.response.send_message(
+                "Give me a task: some text, a .txt/.md attachment, or both.",
+                ephemeral=True,
+            )
+            return None
+        return combined
+
+    @app_commands.describe(
+        text="What Freebuff should do on a fresh freebuff/* branch",
+        attachment="Optional .txt or .md file (max 200 KB) appended to the text",
+    )
+    async def cmd_task(
+        self,
+        interaction: discord.Interaction,
+        text: app_commands.Range[str, 1, rules.MAX_TASK_CHARS] = "",
+        attachment: Optional[discord.Attachment] = None,
+    ) -> None:
+        if not await self.require_allowed(interaction):
+            return
+        task_text = await self._task_text(interaction, text, attachment)
+        if task_text is None:
             return
         job = jobs.make_job(
             self.settings,
@@ -1135,15 +1175,21 @@ class MacBuilderBot(discord.Client):
             ephemeral=True,
         )
 
-    @app_commands.describe(text="What Dan should change in mac-builder/ on a fresh dan/* branch")
-    async def cmd_dan(self, interaction: discord.Interaction, text: str) -> None:
+    @app_commands.describe(
+        text="What Dan should change in mac-builder/ on a fresh dan/* branch",
+        attachment="Optional .txt or .md file (max 200 KB) appended to the text",
+    )
+    async def cmd_dan(
+        self,
+        interaction: discord.Interaction,
+        text: app_commands.Range[str, 1, rules.MAX_TASK_CHARS] = "",
+        attachment: Optional[discord.Attachment] = None,
+    ) -> None:
         """A self-build: her own checkout, branched from a freshly fetched origin/main."""
         if not await self.require_allowed(interaction):
             return
-        try:
-            task_text = rules.sanitize_task_text(text)
-        except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
+        task_text = await self._task_text(interaction, text, attachment)
+        if task_text is None:
             return
         job = jobs.make_job(
             self.settings,
@@ -1170,7 +1216,11 @@ class MacBuilderBot(discord.Client):
     # ------------------------------------------------------------- questions
 
     @app_commands.describe(text="An option number from the question, or free text")
-    async def cmd_answer(self, interaction: discord.Interaction, text: str) -> None:
+    async def cmd_answer(
+        self,
+        interaction: discord.Interaction,
+        text: app_commands.Range[str, 1, questions.MAX_ANSWER_CHARS] = "",
+    ) -> None:
         """Answer the one pending Freebuff question; the allowlist is checked first."""
         if not await self.require_allowed(interaction):
             return
@@ -1241,7 +1291,11 @@ class MacBuilderBot(discord.Client):
         )
 
     @app_commands.describe(name="One key: Enter, Esc, Up, Down, Left, Right, Tab, y or n")
-    async def cmd_key(self, interaction: discord.Interaction, name: str) -> None:
+    async def cmd_key(
+        self,
+        interaction: discord.Interaction,
+        name: app_commands.Range[str, 1, 6000] = "",
+    ) -> None:
         """One key from the fixed allowlist, only while a screen is waiting."""
         if not await self.require_allowed(interaction):
             return
@@ -1262,7 +1316,11 @@ class MacBuilderBot(discord.Client):
         await interaction.response.send_message(f"Sent `{key}`.", ephemeral=True)
 
     @app_commands.describe(text="Text to paste into Freebuff and submit, like /task")
-    async def cmd_send(self, interaction: discord.Interaction, text: str) -> None:
+    async def cmd_send(
+        self,
+        interaction: discord.Interaction,
+        text: app_commands.Range[str, 1, screens.MAX_SEND_CHARS] = "",
+    ) -> None:
         """Paste text into a waiting screen: load-buffer, paste-buffer, Enter."""
         if not await self.require_allowed(interaction):
             return

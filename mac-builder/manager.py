@@ -28,8 +28,10 @@ MAX_PLAN_CHARS = 60_000  # input material; the reply is capped by the token budg
 MAX_CHAT_CHARS = 24_000
 MAX_CHAT_MESSAGES = 12
 MAX_PROPOSED_TASKS = 3
-MAX_ANSWER_CONTEXT_CHARS = 12_000
-MAX_ANSWER_TASK_CHARS = 4000
+# The task is now as long as a Discord option allows, so the context that
+# carries it plus the plan, question and diff has to be wide enough for both.
+MAX_ANSWER_CONTEXT_CHARS = 20_000
+MAX_ANSWER_TASK_CHARS = 6000
 MAX_ANSWER_PLAN_CHARS = 6000
 MAX_ANSWER_QUESTION_CHARS = 2000
 MAX_ANSWER_DIFF_CHARS = 1500

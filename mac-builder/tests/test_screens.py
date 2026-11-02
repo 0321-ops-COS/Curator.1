@@ -227,7 +227,8 @@ class KeyTests(unittest.TestCase):
     def test_send_text_is_one_line_and_capped(self) -> None:
         self.assertEqual(screens.flatten_send("a\nb\r\nc"), "a b c")
         self.assertEqual(
-            len(screens.flatten_send("x" * 5000)), screens.MAX_SEND_CHARS
+            len(screens.flatten_send("x" * (screens.MAX_SEND_CHARS + 1000))),
+            screens.MAX_SEND_CHARS,
         )
         self.assertEqual(screens.flatten_send("\x1b[31mhi\x1b[0m"), "hi")
 
@@ -477,7 +478,7 @@ class ScreenRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await runner.send_screen_text("hello\nthere"))
         self.assertEqual(runner.pasted, ["hello there"])
 
-        await runner.send_screen_text("x" * 2000)
+        await runner.send_screen_text("x" * (screens.MAX_SEND_CHARS + 1000))
         self.assertEqual(len(runner.pasted[-1]), screens.MAX_SEND_CHARS)
 
     async def test_screen_shows_the_pane_only_while_a_session_runs(self) -> None:

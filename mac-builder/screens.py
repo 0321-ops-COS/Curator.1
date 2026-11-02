@@ -64,7 +64,7 @@ KINDS = (
 # Screens that want a person before anything else may be typed. The task text is
 # never pasted into one, and the stall detector posts it instead of waiting for
 # the hard timeout. ``confirm_prompt`` is included on purpose: a y/n prompt is
-# not a place for a 4000-character task paste either.
+# not a place for a 6000-character task paste either.
 WAITING_KINDS = frozenset(
     {
         QUESTION_BOX,
@@ -91,7 +91,7 @@ TITLES = {
 
 # How much pane text one Discord post carries, and the longest /send text.
 MAX_PANE_CHARS = 1800
-MAX_SEND_CHARS = 500
+MAX_SEND_CHARS = 6000
 
 # ------------------------------------------------------------- the patterns
 #
