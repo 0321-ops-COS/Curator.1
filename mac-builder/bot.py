@@ -1403,6 +1403,9 @@ class MacBuilderBot(discord.Client):
         publisher = getattr(self, "_board", None)
         if publisher is None:
             return
+        base = getattr(job, "base_label", "")
+        if base:
+            publisher.set_base(job.id, base)
         screen_kind = detail if stage == status_board.WAITING_ON_YOU else ""
         try:
             task = asyncio.create_task(

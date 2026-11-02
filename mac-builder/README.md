@@ -136,6 +136,9 @@ project she builds) in `.env`. Otherwise startup refuses the Curator.1 checkout,
 in one line, for having no `ios-app/project.yml`. At startup she refuses a
 target without `ios-app/project.yml` or without `AUTHORIZED_BRANCH` as a local
 branch there.
+Each task fetches `origin/<AUTHORIZED_BRANCH>` before it cuts a branch, so a
+merge on GitHub is picked up by the next job; a failed fetch stops the job
+instead of building on stale code, and the board and log show the base commit.
 `/project` shows which repo, branch and project she is on, and herself.
 `WORKTREE_ROOT` defaults to `~/mac-builder-worktrees`, outside
 the repository. Job worktrees stay there until you approve; rejected worktrees

@@ -148,6 +148,8 @@ class TaskEnvironment:
     signature_at_start: str = ""
     # "task" (freebuff/*, the target checkout) or "dan" (dan/*, her own code).
     kind: str = "task"
+    # The commit the branch was cut from, short form; the job card shows it.
+    base_commit: str = ""
 
 
 @dataclass
@@ -215,14 +217,15 @@ class GitRepo:
         return result
 
     async def verify_base(self, base: str) -> None:
+        """The base must exist on origin; a local branch may be stale."""
         base = rules.assert_not_main(base)
         result = await self._run(
-            ["rev-parse", "--verify", "--quiet", f"refs/heads/{base}"], check=False
+            ["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base}"],
+            check=False,
         )
         if result.code != 0:
             raise FreebuffError(
-                f"authorized branch {base!r} does not exist in {self.root}; "
-                "check out or fetch it first"
+                f"origin/{base} does not exist in {self.root}; fetch it first"
             )
 
     async def branch_exists(self, branch: str) -> bool:
@@ -361,8 +364,12 @@ class GitRepo:
             raise FreebuffError(f"commit failed ({result.code}): {detail}")
         return await self.head(cwd)
 
-    async def fetch_origin_main(self, remote: str = "origin", branch: str = "main") -> None:
-        """Refresh origin/main, so a dan branch never starts from a stale base."""
+    async def fetch_branch(self, branch: str, remote: str = "origin") -> None:
+        """Refresh origin/<branch> before anything branches from it.
+
+        A local branch is only as fresh as the last fetch, so a task base is
+        read from origin afterwards, never from refs/heads.
+        """
         result = await self._run(
             ["fetch", "--quiet", remote, branch], timeout=300, check=False
         )
@@ -371,6 +378,10 @@ class GitRepo:
             raise FreebuffError(
                 f"could not fetch {remote} {branch}: {detail or f'exit {result.code}'}"
             )
+
+    async def fetch_origin_main(self) -> None:
+        """Refresh origin/main, so a dan branch never starts from a stale base."""
+        await self.fetch_branch("main")
 
     async def push_branch(self, cwd: Path, branch: str, *, kind: str = "task") -> None:
         branch = rules.validate_push_branch(branch, kind=kind)
@@ -610,6 +621,9 @@ class FreebuffRunner:
                 job_id=job_id, task_text=task_text, log_path=log_path
             )
         base = rules.assert_not_main(str(getattr(self.settings, "authorized_branch")))
+        # Merge on GitHub, and the Mac's local copy is behind immediately. Fetch
+        # first, so a failure stops the job instead of building on stale code.
+        await self.repo.fetch_branch(base)
         await self.repo.verify_base(base)
         if not Path(self.tmux_bin).is_file():
             raise FreebuffError(f"tmux not found at {self.tmux_bin}; install tmux")
@@ -624,20 +638,24 @@ class FreebuffRunner:
         if not branch:
             raise FreebuffError("could not allocate a unique freebuff/* branch")
 
+        start = f"origin/{base}"
         worktree = self.worktree_root / job_id
-        await self.repo.create_worktree(branch, worktree, base)
+        await self.repo.create_worktree(branch, worktree, start)
+        base_commit = (await self.repo.head(worktree))[:7]
         guard_root = self._write_push_guard(job_id)
         session = f"macbuilder-{job_id[-8:]}"
         env = TaskEnvironment(
             branch=branch,
             worktree=worktree,
             session=session,
-            base_branch=base,
+            base_branch=start,
             guard_dir=guard_root,
+            base_commit=base_commit,
         )
         self._append_log(
             log_path,
-            f"\n=== Freebuff task ===\nbranch: {branch}\nworktree: {worktree}\nbase: {base}\n",
+            f"\n=== Freebuff task ===\nbranch: {branch}\nworktree: {worktree}\n"
+            f"base: {start} @ {base_commit} (just fetched)\n",
         )
         await self._launch(env, freebuff_argv, task_text, log_path)
         return env

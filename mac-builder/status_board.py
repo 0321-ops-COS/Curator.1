@@ -174,6 +174,8 @@ class Board:
     job_id: str
     kind: str = "task"
     project: str = ""
+    # What the branch was cut from, e.g. "origin/freebuff/base @ 39dbd5c".
+    base: str = ""
     stage: str = QUEUED
     # The last event in the job's own words: "tests passed", "pushed freebuff/…".
     detail: str = ""
@@ -230,6 +232,8 @@ def render(board: Board, now: float | None = None) -> str:
         lines.append(line)
     else:
         lines.append(stage_title(board.stage))
+    if board.base:
+        lines.append(f"base: {board.base}")
     if board.stage == QUEUED and board.queue_position:
         lines.append(f"queued #{board.queue_position}")
     if board.screen_kind:
@@ -370,6 +374,14 @@ class BoardPublisher:
         self._jobs: dict[str, _Tracked] = {}
 
     # -------------------------------------------------------------- tracking
+
+    def set_base(self, job_id: str, label: str) -> None:
+        """Record what the job was cut from, once the runner knows the commit."""
+        tracked = self._jobs.get(job_id)
+        if tracked is None or not label or tracked.board.base == label:
+            return
+        tracked.board = replace(tracked.board, base=label)
+        tracked.dirty = True
 
     def track(
         self,
