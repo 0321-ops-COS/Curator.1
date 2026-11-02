@@ -33,6 +33,7 @@ from typing import Awaitable, Callable
 
 import questions
 import rules
+import screens
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +47,15 @@ PANE_LINES = 120
 KEY_DELAY_SECONDS = 0.4
 # How much of the pane QUESTION_DEBUG writes to the log after every key.
 DEBUG_PANE_CHARS = 4000
+# A pane and a worktree both unchanged this long is a stuck screen, not work.
+STALL_DEFAULT_SECONDS = 90.0
+# Re-read the pane this often while waiting for the first ready screen.
+READY_POLL_SECONDS = 2.0
+# Told to the owner when a screen will not take the task text.
+_KEY_HINT = (
+    "Use /screen to read the pane, /key with Enter, Esc, Up, Down, Left, Right, "
+    "Tab, y or n, or /send with text, then queue the task again."
+)
 # Steps in one box: each question costs a few, and a box that never settles is
 # a failure, not a reason to keep typing.
 MAX_BOX_STEPS = 24
@@ -473,6 +483,18 @@ class FreebuffRunner:
         # and the last titled box that did not parse (posted once, never idled).
         self._handled_boxes: set[str] = set()
         self._broken_box = ""
+        # The screen the job is waiting on, which session it belongs to, and the
+        # sinks /screen, /key and /send act through. The job runner installs the
+        # reporter, so nothing here needs Discord.
+        self._screen: screens.Screen | None = None
+        self._screen_session: str | None = None
+        self._screen_log: Path | None = None
+        self._screen_reporter: Callable[[screens.Screen, str], Awaitable[None]] | None = None
+        # Screens already posted, so a static pane is shown once, not per poll.
+        self._screens_seen: set[str] = set()
+        # Why the session exited, and what the last stall was, for the report.
+        self._exit_note = ""
+        self._last_stall_kind = ""
         # The tmux server inherits this environment, so the builder never sees
         # the bot's Discord or manager credentials. Everything else (PATH,
         # SSH_AUTH_SOCK, Freebuff's own configuration) is preserved.
@@ -709,24 +731,73 @@ class FreebuffRunner:
         )
         if pipe.code != 0:
             raise FreebuffError(f"could not capture tmux output: {pipe.stderr.strip()}")
-        await self._wait_ready(env)
+        await self._wait_ready(env, log_path)
 
-    async def _wait_ready(self, env: TaskEnvironment) -> None:
-        deadline = time.monotonic() + float(getattr(self.settings, "freebuff_ready_seconds"))
-        while time.monotonic() < deadline:
+    async def _wait_ready(
+        self, env: TaskEnvironment, log_path: Path | None = None
+    ) -> None:
+        """Wait until the task text may be typed into what is on screen.
+
+        Any output at all used to count as ready, so a sign-in screen received
+        the whole task. Now a screen a person has to deal with is posted to
+        Discord instead: the task is sent only once that screen is gone, the
+        owner is asked once per distinct screen, and the wait is capped like a
+        question so nothing hangs silently.
+        """
+        ready_seconds = float(getattr(self.settings, "freebuff_ready_seconds"))
+        cap = max(1.0, float(getattr(self.settings, "question_wait_seconds", 1800.0)))
+        deadline = time.monotonic() + ready_seconds
+        seen: dict[str, float] = {}
+        reported = ""
+        while True:
+            now = time.monotonic()
             if not await self._session_alive(env.session):
                 raise FreebuffError(
                     "Freebuff exited before it was ready; see the job log"
                 )
-            pane = await self._tmux(
-                "capture-pane", "-p", "-J", "-t", env.session, "-S", "-40"
-            )
-            if pane.stdout.strip():
-                return
-            await asyncio.sleep(2)
-        raise FreebuffError(
-            f"Freebuff produced no output within {getattr(self.settings, 'freebuff_ready_seconds')}s"
-        )
+            pane = await self._pane(env.session)
+            if pane.strip():
+                screen = screens.classify(pane)
+                if screen.kind not in screens.WAITING_KINDS:
+                    self._screen = None
+                    self._screen_session = None
+                    return
+                if screen.kind == screens.SURVEY:
+                    # Freebuff's own popup is dismissed, never forwarded, and
+                    # never allowed to hold up the task text.
+                    if log_path is not None:
+                        self._append_log(
+                            log_path,
+                            "\n[survey popup dismissed with Esc before the task]\n",
+                        )
+                    await self._dismiss(env.session, log_path)
+                    continue
+                if screen.key != reported:
+                    reported = screen.key
+                    seen.setdefault(screen.key, now + cap)
+                    self._screen = screen
+                    self._screen_session = env.session
+                    self._screen_log = log_path
+                    if log_path is not None:
+                        await self._report_screen(
+                            screen, log_path, "before the task was sent"
+                        )
+                if now >= seen.get(screen.key, now + cap):
+                    raise FreebuffError(
+                        f"Freebuff stayed on {screens.describe(screen.kind)} and never "
+                        f"took the task text, so nothing was typed. {_KEY_HINT}"
+                    )
+                # Waiting for a person is not readiness time.
+                deadline = max(deadline, now + ready_seconds)
+            elif now >= deadline:
+                raise FreebuffError(
+                    f"Freebuff produced no output within {ready_seconds}s"
+                )
+            if now >= deadline:
+                raise FreebuffError(
+                    f"Freebuff produced no output within {ready_seconds}s"
+                )
+            await asyncio.sleep(READY_POLL_SECONDS)
 
     async def _send_text(self, session: str, text: str) -> None:
         loaded = await self._tmux(
@@ -801,6 +872,139 @@ class FreebuffRunner:
     def pending_question(self) -> questions.Question | None:
         """The question /answer resolves, or None when nothing is waiting."""
         return self._question
+
+    @property
+    def pending_screen(self) -> screens.Screen | None:
+        """The screen the job is waiting on, or None when it is not waiting."""
+        return self._screen
+
+    @property
+    def exit_note(self) -> str:
+        """Why the session exited, in words, once it has exited."""
+        return self._exit_note
+
+    @property
+    def last_stall_kind(self) -> str:
+        """The kind of the screen the last stall expired on, if any."""
+        return self._last_stall_kind
+
+    @property
+    def screen_reporter(
+        self,
+    ) -> Callable[[screens.Screen, str], Awaitable[None]] | None:
+        return self._screen_reporter
+
+    @screen_reporter.setter
+    def screen_reporter(
+        self, reporter: Callable[[screens.Screen, str], Awaitable[None]] | None
+    ) -> None:
+        """Installed by the job runner: puts a stuck screen in front of the owner."""
+        self._screen_reporter = reporter
+
+    async def current_pane(self, limit: int = screens.MAX_PANE_CHARS) -> str | None:
+        """The pane for /screen, redacted, or None when no session is running."""
+        session = self._screen_session
+        if session is None and self._active is not None:
+            session = self._active.session
+        if session is None or not await self._session_alive(session):
+            return None
+        return screens.sanitize(await self._pane(session), limit=limit)
+
+    async def send_key(self, name: str) -> bool:
+        """Send one key from the fixed allowlist to a waiting screen.
+
+        False when nothing is waiting, the name is not a key, or the session is
+        gone. The name is resolved to a tmux key here, so no arbitrary string
+        ever reaches send-keys.
+        """
+        key = screens.key_sequence(name)
+        if key is None or self._screen is None or self._screen_session is None:
+            return False
+        if not await self._session_alive(self._screen_session):
+            return False
+        if self._screen_log is not None:
+            self._append_log(
+                self._screen_log,
+                f"\n[/key {key} on the {self._screen.kind} screen]\n",
+            )
+        await self._press(self._screen_session, key, self._screen_log)
+        return True
+
+    async def send_screen_text(self, text: str) -> bool:
+        """Paste text into a waiting screen through /task's paste path.
+
+        tmux load-buffer + paste-buffer + Enter, never a shell, and capped by
+        ``screens.MAX_SEND_CHARS`` so one command cannot flood the session.
+        """
+        value = screens.flatten_send(text)
+        if not value or self._screen is None or self._screen_session is None:
+            return False
+        if not await self._session_alive(self._screen_session):
+            return False
+        if self._screen_log is not None:
+            self._append_log(
+                self._screen_log,
+                f"\n[/send {screens.redact_pane(value)[:120]} on the "
+                f"{self._screen.kind} screen]\n",
+            )
+        await self._send_text(self._screen_session, value)
+        return True
+
+    async def _report_screen(
+        self, screen: screens.Screen, log_path: Path, where: str
+    ) -> None:
+        """Log a screen and hand it to the reporter, once per distinct screen."""
+        tail = screens.sanitize(screen.raw)
+        self._append_log(
+            log_path,
+            f"\n[screen {screen.kind} {where}; waiting for the owner]\n{tail}\n",
+        )
+        if self._screen_reporter is None:
+            log.warning("no reporter for the %s screen; it is only in the log", screen.kind)
+            return
+        try:
+            await self._screen_reporter(screen, tail)
+        except Exception:  # Discord must not kill the job
+            log.exception("could not post the %s screen", screen.kind)
+
+    async def _wait_screen(
+        self, env: TaskEnvironment, screen: screens.Screen, log_path: Path
+    ) -> str:
+        """Wait for the owner to move a stuck screen: 'changed', 'expired' or 'exited'.
+
+        The pane is posted once, the idle and hard-timeout clocks are paused, and
+        every /key or /send shows up as a changed pane. The wait is capped like a
+        question; after that Esc is sent and the job reports 'expired'.
+        """
+        cap = max(1.0, float(getattr(self.settings, "question_wait_seconds", 1800.0)))
+        poll = max(0.05, float(getattr(self.settings, "freebuff_poll_seconds", 10)))
+        self._screen = screen
+        self._screen_session = env.session
+        self._screen_log = log_path
+        await self._report_screen(screen, log_path, "instead of progress")
+        deadline = time.monotonic() + cap
+        while time.monotonic() < deadline:
+            await asyncio.sleep(poll)
+            if not await self._session_alive(env.session):
+                self._exit_note = screens.exit_summary(screen)
+                return "exited"
+            pane = await self._pane(env.session)
+            if pane.strip() and pane != screen.raw:
+                return "changed"
+        self._append_log(
+            log_path,
+            f"\n[the {screen.kind} screen did not change within {int(cap)}s; "
+            "sending Esc]\n",
+        )
+        self._last_stall_kind = screen.kind
+        await self._dismiss(env.session, log_path)
+        return "expired"
+
+    def _remember_screen(self, key: str) -> None:
+        """Remember a screen already shown, so it is not posted on every poll."""
+        if len(self._screens_seen) > 64:
+            self._screens_seen.clear()
+        self._screens_seen.add(key)
 
     @property
     def _question_debug(self) -> bool:
@@ -1254,17 +1458,28 @@ class FreebuffRunner:
         timeout = float(timeout or getattr(self.settings, "freebuff_timeout_seconds"))
         idle = float(getattr(self.settings, "freebuff_idle_seconds"))
         poll = max(0.05, float(getattr(self.settings, "freebuff_poll_seconds")))
+        # STALL_SECONDS is validated at >= 1 in Settings; the small floor here
+        # only keeps a test or a direct caller from busy-looping.
+        stall = max(0.01, float(getattr(self.settings, "stall_seconds", STALL_DEFAULT_SECONDS)))
         deadline = time.monotonic() + timeout
         last_signature = env.signature_at_start or await self.repo.signature(env.worktree)
         last_change: float | None = None
+        last_pane = await self._pane(env.session)
+        last_pane_at = time.monotonic()
 
         while time.monotonic() < deadline:
             await asyncio.sleep(poll)
             if not await self._session_alive(env.session):
-                self._append_log(log_path, "\n[tmux session exited]\n")
+                self._exit_note = screens.exit_summary(screens.classify(last_pane))
+                self._append_log(
+                    log_path, f"\n[tmux session exited: {self._exit_note}]\n"
+                )
                 return "exited"
-            box = await self._read_box(env.session)
+            pane = await self._pane(env.session)
+            box = questions.parse_pane(pane) if pane.strip() else None
             if box is not None and box.key not in self._handled_boxes:
+                self._screen = None
+                self._screen_session = None
                 opened = time.monotonic()
                 outcome = await self._drive_box(env, box, log_path, on_question, on_pane)
                 # Waiting for the owner is neither idle time nor job time.
@@ -1276,18 +1491,60 @@ class FreebuffRunner:
                 self._remember_box(box.key)
                 last_signature = await self.repo.signature(env.worktree)
                 last_change = time.monotonic()
+                last_pane = await self._pane(env.session)
+                last_pane_at = last_change
                 continue
             signature = await self.repo.signature(env.worktree)
             now = time.monotonic()
             if signature != last_signature:
                 last_signature = signature
                 last_change = now
-            if last_change is not None and (now - last_change) >= idle:
+            if pane != last_pane:
+                last_pane = pane
+                last_pane_at = now
+            # Done needs both halves quiet: a spinner still repaints the pane,
+            # so a live builder is not mistaken for a finished one.
+            if (
+                last_change is not None
+                and (now - last_change) >= idle
+                and (now - last_pane_at) >= min(idle, stall)
+            ):
                 self._append_log(
                     log_path,
                     f"\n[worktree unchanged for {int(idle)}s; treating Freebuff as done]\n",
                 )
                 return "idle"
+            # A pane and a worktree that have both stopped moving are a screen,
+            # not progress: show it once and wait for the owner instead of the
+            # silent hard timeout. Before any change this is the only signal
+            # there is; after one, only a screen that needs a person is worth
+            # interrupting a normal wind-down for.
+            quiet_since = (
+                last_pane_at if last_change is None else max(last_change, last_pane_at)
+            )
+            if (now - quiet_since) >= stall:
+                screen = screens.classify(pane)
+                if screen.key not in self._screens_seen and (
+                    last_change is None or screen.needs_owner
+                ):
+                    self._remember_screen(screen.key)
+                    opened = now
+                    outcome = await self._wait_screen(env, screen, log_path)
+                    deadline += time.monotonic() - opened
+                    if outcome == "exited":
+                        self._append_log(
+                            log_path, f"\n[tmux session exited: {self._exit_note}]\n"
+                        )
+                        return "exited"
+                    if outcome == "expired":
+                        return "stalled"
+                    # The screen moved: /key and /send must stop acting until
+                    # the next one is reported, so a key can never be sent into
+                    # whatever replaced it.
+                    self._screen = None
+                    last_pane = await self._pane(env.session)
+                    last_pane_at = time.monotonic()
+                    continue
 
         self._append_log(log_path, f"\n[Freebuff timed out after {int(timeout)}s]\n")
         return "timeout"
@@ -1454,6 +1711,10 @@ class FreebuffRunner:
         self._forget_question()
         self._handled_boxes.clear()
         self._broken_box = ""
+        self._screen = None
+        self._screen_session = None
+        self._screen_log = None
+        self._screens_seen.clear()
         target = env or self._active
         if target is None:
             return

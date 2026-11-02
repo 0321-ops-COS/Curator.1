@@ -24,6 +24,7 @@ from typing import Awaitable, Callable, Sequence
 
 import questions
 import rules
+import screens
 from freebuff_runner import FreebuffError, FreebuffRunner, TaskEnvironment
 from manager import (
     Manager,
@@ -94,10 +95,14 @@ PostJob = Callable[[Job, bool, str], Awaitable[None]]
 PostReview = Callable[[ReviewOutcome], Awaitable[None]]
 PostQuestion = Callable[[Job, questions.Question], Awaitable[bool]]
 PostPane = Callable[[Job, str], Awaitable[bool]]
+# A screen a person has to deal with, with its sanitized pane text.
+PostScreen = Callable[[Job, screens.Screen, str], Awaitable[bool]]
 # A manager line for the owner: an auto-answer record or a suggestion.
 PostNote = Callable[[Job, str], Awaitable[None]]
 # Reasons from the runner that mean a question box stopped the job.
 QUESTION_REASONS = ("question-timeout", "question-failed")
+# The runner's reason for a screen that never changed and was dismissed.
+STALL_REASON = "stalled"
 # How long advice may take before it is dropped: the question is already posted,
 # so a late line would arrive after the owner had answered.
 SUGGESTION_WINDOW_SECONDS = 15.0
@@ -356,6 +361,7 @@ class JobRunner:
         post_review: PostReview,
         post_question: PostQuestion | None = None,
         post_pane: PostPane | None = None,
+        post_screen: PostScreen | None = None,
         post_note: PostNote | None = None,
     ) -> None:
         self.settings = settings
@@ -365,6 +371,7 @@ class JobRunner:
         self.post_review = post_review
         self.post_question = post_question
         self.post_pane = post_pane
+        self.post_screen = post_screen
         self.post_note = post_note
         self._last_log: Path | None = None
         self._last_summary = ""
@@ -476,6 +483,9 @@ class JobRunner:
 
     async def _run_task(self, job: Job) -> tuple[bool, str]:
         env: TaskEnvironment | None = None
+        # A screen that needs a person is reported through the same Discord
+        # channel as the job, before and during the wait for the first screen.
+        self.freebuff.screen_reporter = self._screen_handler(job)
         try:
             env = await self.freebuff.start_task(
                 job_id=job.id,
@@ -492,6 +502,8 @@ class JobRunner:
             )
             if reason in QUESTION_REASONS:
                 return await self._question_stopped(job, env, reason)
+            if reason == STALL_REASON:
+                return await self._stalled(job, env)
             if reason == "timeout":
                 # Stop the session before counting: collect() runs git and can
                 # raise, and a timed-out Freebuff must not keep running because
@@ -523,8 +535,9 @@ class JobRunner:
                     await self.freebuff.abort(env)
                     return (
                         False,
-                        f"Freebuff finished on {env.branch} without changes ({reason}); "
-                        f"nothing to review. Log: {job.log_path.name}",
+                        f"Freebuff finished on {env.branch} without changes "
+                        f"({self._reason_detail(reason)}); nothing to review. "
+                        f"Log: {job.log_path.name}",
                     )
 
                 # Union the status paths with the paths named by the diff so a
@@ -636,6 +649,9 @@ class JobRunner:
             if env is not None:
                 await self.freebuff.abort(env)
             return False, f"Freebuff job failed: {exc}"
+        finally:
+            # The reporter belongs to this job: a later job installs its own.
+            self.freebuff.screen_reporter = None
 
     # ------------------------------------------------------------- questions
 
@@ -659,6 +675,40 @@ class JobRunner:
                 log.exception("could not post the pane tail for job %s", job.id)
 
         return handle
+
+    def _screen_handler(self, job: Job):
+        """The callback for a screen that needs a person, with its pane text."""
+
+        async def handle(screen: screens.Screen, tail: str) -> None:
+            if self.post_screen is None:
+                return
+            try:
+                await self.post_screen(job, screen, tail)
+            except Exception:  # Discord must not kill the job
+                log.exception("could not post the screen for job %s", job.id)
+
+        return handle
+
+    def _reason_detail(self, reason: str) -> str:
+        """'exited' plus why, when the last screen says what happened."""
+        note = getattr(self.freebuff, "exit_note", "")
+        if reason == "exited" and note:
+            return f"exited; {note}"
+        return reason
+
+    async def _stalled(self, job: Job, env: TaskEnvironment) -> tuple[bool, str]:
+        """A screen that never changed was dismissed with Esc: nothing is reviewed."""
+        wait = int(float(getattr(self.settings, "question_wait_seconds", 1800)))
+        kind = getattr(self.freebuff, "last_stall_kind", "") or screens.UNKNOWN
+        await self.freebuff.abort(env)
+        return (
+            False,
+            f"Freebuff was stuck on {screens.describe(kind)}: the worktree and the "
+            f"pane both stopped changing and it never moved within {wait}s "
+            f"(QUESTION_WAIT_SECONDS), so it was dismissed with Esc and the job was "
+            f"stopped on {env.branch}; nothing is reviewed. The pane is in the log "
+            f"and in the screen message. Log: {job.log_path.name}",
+        )
 
     async def _question_stopped(
         self, job: Job, env: TaskEnvironment, reason: str

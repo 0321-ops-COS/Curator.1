@@ -45,6 +45,7 @@ import planner  # noqa: E402
 import project_context  # noqa: E402
 import questions  # noqa: E402
 import rules  # noqa: E402
+import screens  # noqa: E402
 from freebuff_runner import FreebuffError, FreebuffRunner  # noqa: E402
 from jobs import Job, ReviewOutcome, tail_text  # noqa: E402
 from manager import Manager, ManagerUnavailable  # noqa: E402
@@ -228,6 +229,9 @@ class Settings:
     question_suggest: bool = False
     # Write the pane to the job log after every key sent to a question box.
     question_debug: bool = False
+    # A pane and a worktree both unchanged this long is a stuck screen: it is
+    # posted once with /screen, /key and /send, and the clocks pause.
+    stall_seconds: float = 90.0
     # Filled in by main() after the startup preflight; None before that.
     project: "project_context.ProjectContext | None" = None
 
@@ -311,6 +315,7 @@ class Settings:
             ),
             question_suggest=_env_bool("QUESTION_SUGGEST", False),
             question_debug=_env_bool("QUESTION_DEBUG", False),
+            stall_seconds=_env_float("STALL_SECONDS", 90.0),
         )
         if settings.max_pending_jobs < 1:
             raise ConfigError("MAX_PENDING_JOBS must be at least 1")
@@ -322,6 +327,8 @@ class Settings:
             raise ConfigError("QUESTION_AUTO_ANSWER_MAX must be 0 or more")
         if settings.question_manager_cooldown_seconds < 0:
             raise ConfigError("QUESTION_MANAGER_COOLDOWN_SECONDS must be 0 or more")
+        if settings.stall_seconds < 1:
+            raise ConfigError("STALL_SECONDS must be at least 1")
         return settings
 
 
@@ -520,6 +527,7 @@ class MacBuilderBot(discord.Client):
             post_review=self._post_review,
             post_question=self._post_question,
             post_pane=self._post_pane,
+            post_screen=self._post_screen,
             post_note=self._post_note,
         )
         self.queue = jobs.JobQueue(
@@ -610,6 +618,27 @@ class MacBuilderBot(discord.Client):
                 name="answer",
                 description="Answer the question Freebuff is waiting on (option number or text)",
                 callback=self.cmd_answer,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="screen",
+                description="Show the Freebuff pane for the running job (read-only)",
+                callback=self.cmd_screen,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="key",
+                description="Send one key to a stuck Freebuff screen (Enter, Esc, arrows, Tab, y, n)",
+                callback=self.cmd_key,
+            )
+        )
+        self.tree.add_command(
+            app_commands.Command(
+                name="send",
+                description="Paste text into a stuck Freebuff screen, the way /task does",
+                callback=self.cmd_send,
             )
         )
         self.tree.interaction_check = self.require_allowed
@@ -1068,6 +1097,83 @@ class MacBuilderBot(discord.Client):
             ephemeral=True,
         )
 
+    # --------------------------------------------------------------- screens
+
+    async def cmd_screen(self, interaction: discord.Interaction) -> None:
+        """The running job's pane, or the screen it is waiting on. Read-only."""
+        if not await self.require_allowed(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        pane = await self.freebuff.current_pane()
+        if pane is None:
+            await interaction.followup.send(
+                "No Freebuff session is running, so there is no screen to show.",
+                ephemeral=True,
+            )
+            return
+        waiting = self.freebuff.pending_screen
+        header = (
+            f"`{waiting.kind}` — Freebuff is waiting on {screens.describe(waiting.kind)}\n"
+            if waiting is not None
+            else "Freebuff is not waiting on a screen.\n"
+        )
+        body = tail_text(pane, max_lines=40, max_chars=1700).replace("```", "'''")
+        await interaction.followup.send(
+            f"{header}```\n{body}\n```\n", ephemeral=True
+        )
+
+    @app_commands.describe(name="One key: Enter, Esc, Up, Down, Left, Right, Tab, y or n")
+    async def cmd_key(self, interaction: discord.Interaction, name: str) -> None:
+        """One key from the fixed allowlist, only while a screen is waiting."""
+        if not await self.require_allowed(interaction):
+            return
+        key = screens.key_sequence(name)
+        if key is None:
+            allowed = ", ".join(f"`{item}`" for item in screens.KEY_NAMES)
+            await interaction.response.send_message(
+                f"That is not one of the keys I may send. Use one of: {allowed}.",
+                ephemeral=True,
+            )
+            return
+        if not await self.freebuff.send_key(key):
+            await interaction.response.send_message(
+                "No Freebuff session is waiting on a screen, so no key was sent.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(f"Sent `{key}`.", ephemeral=True)
+
+    @app_commands.describe(text="Text to paste into Freebuff and submit, like /task")
+    async def cmd_send(self, interaction: discord.Interaction, text: str) -> None:
+        """Paste text into a waiting screen: load-buffer, paste-buffer, Enter."""
+        if not await self.require_allowed(interaction):
+            return
+        # The cap is on what was typed, before it is flattened: a long message
+        # is refused, never silently cut to something else.
+        raw = " ".join((text or "").split())
+        if len(raw) > screens.MAX_SEND_CHARS:
+            await interaction.response.send_message(
+                f"That is {len(raw)} characters; `/send` takes at most "
+                f"{screens.MAX_SEND_CHARS}.",
+                ephemeral=True,
+            )
+            return
+        value = screens.flatten_send(raw)
+        if not value:
+            await interaction.response.send_message(
+                "That text is empty, so nothing was sent.", ephemeral=True
+            )
+            return
+        if not await self.freebuff.send_screen_text(value):
+            await interaction.response.send_message(
+                "No Freebuff session is waiting on a screen, so nothing was typed.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            f"Typed into Freebuff: `{screens.redact_pane(value)[:100]}`", ephemeral=True
+        )
+
     # ----------------------------------------------------------- ai channel
 
     async def on_message(self, message: discord.Message) -> None:
@@ -1224,6 +1330,43 @@ class MacBuilderBot(discord.Client):
             await channel.send(embed=embed)
         except Exception:
             log.exception("could not post the pane tail for job %s", job.id)
+            return False
+        return True
+
+    async def _post_screen(self, job: Job, screen: screens.Screen, tail: str) -> bool:
+        """A screen needs a person: show the pane and what may be sent to it."""
+        channel = self._target_channel(job.channel_id)
+        if channel is None:
+            log.warning("no Discord channel for the screen in job %s", job.id)
+            return False
+        pane = (tail or "(the pane was empty)").replace("```", "'''")[-1600:]
+        embed = discord.Embed(
+            title=f"🖥️ Freebuff is waiting on {screens.describe(screen.kind)}",
+            description=(
+                "The worktree and the pane both stopped changing, so this is not "
+                "progress. The idle timer and the hard timeout are paused while you "
+                "deal with it.\n\n"
+                "`/screen` shows the pane again, `/key <name>` sends one key "
+                "(Enter, Esc, Up, Down, Left, Right, Tab, y, n), and `/send <text>` "
+                "pastes text and submits it, the same way `/task` does.\n\n```\n"
+                + pane
+                + "\n```"
+            )[:4000],
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Job", value=f"`{job.id}`", inline=True)
+        embed.add_field(name="Kind", value=screen.kind, inline=True)
+        embed.add_field(name="Log", value=f"`{job.log_path.name}`", inline=True)
+        embed.set_footer(
+            text=(
+                "If it does not change within QUESTION_WAIT_SECONDS it is dismissed "
+                "with Esc and the job fails; nothing is guessed."
+            )
+        )
+        try:
+            await channel.send(embed=embed)
+        except Exception:
+            log.exception("could not post the screen for job %s", job.id)
             return False
         return True
 
