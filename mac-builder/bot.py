@@ -498,6 +498,17 @@ def review_compare_url(settings: object, outcome: ReviewOutcome) -> str | None:
     return compare_link.compare_url(remote, base, env.branch)
 
 
+def approve_confirm_text(settings: object, outcome: ReviewOutcome, user_id: int,
+                         sha: str) -> str:
+    """What the Approve button confirms, with the link still in front of him."""
+    link = review_compare_url(settings, outcome)
+    return (
+        f"✅ Approved by <@{user_id}>. Pushed `{outcome.environment.branch}` at `{sha[:7]}`. "
+        "Merging is yours; this bot never merges.\n"
+        + (f"Open and merge: {link}" if link else "No compare link available")
+    )
+
+
 # Stages no builder job runs: a live Discord and GitHub call, and the simulator
 # needs a booted GUI session. The report names them instead of implying they ran.
 UNVERIFIED_STAGES = ("live Discord", "live GitHub", "simulator")
@@ -615,8 +626,7 @@ class ReviewView(discord.ui.View):
         self.outcome.job.status = "approved"
         await self._finish(
             interaction,
-            f"✅ Approved by <@{interaction.user.id}>. Pushed `{env.branch}` at `{sha[:7]}`. "
-            "Merging is yours; this bot never merges.",
+            approve_confirm_text(self.bot.settings, self.outcome, interaction.user.id, sha),
         )
 
     @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger)
