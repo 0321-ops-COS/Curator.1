@@ -144,6 +144,26 @@ class ReviewCompareLinkTests(unittest.TestCase):
             f"main...{BRANCH}?expand=1",
         )
 
+    def test_the_approved_message_carries_the_link_again(self) -> None:
+        text = bot.approve_confirm_text(
+            self.settings, outcome(kind="dan", base_branch="origin/main"), 42, "9a1c2b3d"
+        )
+        self.assertIn("✅ Approved by <@42>", text)
+        self.assertIn("Pushed `freebuff/9a1c2b3d` at `9a1c2b3`", text)
+        self.assertIn(
+            "Open and merge: https://github.com/0321-ops-COS/Curator.1/compare/"
+            f"main...{BRANCH}?expand=1",
+            text,
+        )
+
+    def test_a_missing_link_says_so_and_still_confirms(self) -> None:
+        text = bot.approve_confirm_text(
+            SimpleNamespace(), outcome(kind="task", base_branch="origin/main"), 42, "9a1c2b3d"
+        )
+        self.assertIn("No compare link available", text)
+        self.assertNotIn("Open and merge", text)
+        self.assertIn("Merging is yours", text)
+
     def test_no_project_context_means_no_link(self) -> None:
         self.assertIsNone(
             bot.review_compare_url(
