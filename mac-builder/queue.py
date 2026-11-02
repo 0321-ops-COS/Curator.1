@@ -39,6 +39,10 @@ class Job:
     summary: str = ""
     # What the job's branch was cut from, filled in once it starts.
     base_label: str = ""
+    # A /build or /check branch, and what that build ran at and took.
+    branch: str = ""
+    commit_label: str = ""
+    elapsed_label: str = ""
 
     @property
     def duration(self) -> float | None:

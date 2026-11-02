@@ -63,6 +63,23 @@ log = logging.getLogger(__name__)
 SCRIPT_DIR = Path(__file__).resolve().parent / "scripts"
 JOB_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}$")
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+# /build and /check may name a branch; only these shapes ever reach git: the
+# authorized branch itself, or a job branch. Everything else is refused by name
+# before a single command runs.
+BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9/._-]{1,100}$")
+BRANCH_PREFIXES = ("freebuff/", "dan/")
+# The one worktree the scripts run in. It is outside the owner's checkout and
+# reused, so DerivedData survives and a second build is not a cold one.
+BUILD_TREE_NAME = "_build"
+GIT_TIMEOUT_SECONDS = 120.0
+# What a passing run says, so the card names the outcome in the script's words.
+SCRIPT_HEADLINES = {
+    "build": "BUILD SUCCEEDED",
+    "check": "CHECK PASSED",
+    "test": "TEST PASSED",
+}
+# Script kinds that use the shared build worktree, so only one may run at once.
+BUILD_KINDS = ("build", "check", "test")
 
 
 @dataclass(frozen=True)
@@ -177,6 +194,7 @@ def make_job(
     channel_id: int,
     requester_id: int,
     text: str = "",
+    branch: str = "",
 ) -> Job:
     job_id = new_job_id()
     log_dir = Path(getattr(settings, "log_dir"))
@@ -189,6 +207,7 @@ def make_job(
         requester_id=requester_id,
         log_path=log_dir / f"{job_id}.log",
         text=text,
+        branch=branch,
     )
 
 
@@ -215,6 +234,177 @@ def build_script_env(settings: object, repo_dir: Path) -> dict[str, str]:
     env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
     env["HOMEBREW_NO_INSTALL_CLEANUP"] = "1"
     return env
+
+
+def resolve_branch(settings: object, value: str | None) -> str:
+    """The branch /build or /check will use, or ValueError saying why not.
+
+    Empty means the authorized branch. Anything else must look like a branch
+    and be the authorized branch or start with freebuff/ or dan/, so a command
+    cannot build an arbitrary ref of the target repo.
+    """
+    default = str(getattr(settings, "authorized_branch", "") or "").strip()
+    name = (value or "").strip() or default
+    if not name:
+        raise ValueError(
+            "No branch to build: AUTHORIZED_BRANCH is not set and no branch was given."
+        )
+    if not BRANCH_NAME_RE.match(name):
+        raise ValueError(
+            f"{name!r} is not a buildable branch name: letters, digits and / . _ - "
+            "only, at most 100 characters."
+        )
+    if (
+        name.startswith("-")
+        or ".." in name
+        or "//" in name
+        or name.endswith(("/", ".", ".lock"))
+    ):
+        raise ValueError(f"{name!r} is not a buildable branch name.")
+    if name != default and not name.startswith(BRANCH_PREFIXES):
+        raise ValueError(
+            f"Can only build {default!r}, or a freebuff/ or dan/ branch, not {name!r}."
+        )
+    return name
+
+
+@dataclass
+class BuildTarget:
+    """Where a /build or /check runs and which commit it is at."""
+
+    branch: str = ""
+    tree: Path | None = None
+    commit: str = ""
+    problem: str = ""
+
+    @property
+    def ready(self) -> bool:
+        return self.tree is not None and not self.problem
+
+
+def build_tree_path(settings: object) -> Path:
+    """The persistent build worktree, beside the job worktrees."""
+    return Path(getattr(settings, "worktree_root")) / BUILD_TREE_NAME
+
+
+def _last_line(outcome: ExecOutcome) -> str:
+    for line in reversed(outcome.tail):
+        text = strip_ansi(line).strip()
+        if text:
+            return text[:300]
+    return f"exit {outcome.code}"
+
+
+async def _git(
+    settings: object, where: Path, *args: str, log_path: Path | None = None
+) -> ExecOutcome:
+    """One git command, logged to the job so the owner can audit the checkout."""
+    return await _exec(
+        ["git", "-C", str(where), *args],
+        cwd=where,
+        env=build_script_env(settings, where),
+        timeout=GIT_TIMEOUT_SECONDS,
+        log_path=log_path,
+        max_tail=40,
+    )
+
+
+async def prepare_build_tree(
+    settings: object, branch: str, *, log_path: Path | None = None
+) -> BuildTarget:
+    """Fetch origin, then put the build worktree at origin/<branch>.
+
+    The owner's checkout is only read: fetch and ``worktree add`` happen there,
+    and every checkout, clean and script run happens in the build worktree. A
+    failed fetch or a branch that is not on origin is reported instead of
+    building whatever happened to be checked out.
+    """
+    target = BuildTarget(branch=branch)
+    repo_dir = Path(getattr(settings, "repo_dir"))
+    tree = build_tree_path(settings)
+    if tree.resolve() == repo_dir.resolve():
+        target.problem = f"the build worktree would be the checkout itself ({tree})"
+        return target
+
+    fetched = await _git(settings, repo_dir, "fetch", "origin", "--prune", log_path=log_path)
+    if fetched.code != 0:
+        target.problem = (
+            f"Could not fetch origin in {repo_dir}: {_last_line(fetched)}. "
+            "Nothing was built."
+        )
+        return target
+
+    known = await _git(
+        settings,
+        repo_dir,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        f"refs/remotes/origin/{branch}",
+    )
+    if known.code != 0:
+        listed = await _git(
+            settings, repo_dir, "ls-remote", "--exit-code", "--heads", "origin", branch
+        )
+        if listed.code != 0:
+            target.problem = (
+                f"origin has no branch {branch!r}. Nothing was built; check the "
+                "name against the GitHub branch list."
+            )
+            return target
+        # A clone whose fetch refspec does not map branches: ask for this tip.
+        await _git(
+            settings,
+            repo_dir,
+            "fetch",
+            "origin",
+            f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
+            log_path=log_path,
+        )
+
+    tree.parent.mkdir(parents=True, exist_ok=True)
+    if not (tree / ".git").exists():
+        await _git(settings, repo_dir, "worktree", "prune")
+        if tree.exists():
+            target.problem = (
+                f"{tree} exists but is not a git worktree; remove it and run again. "
+                "Nothing was built."
+            )
+            return target
+        added = await _git(
+            settings, repo_dir, "worktree", "add", "--detach", str(tree), log_path=log_path
+        )
+        if added.code != 0:
+            target.problem = (
+                f"Could not create the build worktree {tree}: {_last_line(added)}. "
+                "Nothing was built."
+            )
+            return target
+
+    checked = await _git(
+        settings, tree, "checkout", "--detach", "--force", f"origin/{branch}", log_path=log_path
+    )
+    if checked.code != 0:
+        target.problem = (
+            f"Could not check out origin/{branch} in {tree}: {_last_line(checked)}. "
+            "Nothing was built."
+        )
+        return target
+    cleaned = await _git(settings, tree, "clean", "-fd", log_path=log_path)
+    if cleaned.code != 0:
+        target.problem = (
+            f"Could not clean the build worktree {tree}: {_last_line(cleaned)}"
+        )
+        return target
+
+    target.tree = tree
+    logged = await _git(settings, tree, "log", "-1", "--oneline")
+    target.commit = (
+        strip_ansi(" ".join(logged.output)).strip()
+        if logged.code == 0 and logged.output
+        else "commit unknown"
+    )
+    return target
 
 
 async def _stop_process(proc: asyncio.subprocess.Process) -> None:
@@ -476,22 +666,48 @@ class JobRunner:
     # --------------------------------------------------------- script jobs
 
     async def _run_script(self, job: Job) -> tuple[bool, str]:
+        """Build or check origin/<branch> in the build worktree, and say which.
+
+        The branch is fetched and checked out first, so a result can never be
+        mistaken for the owner's checkout or for older work: the card names the
+        branch and commit the script actually ran at.
+        """
         script = SCRIPT_DIR / f"{job.kind}.sh"
         if not script.is_file():
             return False, f"missing script: scripts/{script.name}"
+        try:
+            branch = resolve_branch(self.settings, job.branch)
+        except ValueError as exc:
+            return False, str(exc)
+        job.branch = branch
+        started = time.monotonic()
+        target = await prepare_build_tree(self.settings, branch, log_path=job.log_path)
+        if not target.ready or target.tree is None:
+            job.elapsed_label = format_elapsed(time.monotonic() - started)
+            return False, target.problem
+        job.commit_label = target.commit
         outcome = await _exec(
             ["/bin/bash", str(script)],
-            cwd=Path(getattr(self.settings, "repo_dir")),
-            env=build_script_env(self.settings, Path(getattr(self.settings, "repo_dir"))),
+            cwd=target.tree,
+            env=build_script_env(self.settings, target.tree),
             timeout=_stage_timeout(self.settings, job.kind),
             log_path=job.log_path,
         )
-        state = (
-            "timed out"
-            if outcome.timed_out
-            else ("passed" if outcome.code == 0 else f"failed (exit {outcome.code})")
-        )
-        summary = f"{job.kind} {state}. Log: {job.log_path.name}"
+        job.elapsed_label = format_elapsed(time.monotonic() - started)
+        at = f"{branch} @ {target.commit}"
+        headline = SCRIPT_HEADLINES.get(job.kind, job.kind.upper() + " PASSED")
+        if outcome.code == 0:
+            state = f"{headline} on {at} in {job.elapsed_label}"
+        elif outcome.timed_out:
+            state = (
+                f"{job.kind.upper()} TIMED OUT on {at} after {job.elapsed_label}"
+            )
+        else:
+            state = (
+                f"{job.kind.upper()} FAILED (exit {outcome.code}) on {at} "
+                f"in {job.elapsed_label}"
+            )
+        summary = f"{state}. Log: {job.log_path.name}"
         if outcome.tail:
             summary += "\n" + "\n".join(outcome.tail[-12:])
         return outcome.code == 0, summary

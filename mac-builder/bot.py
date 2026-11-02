@@ -656,7 +656,7 @@ class MacBuilderBot(discord.Client):
         self.tree.add_command(
             app_commands.Command(
                 name="check",
-                description="Run swift test in HustlerCore (fast, queued)",
+                description="Run swift test in HustlerCore on a branch (fast, queued)",
                 callback=self.cmd_check,
             )
         )
@@ -670,7 +670,7 @@ class MacBuilderBot(discord.Client):
         self.tree.add_command(
             app_commands.Command(
                 name="build",
-                description="Run xcodegen + xcodebuild build (queued)",
+                description="Build a branch from origin with xcodegen + xcodebuild (queued)",
                 callback=self.cmd_build,
             )
         )
@@ -1021,8 +1021,29 @@ class MacBuilderBot(discord.Client):
 
     # ----------------------------------------------------------- fixed jobs
 
-    async def _queue_script_job(self, interaction: discord.Interaction, kind: str) -> None:
+    async def _queue_script_job(
+        self,
+        interaction: discord.Interaction,
+        kind: str,
+        branch: Optional[str] = None,
+    ) -> None:
         if not await self.require_allowed(interaction):
+            return
+        try:
+            chosen = jobs.resolve_branch(self.settings, branch)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        # One build at a time: the same worktree would otherwise be checked out
+        # from under the running script.
+        running = self.queue.running
+        if running is not None and running.kind in jobs.BUILD_KINDS:
+            await interaction.response.send_message(
+                f"`/{running.kind}` is already running (`{running.id}`, "
+                f"{jobs.format_elapsed(running.duration)}); nothing was queued. "
+                "Wait for it, or `/cancel` it first.",
+                ephemeral=True,
+            )
             return
         titles = {
             "check": "swift test (HustlerCore)",
@@ -1032,9 +1053,10 @@ class MacBuilderBot(discord.Client):
         job = jobs.make_job(
             self.settings,
             kind=kind,
-            title=titles[kind],
+            title=f"{titles[kind]} on {chosen}",
             channel_id=interaction.channel_id or 0,
             requester_id=interaction.user.id,
+            branch=chosen,
         )
         try:
             position = await self.queue.submit(job)
@@ -1042,19 +1064,29 @@ class MacBuilderBot(discord.Client):
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
         await interaction.response.send_message(
-            f"Queued `/{kind}` as `{job.id}` (position {position}). "
+            f"Queued `/{kind}` on `{chosen}` as `{job.id}` (position {position}). "
             f"Log: `{job.log_path.name}`.",
             ephemeral=True,
         )
 
-    async def cmd_check(self, interaction: discord.Interaction) -> None:
-        await self._queue_script_job(interaction, "check")
+    @app_commands.describe(
+        branch="Branch to check: the authorized branch, or a freebuff/ or dan/ branch"
+    )
+    async def cmd_check(
+        self, interaction: discord.Interaction, branch: Optional[str] = None
+    ) -> None:
+        await self._queue_script_job(interaction, "check", branch)
 
     async def cmd_test(self, interaction: discord.Interaction) -> None:
         await self._queue_script_job(interaction, "test")
 
-    async def cmd_build(self, interaction: discord.Interaction) -> None:
-        await self._queue_script_job(interaction, "build")
+    @app_commands.describe(
+        branch="Branch to build: the authorized branch, or a freebuff/ or dan/ branch"
+    )
+    async def cmd_build(
+        self, interaction: discord.Interaction, branch: Optional[str] = None
+    ) -> None:
+        await self._queue_script_job(interaction, "build", branch)
 
     @app_commands.describe(job_id="Job id to read; leave empty for the newest log")
     async def cmd_logs(
@@ -1671,7 +1703,15 @@ class MacBuilderBot(discord.Client):
         )
         embed.add_field(name="Job", value=f"`{job.id}`", inline=True)
         embed.add_field(name="Log", value=f"`{job.log_path.name}`", inline=True)
-        if job.duration is not None:
+        # /build and /check name the branch and commit they ran, so a green card
+        # can never be read as "the newest work" by mistake.
+        if job.branch:
+            embed.add_field(name="Branch", value=f"`{job.branch}`", inline=True)
+        if job.commit_label:
+            embed.add_field(name="Commit", value=f"`{job.commit_label[:100]}`", inline=True)
+        if job.elapsed_label:
+            embed.add_field(name="Took", value=job.elapsed_label, inline=True)
+        elif job.duration is not None:
             embed.add_field(name="Took", value=f"{job.duration:.0f}s", inline=True)
         await channel.send(embed=embed)
 
