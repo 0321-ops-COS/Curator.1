@@ -45,6 +45,7 @@ import compare_link  # noqa: E402
 import github_client  # noqa: E402
 import jobs  # noqa: E402
 import merge_command  # noqa: E402
+import roadmap  # noqa: E402
 import test_card  # noqa: E402
 import planner  # noqa: E402
 import project_context  # noqa: E402
@@ -645,6 +646,11 @@ class MacBuilderBot(discord.Client):
         # The reviewed jobs /merge may gate, by id, newest last.
         self._merge_jobs: dict[str, Job] = {}
         self._board_ticker: asyncio.Task[None] | None = None
+        self._roadmap_steps: list[roadmap.Step] = []
+        self._roadmap_jobs: dict[str, Job] = {}
+        self._roadmap_job: Job | None = None
+        self._roadmap_channel_id = 0
+        self._roadmap_requester_id = 0
         self.runner = jobs.JobRunner(
             settings,
             self.manager,
@@ -778,6 +784,9 @@ class MacBuilderBot(discord.Client):
         self.tree.add_command(app_commands.Command(
             name="merge", description="Gate an approved review and merge it (dry run)",
             callback=self.cmd_merge))
+        self.tree.add_command(app_commands.Command(
+            name="roadmap", callback=self.cmd_roadmap,
+            description="Queue a build sheet: one job per '## Job', one at a time"))
         self.tree.interaction_check = self.require_allowed
         if self._board_ticker is None or self._board_ticker.done():
             self._board_ticker = asyncio.create_task(self._board_loop())
@@ -1293,6 +1302,46 @@ class MacBuilderBot(discord.Client):
             ephemeral=True,
         )
 
+    # ------------------------------------------------------------- roadmap
+
+    @app_commands.describe(
+        sheet="One .md build sheet: each '## Job' heading starts a job",
+        action="status lists the roadmap; stop drops the jobs not yet queued",
+    )
+    async def cmd_roadmap(self, interaction: discord.Interaction,
+                          sheet: Optional[discord.Attachment] = None,
+                          action: Optional[str] = None) -> None:
+        """Queue a build sheet one job at a time; every job still waits for Approve."""
+        if not await self.require_allowed(interaction):
+            return
+        choice = (action or "").strip().lower()
+        if choice in ("status", "stop"):
+            text = self._roadmap_status() if choice == "status" else self._roadmap_stop()
+            await interaction.response.send_message(text, ephemeral=True)
+            return
+        if sheet is None or not sheet.filename.lower().endswith(".md"):
+            await interaction.response.send_message(
+                "Attach one .md build sheet, or use `action` status or stop.", ephemeral=True)
+            return
+        try:
+            steps = roadmap.parse((await sheet.read()).decode("utf-8", "replace"))
+        except roadmap.RoadmapError as exc:
+            await interaction.response.send_message(f"Not queued: {exc}.", ephemeral=True)
+            return
+        self._roadmap_steps = steps
+        self._roadmap_channel_id = interaction.channel_id or 0
+        self._roadmap_requester_id = interaction.user.id
+        job = await self._queue_roadmap_step(steps[0])
+        if job is None:
+            self._roadmap_steps = []
+            await interaction.response.send_message(
+                "The queue is full; nothing was queued.", ephemeral=True)
+            return
+        roadmap.save(self._roadmap_path(), steps)
+        await interaction.response.send_message(
+            f"Roadmap queued: {len(steps)} job(s), first is `{job.id}` ({steps[0].kind}). "
+            "Each still waits for your Approve; nothing is pushed or merged.", ephemeral=True)
+
     # ------------------------------------------------------------- questions
 
     @app_commands.describe(text="An option number from the question, or free text")
@@ -1573,6 +1622,75 @@ class MacBuilderBot(discord.Client):
 
     # ------------------------------------------------------------ reporting
 
+    def _roadmap_path(self) -> Path:
+        return Path(self.settings.log_dir) / "roadmap.json"
+
+    async def _queue_roadmap_step(self, step: roadmap.Step) -> Job | None:
+        """Queue one sheet job exactly as /task or /dan would, then record it."""
+        job = jobs.make_job(self.settings, kind=step.kind, title=step.text[:100],
+                            channel_id=self._roadmap_channel_id, text=step.text,
+                            requester_id=self._roadmap_requester_id)
+        try:
+            position = await self.queue.submit(job)
+        except jobs.QueueFull as exc:
+            log.warning("roadmap job not queued: %s", exc)
+            return None
+        step.job_id = job.id
+        self._roadmap_job = job
+        self._roadmap_jobs[job.id] = job
+        await self._track_board(job, position)
+        return job
+
+    async def _roadmap_tick(self) -> None:
+        """Queue the next job only after the current one is approved; status only."""
+        current = self._roadmap_job
+        if current is None or not self._roadmap_steps:
+            return
+        if current.status in roadmap.STOPPED_STATUSES:
+            await self._roadmap_finish(
+                f"Roadmap stopped: `{current.id}` {current.status}. Nothing else was queued.")
+        elif current.status == "approved":
+            step = next((item for item in self._roadmap_steps if not item.job_id), None)
+            if step is None:
+                await self._roadmap_finish("roadmap done")
+            elif await self._queue_roadmap_step(step) is not None:
+                roadmap.save(self._roadmap_path(), self._roadmap_steps)
+
+    def _roadmap_status(self) -> str:
+        """One line per sheet job: its number, kind, job id and recorded state."""
+        if not self._roadmap_steps:
+            return "No roadmap is queued."
+        rows = []
+        for number, step in enumerate(self._roadmap_steps, start=1):
+            job = self._roadmap_jobs.get(step.job_id)
+            state = job.status if job else ("queued" if step.job_id else "waiting")
+            rows.append(f"{number}. {step.kind} · `{step.job_id or 'not queued'}` · {state}")
+        return "\n".join([f"Roadmap: {len(rows)} jobs", *rows])
+
+    def _roadmap_stop(self) -> str:
+        """Drop the jobs never queued; the one already in line is untouched."""
+        dropped = len([step for step in self._roadmap_steps if not step.job_id])
+        self._roadmap_steps, self._roadmap_job = [], None
+        self._roadmap_jobs.clear()
+        roadmap.save(self._roadmap_path(), [])
+        if not dropped:
+            return "No roadmap is queued."
+        return (f"Stopped the roadmap; {dropped} job(s) not yet queued were dropped; "
+                "the queued job is unchanged and still waits for Approve.")
+
+    async def _roadmap_finish(self, text: str) -> None:
+        """End the roadmap and say why, once, where it was started."""
+        channel = self._target_channel(self._roadmap_channel_id)
+        who = f"<@{self._roadmap_requester_id}> " if self._roadmap_requester_id else ""
+        self._roadmap_steps, self._roadmap_job = [], None
+        self._roadmap_jobs.clear()
+        roadmap.save(self._roadmap_path(), [])
+        try:
+            if channel is not None:
+                await channel.send(who + text)
+        except Exception:
+            log.exception("could not post the roadmap result")
+
     def _board_channel_id(self, job: Job) -> int:
         """Boards live in NOTIFY_CHANNEL_ID, else where the job was started."""
         return getattr(self.settings, "notify_channel_id", None) or job.channel_id
@@ -1648,6 +1766,10 @@ class MacBuilderBot(discord.Client):
                 await asyncio.sleep(BOARD_TICK_SECONDS)
                 ids = [job.id for job in self.queue.waiting()]
                 await self._board.tick(queue_ids=ids)
+                try:
+                    await self._roadmap_tick()
+                except Exception:  # the roadmap must never stop the board
+                    log.exception("roadmap tick failed")
             except asyncio.CancelledError:
                 raise
             except Exception:  # the board must never stop the bot
