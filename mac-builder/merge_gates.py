@@ -46,10 +46,10 @@ def _allowed(facts: MergeFacts) -> tuple[bool, str]:
         return False, "main is never merged; Hustler merges into its own branch"
     if repo == "Curator.1" and branch.startswith("dan/") and base == "main":
         return True, f"{branch} may merge into main"
+    if repo == "Hustler" and (not base or not authorized):
+        return False, "Hustler needs a base and an authorized branch; one is empty"
     if repo == "Hustler" and base == authorized and branch.startswith("freebuff/"):
         return True, f"{branch} may merge into {authorized}"
-    if repo == "Hustler" and not authorized:
-        return False, "no authorized branch was recorded for this job"
     if repo not in ("Curator.1", "Hustler"):
         return False, f"unknown repo {repo or '(empty)'}"
     return False, f"refused {branch or '(no branch)'} into {base or '(no base)'}"
