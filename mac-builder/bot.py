@@ -64,6 +64,8 @@ DEFAULT_AUTHORIZED_BRANCH = "freebuff/ce4b8907c250c30103d8993e"
 LOG_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}$")
 # How often the board re-checks queue positions and silent stages.
 BOARD_TICK_SECONDS = 30.0
+# A roadmap review that nobody has approved yet is re-pinged this often.
+ROADMAP_PING_SECONDS = 6 * 3600.0
 
 
 class DiscordBoardTransport(status_board.BoardTransport):
@@ -523,7 +525,7 @@ class ReviewView(discord.ui.View):
     """Approve / Reject. Nothing is pushed until Approve is pressed."""
 
     def __init__(self, bot: "MacBuilderBot", outcome: ReviewOutcome) -> None:
-        super().__init__(timeout=86400)
+        super().__init__(timeout=None)
         self.bot = bot
         self.outcome = outcome
         self.approvable = is_approvable(outcome)
@@ -652,6 +654,8 @@ class MacBuilderBot(discord.Client):
         self._roadmap_job: Job | None = None
         self._roadmap_channel_id = 0
         self._roadmap_requester_id = 0
+        # When each waiting job was last reminded of, or is next due one.
+        self._roadmap_reminder: dict[str, float] = {}
         self.runner = jobs.JobRunner(
             settings,
             self.manager,
@@ -1309,7 +1313,7 @@ class MacBuilderBot(discord.Client):
 
     @app_commands.describe(
         sheet="One .md build sheet: each '## Job' heading starts a job",
-        action="status lists the roadmap; stop drops the jobs not yet queued",
+        action="status lists the roadmap; preview shows the plan; stop drops the rest",
     )
     async def cmd_roadmap(self, interaction: discord.Interaction,
                           sheet: Optional[discord.Attachment] = None,
@@ -1324,12 +1328,17 @@ class MacBuilderBot(discord.Client):
             return
         if sheet is None or not sheet.filename.lower().endswith(".md"):
             await interaction.response.send_message(
-                "Attach one .md build sheet, or use `action` status or stop.", ephemeral=True)
+                "Attach one .md build sheet, or use `action` status, preview or stop.",
+                ephemeral=True)
             return
         try:
             steps = roadmap.parse((await sheet.read()).decode("utf-8", "replace"))
         except roadmap.RoadmapError as exc:
-            await interaction.response.send_message(f"Not queued: {exc}.", ephemeral=True)
+            await interaction.response.send_message(
+                f"Not {'previewed' if choice == 'preview' else 'queued'}: {exc}.", ephemeral=True)
+            return
+        if choice == "preview":
+            await interaction.response.send_message(roadmap.preview(steps), ephemeral=True)
             return
         self._roadmap_steps = steps
         self._roadmap_channel_id = interaction.channel_id or 0
@@ -1667,6 +1676,22 @@ class MacBuilderBot(discord.Client):
                 await self._roadmap_finish("roadmap done")
             elif await self._queue_roadmap_step(step) is not None:
                 roadmap.save(self._roadmap_path(), self._roadmap_steps)
+        elif current.status == "awaiting_review":
+            await self._roadmap_remind(current)
+
+    async def _roadmap_remind(self, job: Job) -> None:
+        """One ping every ROADMAP_PING_SECONDS while the review waits on Approve."""
+        now = time.time()
+        due = self._roadmap_reminder.setdefault(job.id, now + ROADMAP_PING_SECONDS)
+        if now < due:
+            return
+        self._roadmap_reminder[job.id] = now + ROADMAP_PING_SECONDS
+        channel = self._target_channel(self._roadmap_channel_id)
+        try:
+            if channel is not None:
+                await channel.send(f"Roadmap waiting on your Approve: `{job.id}`")
+        except Exception:
+            log.exception("could not post the roadmap reminder")
 
     def _roadmap_status(self) -> str:
         """One line per sheet job: its number, kind, job id and recorded state."""
@@ -1684,6 +1709,7 @@ class MacBuilderBot(discord.Client):
         dropped = len([step for step in self._roadmap_steps if not step.job_id])
         self._roadmap_steps, self._roadmap_job = [], None
         self._roadmap_jobs.clear()
+        self._roadmap_reminder.clear()
         roadmap.save(self._roadmap_path(), [])
         if not dropped:
             return "No roadmap is queued."
@@ -1696,6 +1722,7 @@ class MacBuilderBot(discord.Client):
         who = f"<@{self._roadmap_requester_id}> " if self._roadmap_requester_id else ""
         self._roadmap_steps, self._roadmap_job = [], None
         self._roadmap_jobs.clear()
+        self._roadmap_reminder.clear()
         roadmap.save(self._roadmap_path(), [])
         try:
             if channel is not None:

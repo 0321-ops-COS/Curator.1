@@ -342,7 +342,7 @@ tail -f ~/Curator.1/mac-builder/logs/launchd.log
 | `/send <text>` | Pastes text into a stuck screen and submits it, the way `/task` does. At most 500 characters. |
 | `/board` | Re-posts the running job's status board if the message was lost. |
 | `/merge [job-id] [dry-run]` | Gates an approved review (allowlist, check, diff size, protected paths, PR, CI, unchanged head); merges only if every gate passes. Dry run by default. |
-| `/roadmap [sheet] [action]` | Queues one `.md` build sheet: each `## Job` heading is one job (max 8, 6000 chars each), `kind: task`/`kind: dan` picks the type. One at a time; the next queues only after you Approve, a failure stops it and pings. `action: status` lists it, `stop` drops the rest. Never approves, pushes or merges. |
+| `/roadmap [sheet] [action]` | Queues one `.md` build sheet: each `## Job` heading is one job (max 8, 6000 chars each), `kind: task`/`kind: dan` picks the type. One at a time; the next queues only after you Approve, a failure stops it and pings, and a review that still waits on your Approve is pinged every 6 hours. `action: status` lists it, `preview` shows the plan (kind and the first 80 characters of each job, nothing queued or saved), `stop` drops the rest. Never approves, pushes or merges. |
 | `/selftest` | Runs every stage on fakes — sheet parsing, the report and test card, the board and its pings, the merge gates against a mocked GitHub, and the allowlist — and reports pass or fail per stage with one line of evidence. No Freebuff, GitHub, repo write, push, merge or real queue. |
 
 Job results are posted where the job was started, or to `NOTIFY_CHANNEL_ID`.
@@ -786,9 +786,11 @@ branch and short commit of the code that is running.
 
 ## Limitations worth knowing
 
-- Pending Approve/Reject buttons live in bot memory. Restarting the bot (or
-  `KeepAlive` restarting it) drops the buttons; the branch and worktree remain,
-  so inspect or re-run the task. This is deliberately not persisted to disk.
+- Approve/Reject buttons never time out: they stay usable for as long as the
+  bot runs, so a review can wait days. They still live in bot memory, though —
+  restarting the bot (or `KeepAlive` restarting it) drops them, and the branch
+  and worktree remain, so inspect or re-run the task. This is deliberately not
+  persisted to disk.
 - A pending question is held in memory the same way: restarting the bot drops
   it, and Freebuff stays on its box until the session is stopped or
   `QUESTION_WAIT_SECONDS` expires. `/answer` answers the question of the running

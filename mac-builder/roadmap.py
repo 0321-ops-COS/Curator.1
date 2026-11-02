@@ -64,6 +64,13 @@ def parse(sheet: str) -> list[Step]:
     return steps
 
 
+def preview(steps: list[Step]) -> str:
+    """The sheet as a numbered plan: kind and the first 80 chars; nothing saved."""
+    rows = [f"{number}. `{step.kind}` " + " ".join(step.text.split())[:80]
+            for number, step in enumerate(steps, start=1)]
+    return "\n".join([f"Preview: {len(rows)} job(s), nothing queued or saved", *rows])
+
+
 def save(path: Path, steps: list[Step]) -> None:
     """Write the roadmap, so a restart can say what was queued."""
     path.parent.mkdir(parents=True, exist_ok=True)
