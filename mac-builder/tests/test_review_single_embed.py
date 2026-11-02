@@ -67,8 +67,10 @@ class SingleEmbedTests(unittest.IsolatedAsyncioTestCase):
 
         await instance._post_job_result(job, True, "review: approve")
 
-        self.assertEqual(len(channel.sent), 1, "the review embed is the result")
-        embed = channel.sent[0]["embed"]
+        embeds = [e for e in channel.sent if e["embed"] is not None]
+        self.assertEqual(len(embeds), 1, "the review embed is the result")
+        self.assertTrue(any("Not verified:" in (e["content"] or "") for e in channel.sent))
+        embed = embeds[0]["embed"]
         self.assertIsNotNone(embed)
         self.assertIn("waiting for your decision", embed.title)  # type: ignore[attr-defined]
 
@@ -81,7 +83,7 @@ class SingleEmbedTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job.status, "blocked")
         await instance._post_job_result(job, False, "Blocked by rules")
 
-        self.assertEqual(len(channel.sent), 1)
+        self.assertEqual(len([e for e in channel.sent if e["embed"] is not None]), 1)
 
     async def test_a_task_without_a_review_still_reports_its_result(self) -> None:
         channel = FakeChannel()
@@ -89,7 +91,7 @@ class SingleEmbedTests(unittest.IsolatedAsyncioTestCase):
 
         await instance._post_job_result(make_job(), False, "Freebuff timed out")
 
-        self.assertEqual(len(channel.sent), 1)
+        self.assertEqual(len([e for e in channel.sent if e["embed"] is not None]), 1)
         embed = channel.sent[0]["embed"]
         self.assertIn("timed out", embed.description)  # type: ignore[attr-defined]
 

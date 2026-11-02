@@ -28,7 +28,7 @@ class FlakyChannel:
     async def send(
         self, content: str | None = None, embed: object = None, view: object = None
     ) -> None:
-        if self.remaining:
+        if self.remaining and embed is not None:  # the review embed, not the report
             self.remaining -= 1
             raise RuntimeError("500 Internal Server Error")
         self.sent.append({"content": content, "embed": embed, "view": view})
@@ -81,8 +81,9 @@ class ReviewSendFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(job.status, "awaiting_review", "the review never landed")
 
         await instance._post_job_result(job, False, "review: approve")
-        self.assertEqual(len(channel.sent), 1, "the owner still gets a result")
-        text = channel.sent[0]["embed"].description  # type: ignore[attr-defined]
+        embeds = [e for e in channel.sent if e["embed"] is not None]
+        self.assertEqual(len(embeds), 1, "the owner still gets a result")
+        text = embeds[0]["embed"].description  # type: ignore[attr-defined]
         self.assertIn("Review could not be posted", text)
         self.assertIn(BRANCH, text)
 
@@ -95,8 +96,9 @@ class ReviewSendFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(job.status, "blocked", "the blocked review never landed")
 
         await instance._post_job_result(job, False, "Blocked by rules")
-        self.assertEqual(len(channel.sent), 1)
-        text = channel.sent[0]["embed"].description  # type: ignore[attr-defined]
+        embeds = [e for e in channel.sent if e["embed"] is not None]
+        self.assertEqual(len(embeds), 1)
+        text = embeds[0]["embed"].description  # type: ignore[attr-defined]
         self.assertIn("Review could not be posted", text)
         self.assertIn(BRANCH, text)
 

@@ -841,5 +841,48 @@ class BaseLabelTests(unittest.TestCase):
         self.assertNotIn("base:", status_board.render(board, now=0))
 
 
+
+class DigestTests(unittest.IsolatedAsyncioTestCase):
+    """STATUS_DIGEST_SECONDS: one short ping while Freebuff works, never a stream."""
+
+    async def started(self, **over: object):
+        clock = Clock()
+        transport = FakeTransport()
+        publisher = status_board.BoardPublisher(
+            transport, now=clock, wall=clock, edit_min_seconds=0.0,
+            pings=bool(over.get("pings", True)), stall_ping_seconds=10_000.0,
+            digest_seconds=float(over.get("digest", 900.0)),
+        )
+        publisher.track(JOB_ID, channel_id=1, requester_id=OWNER, kind="task",
+                        started_at=clock())
+        await publisher.report(JOB_ID, status_board.FREEBUFF_WORKING, "branch ready")
+        return clock, publisher, transport
+
+    async def test_one_digest_per_interval_with_the_real_stage_and_time(self) -> None:
+        clock, publisher, transport = await self.started()
+        clock.advance(899)
+        await publisher.tick()
+        self.assertEqual(transport.pings, [], "not before the interval")
+        clock.advance(1)
+        await publisher.tick()
+        self.assertEqual(len(transport.pings), 1)
+        ping = transport.pings[0]
+        for piece in (JOB_ID, "3/7 Freebuff working", "15m 00s", "last event: branch ready"):
+            self.assertIn(piece, ping)
+        clock.advance(1)
+        await publisher.tick()
+        self.assertEqual(len(transport.pings), 1, "not once per tick")
+        clock.advance(900)
+        await publisher.tick()
+        self.assertEqual(len(transport.pings), 2, "one per interval")
+
+    async def test_pings_off_or_zero_seconds_sends_none(self) -> None:
+        for over in ({"digest": 0.0}, {"pings": False}):
+            clock, publisher, transport = await self.started(**over)
+            clock.advance(3600)
+            await publisher.tick()
+            self.assertEqual(transport.pings, [], over)
+
+
 if __name__ == "__main__":
     unittest.main()
