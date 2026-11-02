@@ -112,6 +112,10 @@ STALL_REASON = "stalled"
 SUGGESTION_WINDOW_SECONDS = 15.0
 DIFF_STAT_TIMEOUT_SECONDS = 30.0
 MAX_DIFF_STAT_LINES = 60
+# The reviews whose Approve could still push, so a stage the runner reports after
+# the job's run can name the job it belongs to. A reviewer who never decides
+# leaves an entry behind; only the newest few are kept.
+MAX_TRACKED_REVIEWS = 16
 
 
 def _write_job_log(job: Job, text: str) -> None:
@@ -383,6 +387,9 @@ class JobRunner:
         self._last_summary = ""
         self._last_diff_excerpt = ""
         self._running_env: TaskEnvironment | None = None
+        # Branch → job for every review an Approve could still push; see
+        # _on_runner_stage.
+        self._reviews: dict[str, Job] = {}
         # Auto-answers used by each job (QUESTION_AUTO_ANSWER_MAX) and the
         # moment the manager may be called again after a 429 or a timeout.
         self._auto_answers: dict[str, int] = {}
@@ -657,6 +664,9 @@ class JobRunner:
                     f"{changes.diff_lines} changed lines, checks {check_state}, "
                     f"tests {test_state}",
                 )
+                # Approve pushes long after this run returns, so the branch is
+                # kept: it is what names this job when the runner reports PUSHED.
+                self._remember_review(job, env)
                 await self.freebuff.abort(env)
                 outcome = ReviewOutcome(
                     job=job,
@@ -682,9 +692,11 @@ class JobRunner:
                 await self.freebuff.abort(env)
             return False, f"Freebuff job failed: {exc}"
         finally:
-            # The reporters belong to this job: a later job installs its own.
+            # The screen reporter belongs to this job: a later job installs its
+            # own. The stage reporter cannot end with the run, because the push
+            # after Approve is reported through it once the run is long over.
             self.freebuff.screen_reporter = None
-            self.freebuff.status_reporter = None
+            self.freebuff.status_reporter = self._on_runner_stage
 
     # ------------------------------------------------------------- questions
 
@@ -708,6 +720,37 @@ class JobRunner:
                 log.exception("could not post the pane tail for job %s", job.id)
 
         return handle
+
+    def _remember_review(self, job: Job, env: TaskEnvironment | None) -> None:
+        """Keep the branch an Approve will push, so a late PUSHED finds its job."""
+        branch = getattr(env, "branch", "") or ""
+        if not branch:
+            return
+        self._reviews.pop(branch, None)
+        self._reviews[branch] = job
+        while len(self._reviews) > MAX_TRACKED_REVIEWS:
+            self._reviews.pop(next(iter(self._reviews)))
+
+    def _reviewed_job(self, detail: str) -> Job | None:
+        """The job whose review a stage detail names, and only that one."""
+        for branch, job in list(self._reviews.items()):
+            # The push reports '<branch> at <sha>', never a bare branch prefix.
+            if detail == branch or detail.startswith(branch + " "):
+                self._reviews.pop(branch, None)
+                return job
+        return None
+
+    def _on_runner_stage(self, stage: str, detail: str = "") -> None:
+        """A stage the runner reports after the run: the push after Approve.
+
+        The run is over by then (the job is waiting on the owner), so this hook
+        belongs to no run: the branch in the detail names the job it is for.
+        """
+        job = self._reviewed_job(detail)
+        if job is None:
+            log.debug("a stage reported after the run named no review: %s", stage)
+            return
+        self._stage(job, stage, detail)
 
     def _stage(self, job: Job, stage: str, detail: str = "") -> None:
         """Report a real stage through the one hook. Never raises into the job."""
