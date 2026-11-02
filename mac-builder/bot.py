@@ -53,6 +53,7 @@ import questions  # noqa: E402
 import rules  # noqa: E402
 import screens  # noqa: E402
 import selftest  # noqa: E402
+import heartbeat
 import status_board  # noqa: E402
 from freebuff_runner import FreebuffError, FreebuffRunner  # noqa: E402
 from jobs import Job, ReviewOutcome, tail_text  # noqa: E402
@@ -68,6 +69,8 @@ BOARD_TICK_SECONDS = 30.0
 ROADMAP_PING_SECONDS = 6 * 3600.0
 # How long a /roadmap without a sheet waits for that sheet as the next message.
 ROADMAP_WAIT_SECONDS = 10 * 60.0
+# How often the working job's pane is read for the heartbeat.
+HEARTBEAT_TICK_SECONDS = 20.0
 # Discord rejects a message over 2000 characters; every /roadmap reply fits this.
 REPLY_LIMIT = 1900
 
@@ -290,11 +293,14 @@ class Settings:
     # A pane and a worktree both unchanged this long is a stuck screen: it is
     # posted once with /screen, /key and /send, and the clocks pause.
     stall_seconds: float = 90.0
-    # The live board: how often one message may be edited, the silence that
-    # earns a ping, and whether pings are sent at all.
+    # The live board: how often one message may be edited, and whether messages
+    # are sent at all. The pane heartbeat replaces the stage-stall ping: one
+    # "still working" message this often while the pane keeps changing, and the
+    # only silence that ever counts as stuck.
     status_edit_min_seconds: float = 15.0
-    status_stall_ping_seconds: float = 600.0
     status_pings: bool = True
+    heartbeat_ping_seconds: float = 600.0
+    stall_no_output_seconds: float = 300.0
     # While Freebuff works, one short digest ping this often; 0 turns it off.
     status_digest_seconds: float = 900.0
     # Filled in by main() after the startup preflight; None before that.
@@ -382,7 +388,8 @@ class Settings:
             question_debug=_env_bool("QUESTION_DEBUG", False),
             stall_seconds=_env_float("STALL_SECONDS", 90.0),
             status_edit_min_seconds=_env_float("STATUS_EDIT_MIN_SECONDS", 15.0),
-            status_stall_ping_seconds=_env_float("STATUS_STALL_PING_SECONDS", 600.0),
+            heartbeat_ping_seconds=_env_float("HEARTBEAT_PING_SECONDS", 600.0),
+            stall_no_output_seconds=_env_float("STALL_NO_OUTPUT_SECONDS", 300.0),
             status_pings=_env_bool("STATUS_PINGS", True),
             status_digest_seconds=_env_float("STATUS_DIGEST_SECONDS", 900.0),
         )
@@ -400,8 +407,10 @@ class Settings:
             raise ConfigError("STALL_SECONDS must be at least 1")
         if settings.status_edit_min_seconds < 0:
             raise ConfigError("STATUS_EDIT_MIN_SECONDS must be 0 or more")
-        if settings.status_stall_ping_seconds < 1:
-            raise ConfigError("STATUS_STALL_PING_SECONDS must be at least 1")
+        if settings.heartbeat_ping_seconds < 0:
+            raise ConfigError("HEARTBEAT_PING_SECONDS must be 0 or more")
+        if settings.stall_no_output_seconds < 1:
+            raise ConfigError("STALL_NO_OUTPUT_SECONDS must be at least 1")
         if settings.status_digest_seconds < 0:
             raise ConfigError("STATUS_DIGEST_SECONDS must be 0 or more")
         return settings
@@ -652,10 +661,16 @@ class MacBuilderBot(discord.Client):
         self._board = status_board.BoardPublisher(
             DiscordBoardTransport(self),
             edit_min_seconds=settings.status_edit_min_seconds,
-            stall_ping_seconds=settings.status_stall_ping_seconds,
+            # The pane heartbeat owns "stuck" now; a stage clock no longer does.
+            stall_ping_seconds=0.0,
             pings=settings.status_pings,
             digest_seconds=settings.status_digest_seconds,
         )
+        self._heartbeat = heartbeat.Heartbeat(
+            ping_seconds=settings.heartbeat_ping_seconds,
+            stall_seconds=settings.stall_no_output_seconds,
+        )
+        self._heartbeat_ticker: asyncio.Task[None] | None = None
         self._board_tasks: set[asyncio.Task[None]] = set()
         # The reviewed jobs /merge may gate, by id, newest last.
         self._merge_jobs: dict[str, Job] = {}
@@ -810,6 +825,8 @@ class MacBuilderBot(discord.Client):
         self.tree.interaction_check = self.require_allowed
         if self._board_ticker is None or self._board_ticker.done():
             self._board_ticker = asyncio.create_task(self._board_loop())
+        if self._heartbeat_ticker is None or self._heartbeat_ticker.done():
+            self._heartbeat_ticker = asyncio.create_task(self._heartbeat_loop())
         await self.sync_commands()
         if not self._queue_started:
             self.queue.start()
@@ -913,9 +930,11 @@ class MacBuilderBot(discord.Client):
             )
 
     async def close(self) -> None:
-        ticker, self._board_ticker = self._board_ticker, None
-        if ticker is not None:
-            ticker.cancel()
+        tickers = [self._board_ticker, self._heartbeat_ticker]
+        self._board_ticker = self._heartbeat_ticker = None
+        for ticker in tickers:
+            if ticker is not None:
+                ticker.cancel()
         try:
             await self.runner.shutdown()
             await self.queue.stop()
@@ -1874,6 +1893,42 @@ class MacBuilderBot(discord.Client):
                 raise
             except Exception:  # the board must never stop the bot
                 log.exception("status board tick failed")
+
+    async def _heartbeat_loop(self) -> None:
+        """Every 20s: read the pane and say whether the job is really moving."""
+        while True:
+            try:
+                await asyncio.sleep(HEARTBEAT_TICK_SECONDS)
+                await self._heartbeat_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # the heartbeat must never stop the bot
+                log.exception("heartbeat tick failed")
+
+    async def _heartbeat_tick(self) -> None:
+        """One capture of the working job's pane, then what it proves."""
+        board = None
+        for job_id in self._board.tracked_ids():
+            candidate = self._board.board_for(job_id)
+            if candidate is not None and candidate.stage in heartbeat.WORKING_STAGES:
+                board = candidate
+                break
+        if board is None:
+            return
+        pane = await self.freebuff.current_pane()
+        if not pane:
+            return
+        channel_id = self._board.channel_for(board.job_id)
+        for action in self._heartbeat.tick(board, pane):
+            if action.kind == heartbeat.ACTIVITY:
+                await self._board.set_activity(board.job_id, action.text)
+                continue
+            if not channel_id:
+                continue
+            try:
+                await self._board.transport.send(channel_id, action.text)
+            except Exception:  # a message must never touch the job
+                log.warning("could not post a heartbeat for %s", board.job_id)
 
     def _target_channel(self, channel_id: int) -> discord.abc.Messageable | None:
         channel = self.get_channel(channel_id) if channel_id else None
