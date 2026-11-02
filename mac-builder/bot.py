@@ -45,6 +45,7 @@ import compare_link  # noqa: E402
 import github_client  # noqa: E402
 import jobs  # noqa: E402
 import merge_command  # noqa: E402
+import review_record  # noqa: E402
 import roadmap  # noqa: E402
 import test_card  # noqa: E402
 import planner  # noqa: E402
@@ -552,13 +553,48 @@ def is_approvable(outcome: ReviewOutcome) -> bool:
     return outcome.check_ok and outcome.test_ok is not False
 
 
+def review_embed(settings: object, outcome: ReviewOutcome) -> discord.Embed:
+    """The review card. A /review refresh builds it from the same facts."""
+    titles = {"approve": "✅ Manager approved — waiting for your decision",
+              "ask_user": "🟡 Manager needs your decision"}
+    colors = {"approve": discord.Color.green(), "ask_user": discord.Color.orange()}
+    embed = discord.Embed(
+        title=titles.get(outcome.verdict, "Review"),
+        description=(f"**Task:** {outcome.job.text[:300]}\n\n**Manager notes:**\n"
+                     f"{outcome.notes[:3000] or '(none)'}"),
+        color=colors.get(outcome.verdict, discord.Color.orange()))
+    branch = outcome.environment.branch if outcome.environment else "?"
+    embed.add_field(name="Branch", value=f"`{branch}`", inline=True)
+    embed.add_field(name="Changed lines", value=str(outcome.diff_lines), inline=True)
+    embed.add_field(name="Check", value=outcome.check_state[:100], inline=True)
+    embed.add_field(name="Test", value=outcome.test_state[:100], inline=True)
+    embed.add_field(name="Files", value=str(len(outcome.changed_files)), inline=True)
+    embed.add_field(name="Job", value=f"`{outcome.job.id}`", inline=True)
+    embed.add_field(name="Log", value=f"`{outcome.job.log_path.name}`", inline=False)
+    if outcome.changed_files:
+        embed.add_field(name="Uncommitted", inline=False, value=(
+            f"{len(outcome.changed_files)} file(s) not committed yet; Approve "
+            "commits them and pushes only this branch"))
+    link = review_compare_url(settings, outcome)
+    if link:
+        embed.add_field(name="Compare / merge link", value=link, inline=False)
+    embed.set_footer(text=(
+        "Nothing is pushed unless you press Approve." if is_approvable(outcome)
+        else "A check or test failed, so there is no Approve button."))
+    return embed
+
+
 class ReviewView(discord.ui.View):
     """Approve / Reject. Nothing is pushed until Approve is pressed."""
 
-    def __init__(self, bot: "MacBuilderBot", outcome: ReviewOutcome) -> None:
+    def __init__(self, bot: "MacBuilderBot", outcome: ReviewOutcome, *,
+                 refreshed: bool = False) -> None:
         super().__init__(timeout=None)
         self.bot = bot
         self.outcome = outcome
+        # A refreshed card re-checks the saved review and the worktree first: the
+        # buttons are new, but nothing about what may be pushed is looser.
+        self.refreshed = refreshed
         self.approvable = is_approvable(outcome)
         self.resolved = False
         self._lock = asyncio.Lock()
@@ -585,6 +621,12 @@ class ReviewView(discord.ui.View):
             await interaction.message.edit(embed=embed, view=self)
         await interaction.followup.send(text)
 
+    def _decided(self, status: str) -> None:
+        """Tell the bot what was decided; a fake bot without the hook is fine."""
+        hook = getattr(self.bot, "review_decided", None)
+        if hook is not None:
+            hook(self.outcome.job, status)
+
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
     async def approve(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -603,6 +645,11 @@ class ReviewView(discord.ui.View):
                 return
             self.resolved = True
         await interaction.response.defer()
+        if self.refreshed:
+            why = await self.bot.review_refusal(self.outcome)
+            if why:
+                await self._finish(interaction, why)
+                return
         env = self.outcome.environment
         if env is None:
             await self._finish(interaction, "Nothing to push; the worktree was not kept.")
@@ -624,6 +671,7 @@ class ReviewView(discord.ui.View):
                 await interaction.message.edit(view=self)
             return
         self.outcome.job.status = "approved"
+        self._decided("approved")
         await self._finish(
             interaction,
             approve_confirm_text(self.bot.settings, self.outcome, interaction.user.id, sha),
@@ -642,6 +690,7 @@ class ReviewView(discord.ui.View):
             self.resolved = True
         await interaction.response.defer()
         self.outcome.job.status = "rejected"
+        self._decided("rejected")
         branch = self.outcome.environment.branch if self.outcome.environment else "none"
         await self._finish(
             interaction,
@@ -831,6 +880,9 @@ class MacBuilderBot(discord.Client):
         self.tree.add_command(app_commands.Command(
             name="roadmap", callback=self.cmd_roadmap,
             description="Queue a build sheet: one job per '## Job', one at a time"))
+        self.tree.add_command(app_commands.Command(
+            name="review", callback=self.cmd_review,
+            description="Re-post live Approve/Reject cards for reviews waiting on you"))
         self.tree.add_command(app_commands.Command(
             name="selftest", callback=self.cmd_selftest, description="Run each stage on fakes"))
         self.tree.interaction_check = self.require_allowed
@@ -1399,6 +1451,53 @@ class MacBuilderBot(discord.Client):
             "Send the .md sheet as your next message in this channel within 10 minutes.",
             ephemeral=True)
 
+    # --------------------------------------------------------------- review
+
+    @app_commands.describe(job="A job id, or nothing for every job awaiting review")
+    async def cmd_review(self, interaction: discord.Interaction,
+                         job: Optional[str] = None) -> None:
+        """Fresh cards for reviews whose buttons died with the process.
+
+        Rebuilt from the record saved when the review was posted and from the
+        worktree on disk; Approve on one is the same strict path as the original.
+        """
+        if not await self.require_allowed(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        wanted = (job or "").strip()
+        records = [record for record in review_record.load(self.settings)
+                   if not wanted or str(record["job"].get("id", "")) == wanted]
+        if not records:
+            saved = review_record.load_one(self.settings, wanted) if wanted else None
+            if saved is None:
+                text = (f"No saved review for `{wanted}`; nothing to refresh."
+                        if wanted else "No job is awaiting review.")
+            else:
+                state = str(saved.get("status", "")).replace("_", " ")
+                text = f"`{wanted}` is not awaiting review ({state}); nothing to refresh."
+            await interaction.followup.send(text, ephemeral=True)
+            return
+        posted: list[str] = []
+        for record in records:
+            rebuilt = review_record.outcome(record)
+            channel = self._target_channel(rebuilt.job.channel_id) or interaction.channel
+            if channel is None:
+                continue
+            try:
+                await channel.send(
+                    content=(f"Refreshed review for `{rebuilt.job.id}`: these buttons "
+                             "work now; Approve still pushes only this branch."),
+                    embed=review_embed(self.settings, rebuilt),
+                    view=ReviewView(self, rebuilt, refreshed=True))
+            except Exception:
+                log.exception("could not refresh the review for job %s", rebuilt.job.id)
+                continue
+            posted.append(rebuilt.job.id)
+        await interaction.followup.send(
+            (f"Fresh card(s) for {', '.join(f'`{item}`' for item in posted)}."
+             if posted else "The saved review could not be posted; the log says why."),
+            ephemeral=True)
+
     # ------------------------------------------------------------- selftest
 
     async def cmd_selftest(self, interaction: discord.Interaction) -> None:
@@ -1804,7 +1903,9 @@ class MacBuilderBot(discord.Client):
         channel = self._target_channel(self._roadmap_channel_id)
         try:
             if channel is not None:
-                await channel.send(f"Roadmap waiting on your Approve: `{job.id}`")
+                await channel.send(
+                    f"Roadmap waiting on your Approve: `{job.id}`\n"
+                    "Buttons not working? Run /review")
         except Exception:
             log.exception("could not post the roadmap reminder")
 
@@ -2139,7 +2240,54 @@ class MacBuilderBot(discord.Client):
             except Exception:  # a report may never fail a review
                 log.exception("could not post a report line for job %s", outcome.job.id)
 
+    async def review_refusal(self, outcome: ReviewOutcome) -> str | None:
+        """Why a refreshed card must not act, in plain words; None to go ahead."""
+        record = review_record.load_one(self.settings, outcome.job.id)
+        state = (record or {}).get("status", "missing")
+        if state != review_record.AWAITING:
+            said = ("was never saved" if state == "missing"
+                    else f"was already {str(state).replace('_', ' ')}")
+            return (f"`{outcome.job.id}` {said}, so this card has nothing to approve. "
+                    "Nothing was pushed.")
+        env = outcome.environment
+        if env is None or not env.worktree.is_dir():
+            return "The worktree is gone, so there is nothing to push. Nothing was pushed."
+        # Read-only: a branch on origin is the only proof an Approve already ran.
+        pushed = await self.freebuff._repo_for(env)._run(
+            ["ls-remote", "--heads", "origin", env.branch], check=False)
+        if pushed.code == 0 and pushed.stdout.strip():
+            return (f"`{env.branch}` is already on origin, so there is nothing to push. "
+                    "Run /merge to gate the merge.")
+        try:
+            changes = await self.freebuff.collect(env, int(self.settings.max_diff_lines))
+        except FreebuffError as exc:
+            return f"The worktree could not be re-read ({exc}); nothing was pushed."
+        if changes.snapshot != outcome.snapshot:
+            return ("The worktree changed since this card was shown, so it is not what "
+                    "would be pushed. Nothing was pushed. Run /review again.")
+        if sorted(changes.changed_paths) != sorted(outcome.changed_files):
+            return ("The changed files differ from what this card showed. Nothing was "
+                    "pushed. Run /review again.")
+        return None
+
+    def review_decided(self, job: Job, status: str) -> None:
+        """Keep the decision, and let the roadmap advance on a refreshed Approve."""
+        review_record.mark(self.settings, job.id, status)
+        job.status = status
+        if status != "approved":
+            return
+        if any(step.job_id == job.id for step in getattr(self, "_roadmap_steps", [])):
+            # This card is the Approve the roadmap was waiting for: the next tick
+            # queues the next step exactly as an original Approve would, and a
+            # paused roadmap still holds it back.
+            self._roadmap_job = job
+            self._roadmap_jobs[job.id] = job
+
     async def _post_review(self, outcome: ReviewOutcome) -> None:
+        # Save the card's facts before posting: a send that never lands or a
+        # restart that loses the buttons is then recoverable with /review.
+        if outcome.verdict != "blocked":
+            review_record.save(self.settings, outcome)
         self._remember_merge_job(outcome.job)
         channel = self._target_channel(outcome.job.channel_id)
         if channel is None:
@@ -2160,40 +2308,7 @@ class MacBuilderBot(discord.Client):
                 outcome.job.status = "blocked"
             return
 
-        titles = {
-            "approve": "✅ Manager approved — waiting for your decision",
-            "ask_user": "🟡 Manager needs your decision",
-        }
-        colors = {
-            "approve": discord.Color.green(),
-            "ask_user": discord.Color.orange(),
-        }
-        embed = discord.Embed(
-            title=titles.get(outcome.verdict, "Review"),
-            description=f"**Task:** {outcome.job.text[:300]}\n\n**Manager notes:**\n{outcome.notes[:3000] or '(none)'}",
-            color=colors.get(outcome.verdict, discord.Color.orange()),
-        )
-        embed.add_field(
-            name="Branch",
-            value=f"`{outcome.environment.branch if outcome.environment else '?'}`",
-            inline=True,
-        )
-        embed.add_field(name="Changed lines", value=str(outcome.diff_lines), inline=True)
-        embed.add_field(name="Check", value=outcome.check_state[:100], inline=True)
-        embed.add_field(name="Test", value=outcome.test_state[:100], inline=True)
-        embed.add_field(name="Files", value=str(len(outcome.changed_files)), inline=True)
-        embed.add_field(name="Job", value=f"`{outcome.job.id}`", inline=True)
-        embed.add_field(name="Log", value=f"`{outcome.job.log_path.name}`", inline=False)
-        link = review_compare_url(self.settings, outcome)
-        if link:
-            embed.add_field(name="Compare / merge link", value=link, inline=False)
-        embed.set_footer(
-            text=(
-                "Nothing is pushed unless you press Approve."
-                if is_approvable(outcome)
-                else "A check or test failed, so there is no Approve button."
-            )
-        )
+        embed = review_embed(self.settings, outcome)
         view = ReviewView(self, outcome)
         if await self._send_review(channel, outcome, embed=embed, view=view):
             outcome.job.status = "awaiting_review"

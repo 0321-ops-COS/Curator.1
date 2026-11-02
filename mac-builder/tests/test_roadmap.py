@@ -186,7 +186,8 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
             clock[0] += 1
             await self.bot._roadmap_tick()
             self.assertEqual(self.channel.send.await_args.args[0],
-                             f"Roadmap waiting on your Approve: `{first.id}`")
+                             f"Roadmap waiting on your Approve: `{first.id}`\n"
+                             "Buttons not working? Run /review")
             clock[0] += 6 * 3600
             await self.bot._roadmap_tick()
             self.assertEqual(self.channel.send.await_count, 2, "one ping per six hours")
