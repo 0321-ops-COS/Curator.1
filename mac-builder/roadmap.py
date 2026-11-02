@@ -61,11 +61,31 @@ def parse(sheet: str) -> list[Step]:
     return steps
 
 
+# Discord rejects a message over 2000 characters, so a preview stays under this.
+PREVIEW_LIMIT = 1900
+PREVIEW_SNIPPET = 50
+
+
 def preview(steps: list[Step]) -> str:
-    """The sheet as a numbered plan: kind and the first 80 chars; nothing saved."""
-    rows = [f"{number}. `{step.kind}` " + " ".join(step.text.split())[:80]
+    """The sheet as a numbered plan: kind and the first 50 chars; nothing saved.
+
+    A long sheet cannot fit one message: the header still counts every job, rows
+    are dropped from the end once the plan would pass PREVIEW_LIMIT, and the last
+    line says how many jobs were left out.
+    """
+    rows = [f"{number}. `{step.kind}` " + " ".join(step.text.split())[:PREVIEW_SNIPPET]
             for number, step in enumerate(steps, start=1)]
-    return "\n".join([f"Preview: {len(rows)} job(s), nothing queued or saved", *rows])
+    lines = [f"Preview: {len(rows)} job(s), nothing queued or saved"]
+    for index, row in enumerate(rows):
+        omitted = len(rows) - index - 1
+        more = [f"...and {omitted} more job(s)"] if omitted else []
+        if len("\n".join([*lines, row, *more])) > PREVIEW_LIMIT:
+            break
+        lines.append(row)
+    shown = len(lines) - 1
+    if shown < len(rows):
+        lines.append(f"...and {len(rows) - shown} more job(s)")
+    return "\n".join(lines)
 
 
 def save(path: Path, steps: list[Step]) -> None:

@@ -68,6 +68,15 @@ BOARD_TICK_SECONDS = 30.0
 ROADMAP_PING_SECONDS = 6 * 3600.0
 # How long a /roadmap without a sheet waits for that sheet as the next message.
 ROADMAP_WAIT_SECONDS = 10 * 60.0
+# Discord rejects a message over 2000 characters; every /roadmap reply fits this.
+REPLY_LIMIT = 1900
+
+
+def _clip_reply(text: str) -> str:
+    """One Discord-safe reply; the roadmap preview already stays under the limit."""
+    if len(text) <= REPLY_LIMIT:
+        return text
+    return text[:REPLY_LIMIT - 3].rstrip() + "..."
 
 
 class DiscordBoardTransport(status_board.BoardTransport):
@@ -1644,7 +1653,11 @@ class MacBuilderBot(discord.Client):
 
     async def _roadmap_apply(self, sheet: discord.Attachment, mode: str,
                              channel_id: int, requester_id: int) -> str:
-        """The one path for a sheet: read it, then preview it or queue its first job."""
+        """The one path for a sheet: read it, then preview it or queue its first job.
+
+        Every reply goes out through _clip_reply, a last net under the preview's
+        own limit, so no /roadmap text can hit Discord's 2000-character ceiling.
+        """
         try:
             data = await sheet.read()
         except discord.HTTPException:
@@ -1652,9 +1665,9 @@ class MacBuilderBot(discord.Client):
         try:
             steps = roadmap.parse(data.decode("utf-8", "replace"))
         except roadmap.RoadmapError as exc:
-            return f"Not {'previewed' if mode == 'preview' else 'queued'}: {exc}."
+            return _clip_reply(f"Not {'previewed' if mode == 'preview' else 'queued'}: {exc}.")
         if mode == "preview":
-            return roadmap.preview(steps)
+            return _clip_reply(roadmap.preview(steps))
         self._roadmap_steps = steps
         self._roadmap_channel_id = channel_id
         self._roadmap_requester_id = requester_id
@@ -1663,8 +1676,9 @@ class MacBuilderBot(discord.Client):
             self._roadmap_steps = []
             return "The queue is full; nothing was queued."
         roadmap.save(self._roadmap_path(), steps)
-        return (f"Roadmap queued: {len(steps)} job(s), first is `{job.id}` ({steps[0].kind}). "
-                "Each still waits for your Approve; nothing is pushed or merged.")
+        return _clip_reply(
+            f"Roadmap queued: {len(steps)} job(s), first is `{job.id}` ({steps[0].kind}). "
+            "Each still waits for your Approve; nothing is pushed or merged.")
 
     async def _take_roadmap_sheet(self, message: discord.Message) -> bool:
         """True when this message was the sheet a /roadmap is waiting for.

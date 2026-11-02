@@ -135,6 +135,42 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('no "## Job" heading', text)
         self.assertFalse((Path(self._tmp.name) / "roadmap.json").exists())
 
+    async def test_a_preview_of_twenty_four_jobs_fits_one_message(self) -> None:
+        sheet = "".join(f"## Job\nTask {n}: " + "detail " * 12 + "\n" for n in range(24))
+        fake = await self.start(sheet, action="preview")
+        text = fake.response.send_message.await_args.args[0]
+        self.assertLessEqual(len(text), 1900, "Discord rejects more than 2000 characters")
+        self.assertTrue(text.startswith("Preview: 24 job(s), nothing queued or saved"),
+                        "the header still counts every job")
+        self.assertEqual((len(text.splitlines()), self.bot.queue.submitted), (25, []))
+
+    async def test_a_preview_of_a_hundred_jobs_fits_one_message(self) -> None:
+        sheet = "".join(f"## Job\nTask {n}: " + "detail " * 12 + "\n" for n in range(100))
+        fake = await self.start(sheet, action="preview")
+        text = fake.response.send_message.await_args.args[0]
+        lines = text.splitlines()
+        self.assertLessEqual(len(lines), 1900)
+        self.assertLessEqual(len(text), 1900)
+        self.assertTrue(lines[0].startswith("Preview: 100 job(s), nothing queued or saved"))
+        self.assertRegex(lines[-1], r"^\.\.\.and \d+ more job\(s\)$")
+        self.assertFalse((Path(self._tmp.name) / "roadmap.json").exists())
+
+    async def test_a_short_preview_keeps_its_rows_and_shorter_snippets(self) -> None:
+        sheet = ("## Job\nkind: task\n" + "a" * 30 + "\n## Job\nkind: task\n" + "b" * 80
+                 + "\n## Job\nkind: task\nShort one.\n")
+        fake = await self.start(sheet, action="preview")
+        self.assertEqual(fake.response.send_message.await_args.args[0].splitlines(), [
+            "Preview: 3 job(s), nothing queued or saved",
+            "1. `task` " + "a" * 30,
+            "2. `task` " + "b" * 50,
+            "3. `task` Short one.",
+        ])
+
+    def test_a_reply_is_clipped_to_one_discord_message(self) -> None:
+        clipped = bot._clip_reply("x" * 5000)
+        self.assertEqual((len(clipped), clipped.endswith("...")), (1900, True))
+        self.assertEqual(bot._clip_reply("short"), "short")
+
     async def test_a_waiting_review_is_pinged_every_six_hours_until_approved(self) -> None:
         await self.start()
         first = self.bot.queue.submitted[0]
