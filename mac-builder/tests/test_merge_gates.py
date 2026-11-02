@@ -51,6 +51,8 @@ class GateTests(unittest.TestCase):
         self.assertFalse(gates(**hustler, base="main", authorized_branch="freebuff/a")["allowed"].passed)
         merged = gates(**hustler, base="freebuff/b", authorized_branch="freebuff/b")
         self.assertTrue(merged["allowed"].passed)
+        self.assertFalse(gates(**hustler, base="", authorized_branch="")["allowed"].passed)
+        self.assertFalse(gates(**hustler, base="freebuff/b", authorized_branch="")["allowed"].passed)
         self.assertFalse(gates(branch="freebuff/a")["allowed"].passed)
 
     def test_protected_paths_are_refused(self) -> None:
