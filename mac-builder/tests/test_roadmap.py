@@ -57,6 +57,7 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         self.bot._roadmap_requester_id = 0
         self.bot._roadmap_reminder = {}
         self.bot._roadmap_waiting = {}
+        self.bot._roadmap_paused = False
         self.bot._target_channel = lambda channel_id: self.channel  # type: ignore[method-assign]
 
     async def start(self, sheet: str = SHEET, user_id: int = 42,
@@ -198,19 +199,19 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
     def test_a_saved_roadmap_loads_back_with_its_channel(self) -> None:
         path = Path(self._tmp.name) / "roadmap.json"
         steps = [roadmap.Step("Add a button.", "task"), roadmap.Step("Refactor.", "dan", "j1")]
-        roadmap.save(path, steps, channel_id=7, requester_id=42)
-        loaded, channel_id, requester_id = roadmap.load(path)
-        self.assertEqual(([step.text for step in loaded], channel_id, requester_id),
-                         (["Add a button.", "Refactor."], 7, 42))
+        roadmap.save(path, steps, channel_id=7, requester_id=42, paused=True)
+        loaded, channel_id, requester_id, paused = roadmap.load(path)
+        self.assertEqual(([step.text for step in loaded], channel_id, requester_id, paused),
+                         (["Add a button.", "Refactor."], 7, 42, True))
         self.assertEqual(loaded[1].job_id, "j1")
 
     def test_a_missing_or_corrupt_roadmap_file_is_ignored(self) -> None:
         path = Path(self._tmp.name) / "roadmap.json"
-        self.assertEqual(roadmap.load(path), ([], 0, 0), "no file at all")
+        self.assertEqual(roadmap.load(path), ([], 0, 0, False), "no file at all")
         for text in ("", "{not json", "{}", '{"steps": [{"kind": "task"}]}',
                      '{"steps": [{"text": "x", "kind": "evil"}]}'):
             path.write_text(text, "utf-8")
-            self.assertEqual(roadmap.load(path), ([], 0, 0), text)
+            self.assertEqual(roadmap.load(path), ([], 0, 0, False), text)
 
     def test_a_restored_roadmap_adopts_its_queued_job(self) -> None:
         job = SimpleNamespace(id="j1", status="approved")
@@ -302,6 +303,39 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await self.bot._take_roadmap_sheet(message))
         self.assertEqual(message.reply.await_count, 0)
         self.assertEqual((self.bot.queue.submitted, self.bot._roadmap_waiting), ([], {}))
+
+    async def test_pause_holds_the_next_job_and_resume_lets_it_go(self) -> None:
+        await self.start()
+        first = self.bot.queue.submitted[0]
+        reply = (await self.command(action="pause")).response.send_message.await_args.args[0]
+        self.assertIn("paused, 1 job(s) left", reply)
+        self.assertIn("paused, 1 job(s) left", self.bot._roadmap_status())
+        first.status = "approved"
+        await self.bot._roadmap_tick()
+        self.assertEqual(len(self.bot.queue.submitted), 1, "the next job waits while paused")
+        self.assertEqual(first.status, "approved", "the queued job is left alone")
+        self.assertIn("Roadmap resumed", (await self.command(action="resume"))
+                      .response.send_message.await_args.args[0])
+        await self.bot._roadmap_tick()
+        self.assertEqual([job.kind for job in self.bot.queue.submitted], ["task", "dan"])
+        self.assertNotIn("paused", self.bot._roadmap_status(), "no pause line once resumed")
+
+    async def test_a_paused_tick_does_nothing_at_all(self) -> None:
+        await self.start()
+        self.bot.queue.submitted[0].status = "failed"
+        await self.command(action="pause")
+        await self.bot._roadmap_tick()
+        self.assertEqual((self.channel.send.await_count, len(self.bot._roadmap_steps)), (0, 2))
+        await self.command(action="resume")
+        await self.bot._roadmap_tick()
+        self.assertIn("failed", self.channel.send.await_args.args[0], "the tick runs again")
+
+    def test_an_old_roadmap_file_loads_unpaused(self) -> None:
+        path = Path(self._tmp.name) / "roadmap.json"
+        path.write_text(json.dumps([{"text": "Old job.", "kind": "task", "job_id": "abc"}]))
+        steps, channel_id, requester_id, paused = roadmap.load(path)
+        self.assertEqual(([step.text for step in steps], channel_id, requester_id, paused),
+                         (["Old job."], 0, 0, False))
 
     async def test_a_new_roadmap_replaces_the_waiting_one_and_stop_clears_it(self) -> None:
         await self.command(action="preview")
