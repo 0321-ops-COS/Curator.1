@@ -51,9 +51,11 @@ mac-builder/
   manager.py          OpenAI-compatible review and planning chat (no tools)
   planner.py          `/plan`: gathers the context and writes the plan document
   project_context.py  which repo/branch/project she builds, plus herself
+  questions.py        the "Some questions for you" box: parse it, answer it
+  screens.py          classifies any other screen: sign-in, rate limit, crash, ...
   rules.py            hard guardrails enforced in code
   freebuff_runner.py  branch + git worktree + tmux + diff collection + push
-  scripts/            check.sh test.sh build.sh status.sh qcapture.sh
+  scripts/            check.sh test.sh build.sh status.sh qcapture.sh screencap.sh
   logs/               job logs (gitignored except .gitkeep)
   launchd/            com.hustler.macbuilder.plist (LaunchAgent)
   tests/              offline unit tests for the guardrails and parsing
@@ -159,7 +161,8 @@ are kept for inspection.
 | `FREEBUFF_BIN`, `FREEBUFF_ARGS` | Interactive Freebuff CLI and fixed arguments. |
 | `FREEBUFF_READY_SECONDS` | Wait for first terminal output before sending the task. |
 | `FREEBUFF_IDLE_SECONDS` | Worktree must stop changing this long to count as done. |
-| `FREEBUFF_POLL_SECONDS` | How often the pane is captured to look for a question; default 10. |
+| `FREEBUFF_POLL_SECONDS` | How often the pane is captured to look for a question or a stuck screen; default 10. |
+| `STALL_SECONDS` | A pane and a worktree both unchanged this long is a screen, not progress: it is posted once, the clocks pause, and `/screen`, `/key` and `/send` become available. Default 90. |
 | `FREEBUFF_TIMEOUT_SECONDS` | Hard stop per Freebuff round. |
 | `QUESTION_WAIT_SECONDS` | How long a Freebuff question box may hold a job waiting for `/answer`; after that it is dismissed with `Esc` and the job fails. Default 1800. |
 | `QUESTION_AUTO_ANSWER` | `1` lets the manager answer a question, only when it replies with high confidence. Default `0`: the manager is rate limited and off by default. |
@@ -220,6 +223,9 @@ tail -f ~/Curator.1/mac-builder/logs/launchd.log
 | `/task <text>` | Fresh `freebuff/<short-id>` branch + worktree, Freebuff in tmux, then review. |
 | `/dan <text>` | Self-build: `dan/<job-id>` from a freshly fetched `origin/main` in her own checkout, Freebuff in tmux, Python checks instead of Xcode, then review. Approve pushes `dan/*` only. |
 | `/answer <number or text>` | Answers the question Freebuff is waiting on: an option number picks that option, anything else is typed as free text. |
+| `/screen` | The running job's Freebuff pane, read-only, with the kind of screen it is. |
+| `/key <name>` | One key to a stuck screen: `Enter`, `Esc`, `Up`, `Down`, `Left`, `Right`, `Tab`, `y`, `n`. Nothing else. |
+| `/send <text>` | Pastes text into a stuck screen and submits it, the way `/task` does. At most 500 characters. |
 
 Job results are posted where the job was started, or to `NOTIFY_CHANNEL_ID`.
 
@@ -386,6 +392,53 @@ is running another folder, and the startup `code:` line says which one.
    `[question N is the owner's call: it mentions 'delete']`, the manager is not
    called at all (no suggestion even with `QUESTION_SUGGEST=1`), and nothing is
    typed until you `/answer`.
+
+### Every other screen (`/screen`, `/key`, `/send`)
+
+Only the question box used to be recognized. Now `screens.py` classifies the
+pane, and anything that is not progress is shown to you instead of waiting out
+the hard timeout:
+
+| Kind | What it means | Handled by |
+|---|---|---|
+| `sign_in` | a login, device code, or "press Enter to open the browser" | you, with `/key` and `/send` |
+| `rate_limit` | usage limit, quota, waiting room, limited mode | you |
+| `update_prompt` | "a new version is available" | you |
+| `confirm_prompt` | `[y/N]`, "press Enter to continue", a trust or permission request | you |
+| `error_or_crash` | a traceback, a panic, "command not found" | you |
+| `ready_prompt` | the prompt the task is typed into | the runner |
+| `working` | ordinary output, a diff or a failing test included | the runner |
+| `question_box`, `survey` | the numbered questions | `/answer`; the survey is dismissed |
+| `unknown` | an empty or unrecognized screen | the stall path below |
+
+- **Readiness.** The task text is sent only at a `ready_prompt` or at output
+  that is not a screen you have to deal with. A sign-in screen is posted
+  instead of receiving the task; once it clears, the task goes in as usual.
+- **Stall detection.** If the pane text *and* the worktree are both unchanged
+  for `STALL_SECONDS` (default 90) while the job is not done, the sanitized
+  pane is posted once per distinct screen with its kind. The idle timer and the
+  hard timeout are paused while you deal with it, and after
+  `QUESTION_WAIT_SECONDS` it is dismissed with `Esc` and the job fails with
+  "expired". An unrecognized screen uses the same path, so nothing is silent.
+- **Commands.** `/screen` shows the pane read-only. `/key` sends one key from a
+  fixed list and nothing else: the name is resolved to a key inside the bot, so
+  no arbitrary string reaches tmux. `/send <text>` pastes through the same tmux
+  buffer as `/task` (load-buffer, paste-buffer, Enter) and refuses more than
+  500 characters. All three are allowlist-checked, act only while a screen is
+  waiting, and are written to the job log.
+- **Redaction.** Before any pane text reaches Discord, the log or a plan, long
+  token-like strings (32+ characters mixing letters and digits), `Bearer …`
+  values and API-key shapes are masked as `[redacted]`. Short human codes such
+  as `ABCD-1234` are deliberately kept, because you need them to sign in, and
+  paths stay readable so a diff still makes sense.
+- **Exit reasons.** When the session exits, its last screen is classified and
+  named in the result ("the session exited on a rate-limit screen") instead of a
+  bare "exited".
+- **New screens.** Freebuff is closed source, so these patterns are a starting
+  point, not a complete list. Capture a real one with
+  `scripts/screencap.sh <label>`: it writes the plain and coloured pane to
+  `logs/screencaps/` (gitignored) and prints the kind the classifier assigns.
+  Scrub anything personal, then add it to `tests/test_screens.py`.
 
 ### `/dan` (self-build)
 
