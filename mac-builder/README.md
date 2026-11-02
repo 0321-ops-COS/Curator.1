@@ -163,6 +163,9 @@ are kept for inspection.
 | `FREEBUFF_IDLE_SECONDS` | Worktree must stop changing this long to count as done. |
 | `FREEBUFF_POLL_SECONDS` | How often the pane is captured to look for a question or a stuck screen; default 10. |
 | `STALL_SECONDS` | A pane and a worktree both unchanged this long is a screen, not progress: it is posted once, the clocks pause, and `/screen`, `/key` and `/send` become available. Default 90. |
+| `STATUS_EDIT_MIN_SECONDS` | Minimum seconds between edits of one status board message, so Discord is never rate-limited. Default 15. |
+| `STATUS_STALL_PING_SECONDS` | A running job with no stage change for this long earns one "has not moved" ping per stall. Default 600. |
+| `STATUS_PINGS` | `1` (default) sends the short pings that need you; `0` keeps the quietly edited board and sends none. |
 | `FREEBUFF_TIMEOUT_SECONDS` | Hard stop per Freebuff round. |
 | `QUESTION_WAIT_SECONDS` | How long a Freebuff question box may hold a job waiting for `/answer`; after that it is dismissed with `Esc` and the job fails. Default 1800. |
 | `QUESTION_AUTO_ANSWER` | `1` lets the manager answer a question, only when it replies with high confidence. Default `0`: the manager is rate limited and off by default. |
@@ -213,7 +216,7 @@ tail -f ~/Curator.1/mac-builder/logs/launchd.log
 | Command | What it does |
 |---|---|
 | `/project` | Which repo, branch and project Melisa is working on, plus her own repo. |
-| `/status` | Project, branch, git state, queue length, running job and how long it has been going, and whether question detection is on. Runs `status.sh` directly. |
+| `/status` | The live board for the running job — stage, elapsed time, "looks like" screen — plus one line per waiting job. Read-only and immediate; no probe. |
 | `/cancel [job-id]` | Stops the running job, or one still waiting. The branch is kept; nothing is pushed. |
 | `/check` | `swift test` in HustlerCore. Queued. |
 | `/test` | `xcodegen`, then `xcodebuild test` on one simulator, then shuts it down. Queued. |
@@ -226,6 +229,7 @@ tail -f ~/Curator.1/mac-builder/logs/launchd.log
 | `/screen` | The running job's Freebuff pane, read-only, with the kind of screen it is. |
 | `/key <name>` | One key to a stuck screen: `Enter`, `Esc`, `Up`, `Down`, `Left`, `Right`, `Tab`, `y`, `n`. Nothing else. |
 | `/send <text>` | Pastes text into a stuck screen and submits it, the way `/task` does. At most 500 characters. |
+| `/board` | Re-posts the running job's status board if the message was lost. |
 
 Job results are posted where the job was started, or to `NOTIFY_CHANNEL_ID`.
 
@@ -439,6 +443,43 @@ the hard timeout:
   `scripts/screencap.sh <label>`: it writes the plain and coloured pane to
   `logs/screencaps/` (gitignored) and prints the kind the classifier assigns.
   Scrub anything personal, then add it to `tests/test_screens.py`.
+
+### Status board and pings
+
+The owner is on a phone, so every builder job gets one live message instead of
+a stream of posts. It is posted when the job is queued and edited in place as
+the job moves, throttled by `STATUS_EDIT_MIN_SECONDS` (default 15) so Discord is
+never rate-limited. If the message was deleted or the edit fails, one new board
+is posted and the job carries on.
+
+```
+20261102-101500-deadbeef · task · Hustler
+▰▰▰▱▱▱▱ 3/7 Freebuff working · 12m 04s
+looks like: sign_in — sign in on the Mac, or use /screen, /key, /send
+last event: branch freebuff/9a1c ready
+```
+
+- **Real stages only.** `queued → branch_ready → freebuff_working → checks →
+  tests → manager_review → awaiting_approve`, then `pushed`, `rejected`,
+  `failed`, `cancelled` or `timed_out`. Each stage is reported by the code that
+  reaches it, and the bar position is that stage's number: Freebuff reports no
+  progress, so there is none to draw.
+- **Waiting on you.** The board carries the kind `screens.py` returned and the
+  exact commands that deal with it: `question_box` → `/answer`, `sign_in` →
+  `/screen`, `/key`, `/send`, `rate_limit` → `/screen` or `/cancel`,
+  `update_prompt` → `/key Enter`, `confirm_prompt` → `/key y` or `/key n`,
+  `error_or_crash` → `/screen`, and an unrecognized or stalled screen →
+  `/screen`. It is always worded `looks like: <kind>`, because the patterns are
+  not verified against the real binary.
+- **Queue position** (`queued #2`) is refreshed when the queue moves.
+- **Pings** are separate short messages, so the phone actually notifies: a job
+  waiting on you, a review ready to Approve, and a job finished, failed or timed
+  out. A stage that has not changed for `STATUS_STALL_PING_SECONDS` pings once
+  per stall. Routine stages never ping, and a wait screen pings once per kind,
+  not once per pane repaint. `STATUS_PINGS=0` keeps the board and sends nothing.
+- **`/board`** posts a fresh board for the running job. Script jobs (`/check`,
+  `/test`, `/build`) keep their existing result embed and are listed by
+  `/status` only: they are not builder stages, so they get no bar.
 
 ### `/dan` (self-build)
 
