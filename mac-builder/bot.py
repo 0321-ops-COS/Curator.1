@@ -41,6 +41,7 @@ import discord  # noqa: E402
 from discord import app_commands  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
+import compare_link  # noqa: E402
 import jobs  # noqa: E402
 import planner  # noqa: E402
 import project_context  # noqa: E402
@@ -442,6 +443,27 @@ class TaskProposalView(discord.ui.View):
         await interaction.followup.send(
             f"Freebuff task queued from a manager proposal: `{job.id}`.", ephemeral=True
         )
+
+
+def review_compare_url(settings: object, outcome: ReviewOutcome) -> str | None:
+    """The GitHub compare link for a review card, or None when it cannot exist.
+
+    The repo is the one the job's branch was pushed to: the target checkout for
+    a /task, her own checkout for a /dan. The base drops git's ``origin/``
+    prefix, so a /task shows the authorized branch and a /dan shows ``main``.
+    """
+    env = outcome.environment
+    project = getattr(settings, "project", None)
+    if env is None or project is None:
+        return None
+    if getattr(env, "kind", "task") == "dan":
+        remote = getattr(project, "self_remote", "")
+    else:
+        remote = getattr(project, "target_remote", "")
+    base = getattr(env, "base_branch", "") or ""
+    if base.startswith("origin/"):
+        base = base[len("origin/"):]
+    return compare_link.compare_url(remote, base, env.branch)
 
 
 def is_approvable(outcome: ReviewOutcome) -> bool:
@@ -1647,6 +1669,9 @@ class MacBuilderBot(discord.Client):
         embed.add_field(name="Files", value=str(len(outcome.changed_files)), inline=True)
         embed.add_field(name="Job", value=f"`{outcome.job.id}`", inline=True)
         embed.add_field(name="Log", value=f"`{outcome.job.log_path.name}`", inline=False)
+        link = review_compare_url(self.settings, outcome)
+        if link:
+            embed.add_field(name="Compare / merge link", value=link, inline=False)
         embed.set_footer(
             text=(
                 "Nothing is pushed unless you press Approve."
