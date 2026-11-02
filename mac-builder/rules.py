@@ -18,8 +18,13 @@ from typing import Iterable, Sequence
 
 # Discord and Freebuff prompts are user-supplied text. Keep them small enough
 # for a chat turn and for a terminal paste.
-MAX_TASK_CHARS = 4000
+MAX_TASK_CHARS = 6000  # Discord's maximum for a slash-command string option
 MAX_NOTES_CHARS = 4000
+
+# An attachment carries multi-line task text, so it is bounded by bytes and by
+# being UTF-8 text rather than by characters: it is exempt from MAX_TASK_CHARS.
+MAX_ATTACHMENT_BYTES = 200 * 1024
+ATTACHMENT_SUFFIXES = (".txt", ".md")
 
 # Never print an unbounded list of offending paths into Discord.
 MAX_PROTECTED_REPORTS = 12
@@ -373,8 +378,11 @@ def clamp_notes(value: object) -> str:
     return notes
 
 
-def sanitize_task_text(text: str) -> str:
-    """Normalise Discord task text. Raises ValueError when unusable."""
+def sanitize_task_text(text: str, *, max_chars: int | None = MAX_TASK_CHARS) -> str:
+    """Normalise Discord task text. Raises ValueError when unusable.
+
+    ``max_chars=None`` is the attachment path: same cleaning, no length cap.
+    """
     if not isinstance(text, str):
         raise ValueError("task text must be a string")
     value = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -384,11 +392,35 @@ def sanitize_task_text(text: str) -> str:
     value = re.sub(r"\n{3,}", "\n\n", value).strip()
     if not value:
         raise ValueError("task text is empty")
-    if len(value) > MAX_TASK_CHARS:
+    if max_chars is not None and len(value) > max_chars:
         raise ValueError(
-            f"task text is {len(value)} characters; the limit is {MAX_TASK_CHARS}"
+            f"task text is {len(value)} characters; the limit is {max_chars}"
         )
     return value
+
+
+def attachment_task_text(filename: str, data: bytes) -> str:
+    """Task text read from a .txt/.md attachment. Raises ValueError when unusable."""
+    name = (filename or "").strip().lower()
+    if not name.endswith(ATTACHMENT_SUFFIXES):
+        suffixes = " or ".join(ATTACHMENT_SUFFIXES)
+        raise ValueError(f"attach a {suffixes} file; that one is not read")
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        raise ValueError(
+            f"that attachment is {len(data)} bytes; the limit is {MAX_ATTACHMENT_BYTES}"
+        )
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(
+            "that attachment is not UTF-8 text; save the task as UTF-8 .txt or .md"
+        ) from None
+    return sanitize_task_text(text, max_chars=None)
+
+
+def combine_task_text(typed: str, attachment: str) -> str:
+    """Typed text first, then the attachment: one task, neither part cut."""
+    return "\n\n".join(part.strip() for part in (typed, attachment) if part.strip())
 
 
 def protected_summary(violations: Iterable[RuleViolation]) -> str:
