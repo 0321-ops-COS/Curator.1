@@ -66,6 +66,8 @@ LOG_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}$")
 BOARD_TICK_SECONDS = 30.0
 # A roadmap review that nobody has approved yet is re-pinged this often.
 ROADMAP_PING_SECONDS = 6 * 3600.0
+# How long a /roadmap without a sheet waits for that sheet as the next message.
+ROADMAP_WAIT_SECONDS = 10 * 60.0
 
 
 class DiscordBoardTransport(status_board.BoardTransport):
@@ -656,6 +658,8 @@ class MacBuilderBot(discord.Client):
         self._roadmap_requester_id = 0
         # When each waiting job was last reminded of, or is next due one.
         self._roadmap_reminder: dict[str, float] = {}
+        # Requester id -> (channel id, mode, expiry) for a sheet still to arrive.
+        self._roadmap_waiting: dict[int, tuple[int, str, float]] = {}
         self.runner = jobs.JobRunner(
             settings,
             self.manager,
@@ -1313,7 +1317,7 @@ class MacBuilderBot(discord.Client):
 
     @app_commands.describe(
         sheet="One .md build sheet: each '## Job' heading starts a job",
-        action="status lists the roadmap; preview shows the plan; stop drops the rest",
+        action="status lists it; preview or start with no sheet takes the sheet next",
     )
     async def cmd_roadmap(self, interaction: discord.Interaction,
                           sheet: Optional[discord.Attachment] = None,
@@ -1321,38 +1325,31 @@ class MacBuilderBot(discord.Client):
         """Queue a build sheet one job at a time; every job still waits for Approve."""
         if not await self.require_allowed(interaction):
             return
+        # One waiting sheet per requester: any new command replaces the old one.
+        self._roadmap_waiting.pop(interaction.user.id, None)
         choice = (action or "").strip().lower()
         if choice in ("status", "stop"):
             text = self._roadmap_status() if choice == "status" else self._roadmap_stop()
             await interaction.response.send_message(text, ephemeral=True)
             return
-        if sheet is None or not sheet.filename.lower().endswith(".md"):
-            await interaction.response.send_message(
-                "Attach one .md build sheet, or use `action` status, preview or stop.",
-                ephemeral=True)
+        if sheet is not None:
+            if not sheet.filename.lower().endswith(".md"):
+                await interaction.response.send_message(
+                    "Attach one .md build sheet, or use `action` status, preview or stop.",
+                    ephemeral=True)
+                return
+            text = await self._roadmap_apply(
+                sheet, "preview" if choice == "preview" else "start",
+                interaction.channel_id or 0, interaction.user.id)
+            await interaction.response.send_message(text, ephemeral=True)
             return
-        try:
-            steps = roadmap.parse((await sheet.read()).decode("utf-8", "replace"))
-        except roadmap.RoadmapError as exc:
-            await interaction.response.send_message(
-                f"Not {'previewed' if choice == 'preview' else 'queued'}: {exc}.", ephemeral=True)
-            return
-        if choice == "preview":
-            await interaction.response.send_message(roadmap.preview(steps), ephemeral=True)
-            return
-        self._roadmap_steps = steps
-        self._roadmap_channel_id = interaction.channel_id or 0
-        self._roadmap_requester_id = interaction.user.id
-        job = await self._queue_roadmap_step(steps[0])
-        if job is None:
-            self._roadmap_steps = []
-            await interaction.response.send_message(
-                "The queue is full; nothing was queued.", ephemeral=True)
-            return
-        roadmap.save(self._roadmap_path(), steps)
+        # No file attached (a phone cannot add one): take it as the next message.
+        self._roadmap_waiting[interaction.user.id] = (
+            interaction.channel_id or 0, "preview" if choice == "preview" else "start",
+            time.time() + ROADMAP_WAIT_SECONDS)
         await interaction.response.send_message(
-            f"Roadmap queued: {len(steps)} job(s), first is `{job.id}` ({steps[0].kind}). "
-            "Each still waits for your Approve; nothing is pushed or merged.", ephemeral=True)
+            "Send the .md sheet as your next message in this channel within 10 minutes.",
+            ephemeral=True)
 
     # ------------------------------------------------------------- selftest
 
@@ -1577,6 +1574,8 @@ class MacBuilderBot(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or message.guild is None:
             return
+        if await self._take_roadmap_sheet(message):
+            return
         if not self._is_ai_channel(message.channel):
             return
         if message.author.id not in self.settings.allowed_user_ids:
@@ -1642,6 +1641,54 @@ class MacBuilderBot(discord.Client):
         return "\n".join(part for part in parts if part)
 
     # ------------------------------------------------------------ reporting
+
+    async def _roadmap_apply(self, sheet: discord.Attachment, mode: str,
+                             channel_id: int, requester_id: int) -> str:
+        """The one path for a sheet: read it, then preview it or queue its first job."""
+        try:
+            data = await sheet.read()
+        except discord.HTTPException:
+            return "I could not read that attachment; post the file again."
+        try:
+            steps = roadmap.parse(data.decode("utf-8", "replace"))
+        except roadmap.RoadmapError as exc:
+            return f"Not {'previewed' if mode == 'preview' else 'queued'}: {exc}."
+        if mode == "preview":
+            return roadmap.preview(steps)
+        self._roadmap_steps = steps
+        self._roadmap_channel_id = channel_id
+        self._roadmap_requester_id = requester_id
+        job = await self._queue_roadmap_step(steps[0])
+        if job is None:
+            self._roadmap_steps = []
+            return "The queue is full; nothing was queued."
+        roadmap.save(self._roadmap_path(), steps)
+        return (f"Roadmap queued: {len(steps)} job(s), first is `{job.id}` ({steps[0].kind}). "
+                "Each still waits for your Approve; nothing is pushed or merged.")
+
+    async def _take_roadmap_sheet(self, message: discord.Message) -> bool:
+        """True when this message was the sheet a /roadmap is waiting for.
+
+        Only its requester, only in the channel it was asked in, and only before it
+        expires; a message without a .md file leaves the wait running.
+        """
+        waiting = self._roadmap_waiting.get(message.author.id)
+        if waiting is None:
+            return False
+        channel_id, mode, expires = waiting
+        if message.channel.id != channel_id:
+            return False
+        del self._roadmap_waiting[message.author.id]
+        if time.time() >= expires:
+            log.info("the waiting roadmap sheet from %s expired", message.author.id)
+            return False
+        sheet = next((item for item in message.attachments
+                      if item.filename.lower().endswith(".md")), None)
+        if sheet is None:
+            self._roadmap_waiting[message.author.id] = waiting
+            return False
+        await message.reply(await self._roadmap_apply(sheet, mode, channel_id, message.author.id))
+        return True
 
     def _roadmap_path(self) -> Path:
         return Path(self.settings.log_dir) / "roadmap.json"

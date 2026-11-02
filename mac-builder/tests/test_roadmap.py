@@ -24,6 +24,14 @@ kind: dan
 """
 
 
+def attachment(text: str, filename: str = "sheet.md") -> SimpleNamespace:
+    """A fake attachment whose read() hands back the sheet text."""
+    async def read() -> bytes:
+        return text.encode("utf-8")
+
+    return SimpleNamespace(filename=filename, read=read)
+
+
 class FakeQueue:
     def __init__(self) -> None:
         self.submitted: list[object] = []
@@ -47,6 +55,7 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         self.bot._roadmap_job, self.bot._roadmap_channel_id = None, 0
         self.bot._roadmap_requester_id = 0
         self.bot._roadmap_reminder = {}
+        self.bot._roadmap_waiting = {}
         self.bot._target_channel = lambda channel_id: self.channel  # type: ignore[method-assign]
 
     async def start(self, sheet: str = SHEET, user_id: int = 42,
@@ -60,6 +69,23 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.cmd_roadmap(fake, sheet=SimpleNamespace(filename="sheet.md", read=read),
                                    action=action)
         return fake
+
+    async def command(self, user_id: int = 42, action: str | None = None) -> SimpleNamespace:
+        """Run /roadmap with no sheet attached, the way a phone sends it."""
+        fake = SimpleNamespace(
+            user=SimpleNamespace(id=user_id), channel_id=1,
+            response=SimpleNamespace(is_done=lambda: False, send_message=mock.AsyncMock()))
+        await self.bot.cmd_roadmap(fake, sheet=None, action=action)
+        return fake
+
+    def message(self, sheet: str | None = None, filename: str = "sheet.md",
+                user_id: int = 42, channel_id: int = 1) -> SimpleNamespace:
+        """A message from a person, optionally carrying one attachment."""
+        attachments = [attachment(sheet, filename)] if sheet is not None else []
+        return SimpleNamespace(
+            author=SimpleNamespace(id=user_id, bot=False), guild=SimpleNamespace(id=9),
+            channel=SimpleNamespace(id=channel_id, name="general"), content="",
+            attachments=attachments, reply=mock.AsyncMock())
 
     async def test_the_next_job_queues_only_after_the_first_is_approved(self) -> None:
         await self.start()
@@ -153,6 +179,74 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         fake = await self.start("# Build sheet\nNothing under a heading.\n")
         self.assertIn('no "## Job" heading', fake.response.send_message.await_args.args[0])
         self.assertEqual((self.bot.queue.submitted, self.bot._roadmap_steps), ([], []))
+
+    async def test_the_sheet_helper_previews_queues_and_reports(self) -> None:
+        preview = await self.bot._roadmap_apply(attachment(SHEET), "preview", 1, 42)
+        self.assertTrue(preview.startswith("Preview: 2 job(s), nothing queued or saved"))
+        self.assertEqual((self.bot.queue.submitted, self.bot._roadmap_steps), ([], []))
+        bad = await self.bot._roadmap_apply(attachment("# Empty\nNo jobs.\n"), "preview", 1, 42)
+        self.assertEqual(bad, 'Not previewed: no "## Job" heading with a task under it.')
+        queued = await self.bot._roadmap_apply(attachment(SHEET), "start", 1, 42)
+        self.assertIn("Roadmap queued: 2 job(s)", queued)
+        self.assertEqual(len(self.bot.queue.submitted), 1, "start queues only the first job")
+
+    async def test_a_roadmap_without_a_sheet_waits_for_the_next_message(self) -> None:
+        fake = await self.command(action="preview")
+        self.assertEqual(fake.response.send_message.await_args.args[0],
+                         "Send the .md sheet as your next message in this channel "
+                         "within 10 minutes.")
+        self.assertEqual(self.bot._roadmap_waiting[42][:2], (1, "preview"))
+        message = self.message(SHEET)
+        await self.bot.on_message(message)
+        self.assertTrue(message.reply.await_args.args[0].startswith("Preview: 2 job(s)"))
+        self.assertEqual((self.bot.queue.submitted, self.bot._roadmap_waiting), ([], {}))
+        self.assertFalse((Path(self._tmp.name) / "roadmap.json").exists())
+
+    async def test_the_next_message_starts_the_roadmap(self) -> None:
+        await self.command()  # no action, no sheet: start
+        message = self.message(SHEET)
+        await self.bot.on_message(message)
+        self.assertIn("Roadmap queued: 2 job(s)", message.reply.await_args.args[0])
+        self.assertEqual(len(self.bot.queue.submitted), 1, "one job at a time")
+        saved = json.loads((Path(self._tmp.name) / "roadmap.json").read_text("utf-8"))
+        self.assertEqual([item["text"] for item in saved], ["Add a button.",
+                                                            "Refactor the parser."])
+        self.assertEqual(self.bot._roadmap_waiting, {})
+
+    async def test_a_bad_sheet_in_the_next_message_reports_and_stops_waiting(self) -> None:
+        await self.command()
+        message = self.message("# Empty\nNo jobs.\n")
+        await self.bot.on_message(message)
+        self.assertEqual(message.reply.await_args.args[0],
+                         'Not queued: no "## Job" heading with a task under it.')
+        self.assertEqual((self.bot.queue.submitted, self.bot._roadmap_waiting), ([], {}))
+
+    async def test_a_next_message_without_a_md_file_keeps_waiting(self) -> None:
+        await self.command()
+        self.assertFalse(await self.bot._take_roadmap_sheet(self.message()))
+        self.assertFalse(await self.bot._take_roadmap_sheet(
+            self.message("# notes", filename="notes.txt")))
+        self.assertFalse(await self.bot._take_roadmap_sheet(self.message(SHEET, channel_id=2)))
+        self.assertFalse(await self.bot._take_roadmap_sheet(self.message(SHEET, user_id=7)))
+        self.assertIn(42, self.bot._roadmap_waiting, "still waiting for the sheet")
+        self.assertEqual(self.bot.queue.submitted, [])
+
+    async def test_the_waiting_sheet_expires_after_ten_minutes(self) -> None:
+        clock = [1_000_000.0]
+        with mock.patch("bot.time.time", lambda: clock[0]):
+            await self.command()
+            clock[0] += 601
+            message = self.message(SHEET)
+            self.assertFalse(await self.bot._take_roadmap_sheet(message))
+        self.assertEqual(message.reply.await_count, 0)
+        self.assertEqual((self.bot.queue.submitted, self.bot._roadmap_waiting), ([], {}))
+
+    async def test_a_new_roadmap_replaces_the_waiting_one_and_stop_clears_it(self) -> None:
+        await self.command(action="preview")
+        await self.command()
+        self.assertEqual(self.bot._roadmap_waiting[42][1], "start")
+        await self.command(action="stop")
+        self.assertEqual(self.bot._roadmap_waiting, {})
 
 
 if __name__ == "__main__":
