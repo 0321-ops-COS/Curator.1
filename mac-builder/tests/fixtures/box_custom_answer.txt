@@ -1,0 +1,12 @@
+╭───────────── Some questions for you ─────────────╮
+│                                        Close ✕    │
+│  ▼ 1. What should the empty state say?            │
+│     ○ No items yet                                │
+│       The plain fallback copy                     │
+│     ● Custom                                      │
+│       ↳ "Nothing here yet — add your first item"  │
+│  ╭────────╮                                        │
+│  │ Submit │   ↑↓ navigate • Enter select           │
+│  ╰────────╯                                        │
+│  esc to cancel   tab to switch                     │
+╰────────────────────────────────────────────────────╯

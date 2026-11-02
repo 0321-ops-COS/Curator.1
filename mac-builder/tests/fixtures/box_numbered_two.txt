@@ -1,0 +1,23 @@
+╭─────────────────────── Exa ───────────────────────╮
+│  Search the web inside your repo   Exa  [Report 1] │
+│  Keep coding from your phone   Ad                  │
+╰────────────────────────────────────────────────────╯
+╭───────────── Some questions for you ──────────────╮
+│                                          Close ✕  │
+│  ▼ 1. Which tone should the project description    │
+│       use? (the answer goes to project.yml)        │
+│      ○ Formal                                     │
+│        Polished, professional prose suitable for   │
+│        project documentation                       │
+│      ○ Casual                                     │
+│      ○ Technical                                  │
+│      ○ Custom                                     │
+│        Type your own answer                        │
+│  ▶ 2. What name should go in the title of          │
+│       docs/question-test.md?                       │
+│      ↳ (click to answer)                           │
+│  ╭────────╮                                        │
+│  │ Submit │   ↑↓ navigate • Enter select           │
+│  ╰────────╯                                        │
+╰────────────────────────────────────────────────────╯
+Freebuff • high · ~/mac-builder-worktrees/20261102-101010-abcd1234 · /model to switch

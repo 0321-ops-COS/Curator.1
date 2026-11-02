@@ -1,0 +1,18 @@
+┃ ╭───────────── Some questions for you ─────────────╮ ┃
+┃ │                                        Close ✕   │ ┃
+┃ │  ▼ 1. Which screen should open first?            │ ┃
+┃ │     ● Home                                       │ ┃
+┃ │       The dashboard with today's items           │ ┃
+┃ │     ◯ Settings                                   │ ┃
+┃ │     ◯ Custom                                     │ ┃
+┃ │       Type your own answer                       │ ┃
+┃ │  ▶ 2. Should the tab bar keep its labels?        │ ┃
+┃ │     ◯ Yes                                        │ ┃
+┃ │     ◯ No                                         │ ┃
+┃ │  ▶ 3. What colour should the accent be?          │ ┃
+┃ │     ↳ (click to answer)                          │ ┃
+┃ │  ╭────────╮                                      │ ┃
+┃ │  │ Submit │   ↑↓ navigate • Enter select         │ ┃
+┃ │  ╰────────╯                                      │ ┃
+┃ ╰──────────────────────────────────────────────────╯ ┃
+Freebuff • high · ~/mac-builder-worktrees/20261102-103030-cafe1234 · /model to switch

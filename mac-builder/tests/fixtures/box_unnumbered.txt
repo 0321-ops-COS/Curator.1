@@ -1,0 +1,15 @@
+Try for Free   wisprflow.ai
+╭────────────── Some questions for you ──────────────╮
+│                                          Close ✕   │
+│  ▼ What should "1" start?                          │
+│     ○ A blank screen                               │
+│       Just the tab bar and nothing on it           │
+│     ○ The list of saved items                      │
+│       Opens with today's saves already loaded      │
+│     ○ Custom                                       │
+│       Type your own answer                         │
+│  ╭────────╮                                         │
+│  │ Submit │   ↑↓ navigate • Enter select            │
+│  ╰────────╯                                         │
+╰─────────────────────────────────────────────────────╯
+Freebuff • high · ~/mac-builder-worktrees/20261102-102020-beef1234 · /model to switch

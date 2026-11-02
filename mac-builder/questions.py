@@ -23,6 +23,11 @@ are collapsed (``▶``). An option may carry a description line underneath it,
 which is not itself an option. A question with no options and ``(click to
 answer)`` is free text. A ``Custom`` option is a free-text answer behind a row.
 
+A real box does not always number its rows: ``▼ What should "1" start?`` is the
+same header with no number at all, so the numbers here are assigned in order.
+The pane also shows an ad banner above the box (an app strip or a "Try for
+Free" line) and Freebuff's status bar below it; neither is ever content.
+
 The same terminal also shows Freebuff's own survey: a box titled
 "quick question 1/11" with "esc not now". That is not a task question, so the
 runner dismisses it with Esc and never forwards it to Discord.
@@ -61,6 +66,12 @@ QUESTION_HEADER_RE = re.compile(
     r"^(?P<mark>[" + re.escape(EXPANDED_MARKERS + COLLAPSED_MARKERS) + r"])?\s*"
     r"(?P<number>\d{1,2})\s*[.)]\s*(?P<text>\S.*)$"
 )
+# '▼ What should "1" start?': the same header with no number in front of it.
+# The marker is required, so a plain line of prose is never a question.
+UNNUMBERED_HEADER_RE = re.compile(
+    r"^(?P<mark>[" + re.escape(EXPANDED_MARKERS + COLLAPSED_MARKERS) + r"])\s*"
+    r"(?P<text>\S.*)$"
+)
 # "○ Formal", "◉ Casual", "❯ ◯ Home": a circle, an optional focus arrow.
 OPTION_RE = re.compile(
     r"^(?P<arrow>[" + re.escape(ARROWS) + r"]\s*)?"
@@ -76,9 +87,17 @@ SUBMIT_ROW_RE = re.compile(
     r"\[?\s*Submit\b",
     re.IGNORECASE,
 )
-# The ad strip above the box: an app banner and a report link, never content.
-AD_LINE_RE = re.compile(r"\[Report\b|\bGet the app\b\s*$|\bfor Android\b", re.IGNORECASE)
+# The ad strip above the box: an app banner, a "Try for Free" host strip and a
+# report link, never content.
+AD_LINE_RE = re.compile(
+    r"\[Report\b|\bGet the app\b\s*$|\bfor Android\b|\bTry for Free\b"
+    r"|\bSponsored\b|\bAd\b\s*$|^\W*[a-z0-9-]+\.(?:ai|com|io|dev|app)\W*$",
+    re.IGNORECASE,
+)
 CLOSE_LINE_RE = re.compile(r"^close\b", re.IGNORECASE)
+# The key hints under the box: 'esc to cancel', 'tab to switch'. Everything
+# after them belongs to no option.
+FOOTER_HINT_RE = re.compile(r"^(?:esc|escape|ctrl\+c|tab)\b", re.IGNORECASE)
 
 MAX_QUESTION_CHARS = 1500
 MAX_OPTION_CHARS = 200
@@ -118,8 +137,10 @@ class Question:
     def custom_index(self) -> int | None:
         """The row that opens a free-text field, if the box offers one."""
         for index, option in enumerate(self.options):
-            word = option.label.strip().lower()
-            if word == "custom" or word.startswith("custom ") or word.startswith("custom:"):
+            # 'Custom', 'Custom…', 'Custom answer' and 'Custom:' are all the
+            # same row; the label itself keeps its punctuation.
+            word = option.label.strip().lower().rstrip(" .:…›>-")
+            if word == "custom" or word.startswith("custom "):
                 return index
         return None
 
@@ -284,6 +305,8 @@ def _is_footer(line: str) -> bool:
         return True
     if "navigate" in lowered and ("↑" in line or "↓" in line or "enter" in lowered):
         return True
+    if FOOTER_HINT_RE.match(lowered.strip()):
+        return True
     return lowered.strip("[](){}<>_ •") == "submit"
 
 
@@ -327,8 +350,29 @@ def _option(line: str) -> Option | None:
     )
 
 
-def _header(line: str) -> re.Match[str] | None:
-    return QUESTION_HEADER_RE.match(line)
+def _header(line: str) -> tuple[int | None, str, bool] | None:
+    """A question row: its number (None when Freebuff left it off), text, state."""
+    match = QUESTION_HEADER_RE.match(line)
+    if match is not None:
+        mark = match.group("mark") or "▼"
+        return (
+            int(match.group("number")),
+            match.group("text").strip(),
+            mark not in COLLAPSED_MARKERS,
+        )
+    match = UNNUMBERED_HEADER_RE.match(line)
+    if match is not None:
+        return None, match.group("text").strip(), (
+            match.group("mark") not in COLLAPSED_MARKERS
+        )
+    return None
+
+
+def _box_rows(rows: Sequence[str]) -> bool:
+    """Whether bare rows look like a box whose title scrolled out of the pane."""
+    headers = any(_header(row) is not None for row in rows)
+    options = any(_option(row) is not None for row in rows)
+    return headers and options
 
 
 def _questions_from(rows: Sequence[str]) -> list[Question]:
@@ -366,19 +410,31 @@ def _questions_from(rows: Sequence[str]) -> list[Question]:
     for line in rows:
         if RULE_RE.match(line) or CLOSE_LINE_RE.match(line):
             continue
+        if AD_LINE_RE.search(line):
+            # A banner is never content, even when it ends up between the
+            # title and the questions.
+            continue
         header = _header(line)
         if header is not None:
             finish()
-            number = int(header.group("number"))
+            written, body, expanded_now = header
+            number = (
+                written
+                if written is not None
+                else (questions[-1].number + 1 if questions else 1)
+            )
             started = True
-            expanded = (header.group("mark") or "▼") not in COLLAPSED_MARKERS
+            expanded = expanded_now
+            sealed = False
             free_text = False
             hint = ""
-            body = header.group("text").strip()
             if body:
                 text.append(body)
             continue
         if _is_footer(line):
+            # Nothing under the key hints or the Submit button can be a
+            # description of the option above them.
+            sealed = True
             continue
         if _is_status_bar(line):
             # Nothing below the status bar belongs to an option above it.
@@ -441,9 +497,13 @@ def parse_pane(pane: str) -> QuestionBox | None:
 
     title = _title_index(rows)
     if title is None:
-        return None
-
-    questions = _questions_from(rows[title + 1 :])
+        # A pane caught mid-scroll loses the title row but still shows the
+        # questions and their circles; that is readable, not "could not read".
+        if not _box_rows(rows):
+            return None
+        questions = _questions_from(rows)
+    else:
+        questions = _questions_from(rows[title + 1 :])
     total = len(questions)
     return QuestionBox(
         questions=tuple(replace(q, total=total) for q in questions), raw=pane
