@@ -3,8 +3,8 @@
 A single-user Discord bot for a headless Mac mini (M1, 8 GB). It queues
 `xcodegen` / `xcodebuild` / `swift test` jobs, runs Freebuff as a supervised
 builder on an isolated `freebuff/*` branch, and has an AI manager review the
-diff and test output. Nothing is pushed until you press **Approve**, and the bot
-never merges.
+diff and test output. Nothing is pushed until you press **Approve**; only the gated `/merge` merges,
+and it is a dry run unless you turn it off.
 
 
 ## Product purpose and long-term direction
@@ -285,6 +285,7 @@ are kept for inspection.
 | `MANAGER_API_BASE`, `MANAGER_API_KEY`, `MANAGER_MODEL` | Any OpenAI-compatible chat endpoint; all three are needed before the manager is used at all. There is no built-in model default, so set `MANAGER_MODEL` yourself, for example `openrouter/free`, which needs the OpenRouter base URL (`https://openrouter.ai/api/v1`). |
 | `MANAGER_FALLBACK_MODELS` | Optional comma-separated fallback model ids. When set, requests also send `"models": [MANAGER_MODEL, ...]` so OpenRouter falls through on a 429 or provider error; empty leaves the payload unchanged. |
 | `MANAGER_TIMEOUT_SECONDS` | Per-request timeout for one manager call; default 120. |
+| `MANAGER_GITHUB_TOKEN` | GitHub token for `/merge` only. Without it `/merge` says so in one line and merges nothing. |
 | `MAX_DIFF_LINES` | Hard diff limit, default 400. |
 | `MAX_REVISE_ROUNDS` | Automatic revision rounds, default 2. |
 | `MAX_PENDING_JOBS` | Queue cap, default 10. |
@@ -339,6 +340,7 @@ tail -f ~/Curator.1/mac-builder/logs/launchd.log
 | `/key <name>` | One key to a stuck screen: `Enter`, `Esc`, `Up`, `Down`, `Left`, `Right`, `Tab`, `y`, `n`. Nothing else. |
 | `/send <text>` | Pastes text into a stuck screen and submits it, the way `/task` does. At most 500 characters. |
 | `/board` | Re-posts the running job's status board if the message was lost. |
+| `/merge [job-id] [dry-run]` | Gates an approved review (allowlist, check, diff size, protected paths, PR, CI, unchanged head); merges only if every gate passes. Dry run by default. |
 
 Job results are posted where the job was started, or to `NOTIFY_CHANNEL_ID`.
 
@@ -364,7 +366,7 @@ A generated `git` shim is placed first on the session `PATH`. It refuses
 prefix plus `--force`, `--mirror`, `--all`, `--tags` and `--delete`. This is
 defence in depth, **not a sandbox**: the macOS user account is the real
 boundary, and an agent could call git by absolute path. The bot itself also
-validates the branch before pushing, and never merges.
+validates the branch before pushing, and never pushes to `main`; only `/merge` merges.
 
 ### Questions from Freebuff (`/answer`)
 
@@ -654,7 +656,8 @@ arguments (never Discord input).
   again, up to `MAX_REVISE_ROUNDS` (2). After that the decision goes to you.
 - `approve` and `ask_user` post an embed with **Approve** / **Reject** buttons.
   Approve commits the worktree, pushes only `freebuff/<id>` and reports the
-  commit. Reject pushes nothing. There is no merge path anywhere in the bot.
+  commit. Reject pushes nothing. Only the gated `/merge` merges: every gate must
+  pass, Hustler `main` is refused, and it is a dry run by default.
 - `/plan <goal>` asks the manager for a plan in the owner's task-document shape:
   evidence, items in priority order, acceptance per item, out of scope, open
   decisions. It is given the project block, the tails and error lines of the
@@ -689,7 +692,7 @@ These run before the manager and cannot be overridden by it:
 | `/dan`: `rules.py`, `freebuff_runner.py`, the allowlist or Approve lines in `bot.py`, or the four tests that pin them | Blocked immediately; the detail says why. |
 | `/dan`: `.env*`, `.github/`, `project.yml`, signing material, `main`/`master` | Blocked exactly as for `/task`. |
 | Any push outside `freebuff/*` (task) or `dan/*` (dan), or to `main`/`master` | Refused in code. |
-| Merge to main | No code path exists. |
+| Merge to Hustler `main`, or any merge with a failed gate | Refused by `/merge`, which merges nothing. |
 
 Oversized and protected-path changes are reported in Discord with no Approve
 button, because there is nothing safe to approve.

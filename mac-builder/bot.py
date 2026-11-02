@@ -42,7 +42,9 @@ from discord import app_commands  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
 import compare_link  # noqa: E402
+import github_client  # noqa: E402
 import jobs  # noqa: E402
+import merge_command  # noqa: E402
 import planner  # noqa: E402
 import project_context  # noqa: E402
 import questions  # noqa: E402
@@ -599,6 +601,8 @@ class MacBuilderBot(discord.Client):
             pings=settings.status_pings,
         )
         self._board_tasks: set[asyncio.Task[None]] = set()
+        # The reviewed jobs /merge may gate, by id, newest last.
+        self._merge_jobs: dict[str, Job] = {}
         self._board_ticker: asyncio.Task[None] | None = None
         self.runner = jobs.JobRunner(
             settings,
@@ -730,6 +734,9 @@ class MacBuilderBot(discord.Client):
                 callback=self.cmd_board,
             )
         )
+        self.tree.add_command(app_commands.Command(
+            name="merge", description="Gate an approved review and merge it (dry run)",
+            callback=self.cmd_merge))
         self.tree.interaction_check = self.require_allowed
         if self._board_ticker is None or self._board_ticker.done():
             self._board_ticker = asyncio.create_task(self._board_loop())
@@ -1408,6 +1415,52 @@ class MacBuilderBot(discord.Client):
                 ephemeral=True,
             )
 
+    @app_commands.describe(
+        job_id="Job id of the approved review; empty uses the newest",
+        dry_run="Check the gates and remember the PR head without merging (default)",
+    )
+    async def cmd_merge(self, interaction: discord.Interaction, job_id: Optional[str] = None,
+                        dry_run: bool = True) -> None:
+        """The only merge path: gated, dry run unless it is turned off."""
+        if not await self.require_allowed(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not os.environ.get(github_client.TOKEN_ENV, "").strip():
+            await interaction.followup.send(
+                f"{github_client.TOKEN_ENV} is not set, so nothing was checked or merged."
+            )
+            return
+        job = self._merge_job(job_id)
+        if job is None:
+            await interaction.followup.send(
+                "There is no approved review to gate; pass its job id. Nothing merged.")
+            return
+        try:
+            outcome = await merge_command.run_merge(job, self.settings, dry_run=dry_run)
+        except github_client.GitHubError as exc:
+            await interaction.followup.send(f"GitHub: {exc}. Nothing was merged.")
+            return
+        job.merge_dry_run_sha = outcome.dry_run_sha or job.merge_dry_run_sha
+        await interaction.followup.send(outcome.text[:1900])
+
+    def _remember_merge_job(self, job: Job) -> None:
+        """Keep a reviewed job so /merge can read what it recorded."""
+        registry = getattr(self, "_merge_jobs", None)
+        if registry is None:
+            return
+        registry.pop(job.id, None)
+        registry[job.id] = job
+        while len(registry) > jobs.MAX_TRACKED_REVIEWS:
+            registry.pop(next(iter(registry)))
+
+    def _merge_job(self, job_id: str | None) -> Job | None:
+        """A reviewed job by id, or the newest one when no id is given."""
+        registry, target = getattr(self, "_merge_jobs", None) or {}, (job_id or "").strip()
+        value = target[:-4] if target.endswith(".log") else target
+        if not value:
+            return next(reversed(registry.values()), None) if registry else None
+        return registry.get(value) if LOG_ID_RE.match(value) else None
+
     # ----------------------------------------------------------- ai channel
 
     async def on_message(self, message: discord.Message) -> None:
@@ -1471,7 +1524,8 @@ class MacBuilderBot(discord.Client):
             f"manager model: {self.settings.manager_model or 'not configured'}",
             "hard rules: diffs over "
             f"{self.settings.max_diff_lines} lines and protected-path changes are rejected "
-            "without asking the model; failing checks force revise; the bot never merges.",
+            "without asking the model; failing checks force revise; a merge only "
+            "happens through the gated /merge, which is a dry run unless asked otherwise.",
             self.runner.last_job_context(),
         ]
         return "\n".join(part for part in parts if part)
@@ -1725,6 +1779,7 @@ class MacBuilderBot(discord.Client):
         )
 
     async def _post_review(self, outcome: ReviewOutcome) -> None:
+        self._remember_merge_job(outcome.job)
         channel = self._target_channel(outcome.job.channel_id)
         if channel is None:
             log.warning("no Discord channel for review of %s", outcome.job.id)

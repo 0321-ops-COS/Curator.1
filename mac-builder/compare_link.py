@@ -54,6 +54,11 @@ def _owner_repo(remote_url: str) -> str | None:
     return f"{parts[0]}/{parts[1]}"
 
 
+def owner_repo(remote_url: str) -> str | None:
+    """``OWNER/REPO`` from a GitHub remote, or None when it is not one."""
+    return _owner_repo(remote_url)
+
+
 def compare_url(remote_url: str, base: str, branch: str) -> str | None:
     """A GitHub 'compare and open a pull request' link, or None.
 
