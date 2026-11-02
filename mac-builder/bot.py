@@ -694,6 +694,8 @@ class MacBuilderBot(discord.Client):
         self._roadmap_reminder: dict[str, float] = {}
         # Requester id -> (channel id, mode, expiry) for a sheet still to arrive.
         self._roadmap_waiting: dict[int, tuple[int, str, float]] = {}
+        # Paused holds back only the next queue; an old roadmap.json is unpaused.
+        self._roadmap_paused = roadmap.load(self._roadmap_path()).paused
         self.runner = jobs.JobRunner(
             settings,
             self.manager,
@@ -1008,6 +1010,8 @@ class MacBuilderBot(discord.Client):
         lines += ["", "waiting:", status_board.render_waiting(waiting), ""]
         code, output = await jobs.probe_status(self.settings)
         snapshot = self.queue.snapshot()
+        if getattr(self, "_roadmap_paused", False):
+            lines.append(f"roadmap: paused, {self._roadmap_left()} job(s) left")
         ctx = getattr(self.settings, "project", None)
         if ctx is not None:
             lines += [f"project: {ctx.project_name}", f"target repo: {ctx.target_remote}"]
@@ -1355,7 +1359,7 @@ class MacBuilderBot(discord.Client):
 
     @app_commands.describe(
         sheet="One .md build sheet: each '## Job' heading starts a job",
-        action="status lists it; preview or start with no sheet takes the sheet next",
+        action="status lists it, pause or resume queueing; preview or start takes the sheet next",
     )
     async def cmd_roadmap(self, interaction: discord.Interaction,
                           sheet: Optional[discord.Attachment] = None,
@@ -1366,14 +1370,18 @@ class MacBuilderBot(discord.Client):
         # One waiting sheet per requester: any new command replaces the old one.
         self._roadmap_waiting.pop(interaction.user.id, None)
         choice = (action or "").strip().lower()
-        if choice in ("status", "stop"):
-            text = self._roadmap_status() if choice == "status" else self._roadmap_stop()
+        if choice in ("status", "stop", "pause", "resume"):
+            if choice in ("pause", "resume"):
+                text = self._roadmap_set_paused(choice == "pause")
+            else:
+                text = self._roadmap_status() if choice == "status" else self._roadmap_stop()
             await interaction.response.send_message(text, ephemeral=True)
             return
         if sheet is not None:
             if not sheet.filename.lower().endswith(".md"):
                 await interaction.response.send_message(
-                    "Attach one .md build sheet, or use `action` status, preview or stop.",
+                    "Attach one .md build sheet, or use `action` status, preview, "
+                    "pause, resume or stop.",
                     ephemeral=True)
                 return
             text = await self._roadmap_apply(
@@ -1700,11 +1708,12 @@ class MacBuilderBot(discord.Client):
         self._roadmap_steps = steps
         self._roadmap_channel_id = channel_id
         self._roadmap_requester_id = requester_id
+        self._roadmap_paused = False  # a new sheet starts running
         job = await self._queue_roadmap_step(steps[0])
         if job is None:
             self._roadmap_steps = []
             return "The queue is full; nothing was queued."
-        roadmap.save(self._roadmap_path(), steps)
+        roadmap.save(self._roadmap_path(), self._roadmap_steps, self._roadmap_paused)
         return _clip_reply(
             f"Roadmap queued: {len(steps)} job(s), first is `{job.id}` ({steps[0].kind}). "
             "Each still waits for your Approve; nothing is pushed or merged.")
@@ -1736,6 +1745,23 @@ class MacBuilderBot(discord.Client):
     def _roadmap_path(self) -> Path:
         return Path(self.settings.log_dir) / "roadmap.json"
 
+    def _roadmap_left(self) -> int:
+        """Jobs the sheet never queued: the only ones a pause holds back."""
+        return len([step for step in self._roadmap_steps if not step.job_id])
+
+    def _roadmap_set_paused(self, paused: bool) -> str:
+        """Pause or resume queueing; the queued or running job is never touched."""
+        self._roadmap_paused = paused
+        roadmap.save(self._roadmap_path(), self._roadmap_steps, self._roadmap_paused)
+        if not self._roadmap_steps:
+            return f"{'Roadmap paused.' if paused else 'Roadmap resumed.'} No roadmap is queued."
+        if paused:
+            return (f"Roadmap paused, {self._roadmap_left()} job(s) left. No next job is "
+                    "queued until `/roadmap action:resume`; the queued or running job is "
+                    "untouched.")
+        return (f"Roadmap resumed; {self._roadmap_left()} job(s) left. "
+                "The next tick queues the next job as normal.")
+
     async def _queue_roadmap_step(self, step: roadmap.Step) -> Job | None:
         """Queue one sheet job exactly as /task or /dan would, then record it."""
         job = jobs.make_job(self.settings, kind=step.kind, title=step.text[:100],
@@ -1753,7 +1779,13 @@ class MacBuilderBot(discord.Client):
         return job
 
     async def _roadmap_tick(self) -> None:
-        """Queue the next job only after the current one is approved; status only."""
+        """Queue the next job only after the current one is approved; status only.
+
+        Paused, it does nothing at all: nothing is queued, pinged or stopped. A
+        job already queued or running keeps going and still waits for Approve.
+        """
+        if self._roadmap_paused:
+            return
         current = self._roadmap_job
         if current is None or not self._roadmap_steps:
             return
@@ -1765,7 +1797,7 @@ class MacBuilderBot(discord.Client):
             if step is None:
                 await self._roadmap_finish("roadmap done")
             elif await self._queue_roadmap_step(step) is not None:
-                roadmap.save(self._roadmap_path(), self._roadmap_steps)
+                roadmap.save(self._roadmap_path(), self._roadmap_steps, self._roadmap_paused)
         elif current.status == "awaiting_review":
             await self._roadmap_remind(current)
 
@@ -1792,7 +1824,10 @@ class MacBuilderBot(discord.Client):
             job = self._roadmap_jobs.get(step.job_id)
             state = job.status if job else ("queued" if step.job_id else "waiting")
             rows.append(f"{number}. {step.kind} · `{step.job_id or 'not queued'}` · {state}")
-        return "\n".join([f"Roadmap: {len(rows)} jobs", *rows])
+        header = f"Roadmap: {len(rows)} jobs"
+        if self._roadmap_paused:
+            header += f"; paused, {self._roadmap_left()} job(s) left"
+        return "\n".join([header, *rows])
 
     def _roadmap_stop(self) -> str:
         """Drop the jobs never queued; the one already in line is untouched."""
@@ -1800,7 +1835,8 @@ class MacBuilderBot(discord.Client):
         self._roadmap_steps, self._roadmap_job = [], None
         self._roadmap_jobs.clear()
         self._roadmap_reminder.clear()
-        roadmap.save(self._roadmap_path(), [])
+        self._roadmap_paused = False
+        roadmap.save(self._roadmap_path(), [], self._roadmap_paused)
         if not dropped:
             return "No roadmap is queued."
         return (f"Stopped the roadmap; {dropped} job(s) not yet queued were dropped; "
@@ -1813,7 +1849,8 @@ class MacBuilderBot(discord.Client):
         self._roadmap_steps, self._roadmap_job = [], None
         self._roadmap_jobs.clear()
         self._roadmap_reminder.clear()
-        roadmap.save(self._roadmap_path(), [])
+        self._roadmap_paused = False
+        roadmap.save(self._roadmap_path(), [], self._roadmap_paused)
         try:
             if channel is not None:
                 await channel.send(who + text)

@@ -29,6 +29,14 @@ class Step:
     job_id: str = ""
 
 
+@dataclass
+class State:
+    """What roadmap.json holds: the steps, and whether queueing is paused."""
+
+    steps: list[Step]
+    paused: bool = False
+
+
 def parse(sheet: str) -> list[Step]:
     """The sheet's jobs in order, or RoadmapError naming the rule broken."""
     steps: list[Step] = []
@@ -88,7 +96,29 @@ def preview(steps: list[Step]) -> str:
     return "\n".join(lines)
 
 
-def save(path: Path, steps: list[Step]) -> None:
-    """Write the roadmap, so a restart can say what was queued."""
+def save(path: Path, steps: list[Step], paused: bool = False) -> None:
+    """Write the roadmap and its paused flag, so a restart can keep both."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps([asdict(step) for step in steps], indent=2), "utf-8")
+    payload = {"paused": bool(paused), "steps": [asdict(step) for step in steps]}
+    path.write_text(json.dumps(payload, indent=2), "utf-8")
+
+
+def load(path: Path) -> State:
+    """Read the roadmap back; a missing, broken or old file is unpaused.
+
+    A file written before the paused flag existed is a bare list of steps. It
+    loads as not paused, so an upgrade never leaves a roadmap silently held back.
+    """
+    try:
+        raw = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return State([])
+    if isinstance(raw, list):
+        raw = {"steps": raw}  # written before the flag existed: not paused
+    if not isinstance(raw, dict):
+        return State([])
+    rows = raw.get("steps") if isinstance(raw.get("steps"), list) else []
+    steps = [Step(row["text"], str(row.get("kind") or "task"), str(row.get("job_id") or ""))
+             for row in rows if isinstance(row, dict) and isinstance(row.get("text"), str)
+             and row["text"]]
+    return State(steps, bool(raw.get("paused")))

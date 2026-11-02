@@ -56,6 +56,7 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         self.bot._roadmap_requester_id = 0
         self.bot._roadmap_reminder = {}
         self.bot._roadmap_waiting = {}
+        self.bot._roadmap_paused = False
         self.bot._target_channel = lambda channel_id: self.channel  # type: ignore[method-assign]
 
     async def start(self, sheet: str = SHEET, user_id: int = 42,
@@ -99,7 +100,7 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         second = self.bot.queue.submitted[1]
         self.assertEqual((second.kind, second.text), ("dan", "Refactor the parser."))
         saved = json.loads((Path(self._tmp.name) / "roadmap.json").read_text("utf-8"))
-        self.assertEqual([item["kind"] for item in saved], ["task", "dan"])
+        self.assertEqual([item["kind"] for item in saved["steps"]], ["task", "dan"])
         second.status = "approved"
         await self.bot._roadmap_tick()
         self.assertTrue(self.channel.send.await_args.args[0].endswith("roadmap done"))
@@ -114,7 +115,8 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
                           "failed" in ping, self.bot._roadmap_steps), (1, True, True, []))
         await self.start(SHEET)
         self.assertIn("1 job", self.bot._roadmap_stop())
-        self.assertEqual(json.loads((Path(self._tmp.name) / "roadmap.json").read_text()), [])
+        self.assertEqual(
+            json.loads((Path(self._tmp.name) / "roadmap.json").read_text())["steps"], [])
         self.bot.queue.submitted[1].status = "approved"
         await self.bot._roadmap_tick()
         self.assertEqual(len(self.bot.queue.submitted), 2)
@@ -245,8 +247,9 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Roadmap queued: 2 job(s)", message.reply.await_args.args[0])
         self.assertEqual(len(self.bot.queue.submitted), 1, "one job at a time")
         saved = json.loads((Path(self._tmp.name) / "roadmap.json").read_text("utf-8"))
-        self.assertEqual([item["text"] for item in saved], ["Add a button.",
-                                                            "Refactor the parser."])
+        self.assertEqual([item["text"] for item in saved["steps"]],
+                         ["Add a button.", "Refactor the parser."])
+        self.assertFalse(saved["paused"], "a new roadmap is not paused")
         self.assertEqual(self.bot._roadmap_waiting, {})
 
     async def test_a_bad_sheet_in_the_next_message_reports_and_stops_waiting(self) -> None:
@@ -276,6 +279,49 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await self.bot._take_roadmap_sheet(message))
         self.assertEqual(message.reply.await_count, 0)
         self.assertEqual((self.bot.queue.submitted, self.bot._roadmap_waiting), ([], {}))
+
+    async def test_pause_holds_the_next_job_and_resume_lets_it_go(self) -> None:
+        await self.start()
+        first = self.bot.queue.submitted[0]
+        reply = (await self.command(action="pause")).response.send_message.await_args.args[0]
+        self.assertIn("paused, 1 job(s) left", reply)
+        self.assertIn("paused, 1 job(s) left", self.bot._roadmap_status())
+        first.status = "approved"
+        await self.bot._roadmap_tick()
+        self.assertEqual(len(self.bot.queue.submitted), 1, "the next job waits while paused")
+        self.assertEqual(first.status, "approved", "the queued job is left alone")
+        self.assertIn("resumed", (await self.command(action="resume"))
+                      .response.send_message.await_args.args[0])
+        await self.bot._roadmap_tick()
+        self.assertEqual([job.kind for job in self.bot.queue.submitted], ["task", "dan"])
+        self.assertIn("2 jobs", self.bot._roadmap_status(), "no pause line once resumed")
+
+    async def test_a_paused_tick_does_nothing_at_all(self) -> None:
+        await self.start()
+        self.bot.queue.submitted[0].status = "failed"
+        await self.command(action="pause")
+        await self.bot._roadmap_tick()
+        self.assertEqual((self.channel.send.await_count, len(self.bot._roadmap_steps)), (0, 2))
+        await self.command(action="resume")
+        await self.bot._roadmap_tick()
+        self.assertIn("failed", self.channel.send.await_args.args[0], "the tick runs again")
+
+    async def test_the_paused_flag_survives_save_and_load(self) -> None:
+        await self.start()
+        await self.command(action="pause")
+        path = Path(self._tmp.name) / "roadmap.json"
+        state = bot.roadmap.load(path)
+        self.assertEqual((state.paused, [step.text for step in state.steps]),
+                         (True, ["Add a button.", "Refactor the parser."]))
+
+    def test_an_old_roadmap_file_loads_unpaused(self) -> None:
+        path = Path(self._tmp.name) / "roadmap.json"
+        path.write_text(json.dumps([{"text": "Old job.", "kind": "task", "job_id": "abc"}]))
+        state = bot.roadmap.load(path)
+        self.assertEqual((state.paused, [(step.text, step.kind, step.job_id)
+                                         for step in state.steps]),
+                         (False, [("Old job.", "task", "abc")]))
+        self.assertFalse(bot.roadmap.load(Path(self._tmp.name) / "missing.json").paused)
 
     async def test_a_new_roadmap_replaces_the_waiting_one_and_stop_clears_it(self) -> None:
         await self.command(action="preview")
