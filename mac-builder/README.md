@@ -343,6 +343,7 @@ tail -f ~/Curator.1/mac-builder/logs/launchd.log
 | `/board` | Re-posts the running job's status board if the message was lost. |
 | `/merge [job-id] [dry-run]` | Gates an approved review (allowlist, check, diff size, protected paths, PR, CI, unchanged head); merges only if every gate passes. Dry run by default. |
 | `/roadmap [sheet] [action]` | Queues one `.md` build sheet: each `## Job` heading is one job (max 8, 6000 chars each), `kind: task`/`kind: dan` picks the type. One at a time; the next queues only after you Approve, a failure stops it and pings. `action: status` lists it, `stop` drops the rest. Never approves, pushes or merges. |
+| `/selftest` | Runs every stage on fakes — sheet parsing, the report and test card, the board and its pings, the merge gates against a mocked GitHub, and the allowlist — and reports pass or fail per stage with one line of evidence. No Freebuff, GitHub, repo write, push, merge or real queue. |
 
 Job results are posted where the job was started, or to `NOTIFY_CHANNEL_ID`.
 

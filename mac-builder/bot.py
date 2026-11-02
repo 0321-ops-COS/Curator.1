@@ -52,6 +52,7 @@ import project_context  # noqa: E402
 import questions  # noqa: E402
 import rules  # noqa: E402
 import screens  # noqa: E402
+import selftest  # noqa: E402
 import status_board  # noqa: E402
 from freebuff_runner import FreebuffError, FreebuffRunner  # noqa: E402
 from jobs import Job, ReviewOutcome, tail_text  # noqa: E402
@@ -787,6 +788,8 @@ class MacBuilderBot(discord.Client):
         self.tree.add_command(app_commands.Command(
             name="roadmap", callback=self.cmd_roadmap,
             description="Queue a build sheet: one job per '## Job', one at a time"))
+        self.tree.add_command(app_commands.Command(
+            name="selftest", callback=self.cmd_selftest, description="Run each stage on fakes"))
         self.tree.interaction_check = self.require_allowed
         if self._board_ticker is None or self._board_ticker.done():
             self._board_ticker = asyncio.create_task(self._board_loop())
@@ -1341,6 +1344,15 @@ class MacBuilderBot(discord.Client):
         await interaction.response.send_message(
             f"Roadmap queued: {len(steps)} job(s), first is `{job.id}` ({steps[0].kind}). "
             "Each still waits for your Approve; nothing is pushed or merged.", ephemeral=True)
+
+    # ------------------------------------------------------------- selftest
+
+    async def cmd_selftest(self, interaction: discord.Interaction) -> None:
+        """Every stage on fakes: no Freebuff, GitHub, repo write, push or queue."""
+        if not await self.require_allowed(interaction):
+            return
+        stages = await selftest.run(self, dan_report_text)
+        await interaction.response.send_message(selftest.report(stages), ephemeral=True)
 
     # ------------------------------------------------------------- questions
 
