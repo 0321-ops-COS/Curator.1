@@ -52,6 +52,16 @@ DEBUG_PANE_CHARS = 4000
 STALL_DEFAULT_SECONDS = 90.0
 # Re-read the pane this often while waiting for the first ready screen.
 READY_POLL_SECONDS = 2.0
+# Freebuff's input box keeps only about 2048 characters of one paste (job
+# 20261101-223820-c486b968 stopped at 2049), so text goes in pieces with a
+# breath between them, and Enter waits until the end of it is on the pane.
+PASTE_CHUNK_CHARS = 1000
+PASTE_CHUNK_PAUSE_SECONDS = 0.08
+PASTE_CONFIRM_SECONDS = 5.0
+PASTE_CONFIRM_POLL_SECONDS = 0.25
+PASTE_TAIL_CHARS = 40
+# Rules, corners and gutters: layout, not text, so the tail check drops them.
+BOX_DRAWING = frozenset("│┃║─━═╭╮╰╯┌┐└┘├┤┬┴┼▏▕▎▍▌█▉▊▋")
 # Told to the owner when a screen will not take the task text.
 _KEY_HINT = (
     "Use /screen to read the pane, /key with Enter, Esc, Up, Down, Left, Right, "
@@ -135,6 +145,24 @@ def _snapshot_label(snapshot: str) -> str:
     """Short 'commit/digest' form for a message, never the full value."""
     head, _, digest = snapshot.partition(":")
     return f"{head[:7]}/{digest[:8]}"
+
+
+def paste_tail(text: str, count: int = PASTE_TAIL_CHARS) -> str:
+    """The last ``count`` non-space characters: what has to be on the pane."""
+    return "".join(ch for ch in text if not ch.isspace())[-count:]
+
+
+def paste_visible(text: str, pane: str) -> bool:
+    """Whether the end of ``text`` is on the pane, once layout is normalised.
+
+    A wrapped line, a newline and a box border all vanish here, so the check
+    compares characters the owner can see, not where the box put them.
+    """
+    tail = paste_tail(text)
+    if not tail:
+        return True
+    seen = "".join(ch for ch in pane if not ch.isspace() and ch not in BOX_DRAWING)
+    return tail in seen
 
 
 @dataclass
@@ -504,6 +532,8 @@ class FreebuffRunner:
         self._screen_reporter: Callable[[screens.Screen, str], Awaitable[None]] | None = None
         # Screens already posted, so a static pane is shown once, not per poll.
         self._screens_seen: set[str] = set()
+        # Whether tmux may use bracketed paste; turned off once if it cannot.
+        self._bracket_paste = True
         # Why the session exited, and what the last stall was, for the report.
         self._exit_note = ""
         self._last_stall_kind = ""
@@ -824,19 +854,70 @@ class FreebuffRunner:
             await asyncio.sleep(READY_POLL_SECONDS)
 
     async def _send_text(self, session: str, text: str) -> None:
-        loaded = await self._tmux(
-            "load-buffer", "-b", "macbuilder", "-", input_bytes=text.encode("utf-8")
-        )
-        if loaded.code != 0:
-            raise FreebuffError(f"could not load task text into tmux: {loaded.stderr.strip()}")
-        pasted = await self._tmux(
-            "paste-buffer", "-d", "-b", "macbuilder", "-t", session
-        )
-        if pasted.code != 0:
-            raise FreebuffError(f"could not paste task text into Freebuff: {pasted.stderr.strip()}")
+        """Paste text in chunks, confirm the end arrived, then press Enter.
+
+        The text is cut into ``PASTE_CHUNK_CHARS`` pieces and each piece is
+        pasted through tmux's own buffer, so a paste larger than the box's
+        ~2048 limit still arrives in full and in order. Enter is pressed only
+        once the last characters are on the pane: a cut prompt is cleared and
+        fails the job instead of being submitted.
+        """
+        for start in range(0, len(text), PASTE_CHUNK_CHARS):
+            chunk = text[start : start + PASTE_CHUNK_CHARS]
+            loaded = await self._tmux(
+                "load-buffer", "-b", "macbuilder", "-", input_bytes=chunk.encode("utf-8")
+            )
+            if loaded.code != 0:
+                raise FreebuffError(
+                    f"could not load task text into tmux: {loaded.stderr.strip()}"
+                )
+            pasted = await self._paste_buffer(session)
+            if pasted.code != 0:
+                raise FreebuffError(
+                    f"could not paste task text into Freebuff: {pasted.stderr.strip()}"
+                )
+            if start + PASTE_CHUNK_CHARS < len(text):
+                await asyncio.sleep(PASTE_CHUNK_PAUSE_SECONDS)
+        if not await self._paste_arrived(session, text):
+            await self._clear_input(session)
+            raise FreebuffError("the paste was cut off; nothing was submitted")
         sent = await self._tmux("send-keys", "-t", session, "Enter")
         if sent.code != 0:
             raise FreebuffError(f"could not submit task text: {sent.stderr.strip()}")
+
+    async def _paste_buffer(self, session: str) -> CommandResult:
+        """paste-buffer with bracketed paste, plainly if tmux is too old.
+
+        ``-p`` adds the markers only when Freebuff asked for bracketed paste, so
+        newlines inside a task are text rather than an early Enter.
+        """
+        flags = ["paste-buffer", "-p"] if self._bracket_paste else ["paste-buffer"]
+        pasted = await self._tmux(*flags, "-d", "-b", "macbuilder", "-t", session)
+        if pasted.code != 0 and self._bracket_paste:
+            log.warning("tmux refused bracketed paste; pasting plainly from now on")
+            self._bracket_paste = False
+            pasted = await self._tmux(
+                "paste-buffer", "-d", "-b", "macbuilder", "-t", session
+            )
+        return pasted
+
+    async def _paste_arrived(self, session: str, text: str) -> bool:
+        """Wait up to PASTE_CONFIRM_SECONDS for the end of the text to show."""
+        deadline = time.monotonic() + PASTE_CONFIRM_SECONDS
+        while True:
+            if paste_visible(text, await self._pane(session)):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(PASTE_CONFIRM_POLL_SECONDS)
+
+    async def _clear_input(self, session: str) -> None:
+        """Esc and Ctrl-U, best effort: a cut prompt must never be submitted."""
+        for key in ("Escape", "C-u"):
+            try:
+                await self._press(session, key)
+            except FreebuffError as exc:
+                log.warning("could not clear the input box with %s: %s", key, exc)
 
     async def _pane(self, session: str) -> str:
         """The visible pane, read only for question detection."""
