@@ -49,6 +49,7 @@ mac-builder/
   queue.py            single-worker asyncio FIFO queue
   jobs.py             fixed-script execution + the Freebuff review pipeline
   manager.py          OpenAI-compatible review and planning chat (no tools)
+  planner.py          `/plan`: gathers the context and writes the plan document
   project_context.py  which repo/branch/project she builds, plus herself
   rules.py            hard guardrails enforced in code
   freebuff_runner.py  branch + git worktree + tmux + diff collection + push
@@ -57,6 +58,7 @@ mac-builder/
   launchd/            com.hustler.macbuilder.plist (LaunchAgent)
   tests/              offline unit tests for the guardrails and parsing
   .env.example        configuration template (no secrets)
+  requirements.txt    pinned Python dependencies for the venv
 ```
 
 Only one job runs at a time. `/check`, `/test`, `/build` and `/task` are queued;
@@ -143,6 +145,8 @@ are kept for inspection.
 |---|---|
 | `DISCORD_TOKEN` | Bot token. Never commit it. |
 | `ALLOWED_USER_IDS` | Comma/space-separated Discord user IDs; required. |
+| `GUILD_ID` | Optional guild ID, so slash commands sync to one server instantly instead of globally. |
+| `NOTIFY_CHANNEL_ID`, `AI_CHANNEL_ID`, `AI_CHANNEL_NAME` | Optional result channel, the `#ai` channel by ID, or by name (default `ai`). An empty `NOTIFY_CHANNEL_ID` posts results where the job was started. |
 | `AUTHORIZED_BRANCH` | Base branch for tasks; never `main`/`master`. |
 | `REPO_DIR` | The project checkout to build; default is the one containing `mac-builder/`. On the Mac that is `~/Desktop/Hustler`, because `mac-builder/` now lives in the Curator.1 checkout. |
 | `PROJECT_NAME`, `BUILDER_NAME`, `BOT_NAME` | Labels for `/project` and the manager; default to the target folder name, `Freebuff`, `Melisa`. |
@@ -155,6 +159,7 @@ are kept for inspection.
 | `FREEBUFF_BIN`, `FREEBUFF_ARGS` | Interactive Freebuff CLI and fixed arguments. |
 | `FREEBUFF_READY_SECONDS` | Wait for first terminal output before sending the task. |
 | `FREEBUFF_IDLE_SECONDS` | Worktree must stop changing this long to count as done. |
+| `FREEBUFF_POLL_SECONDS` | How often the pane is captured to look for a question; default 10. |
 | `FREEBUFF_TIMEOUT_SECONDS` | Hard stop per Freebuff round. |
 | `QUESTION_WAIT_SECONDS` | How long a Freebuff question box may hold a job waiting for `/answer`; after that it is dismissed with `Esc` and the job fails. Default 1800. |
 | `QUESTION_AUTO_ANSWER` | `1` lets the manager answer a question, only when it replies with high confidence. Default `0`: the manager is rate limited and off by default. |
@@ -162,12 +167,13 @@ are kept for inspection.
 | `QUESTION_MANAGER_COOLDOWN_SECONDS` | After a 429 or a timeout from the manager, skip manager calls for this long and ask you instead. Default 30. |
 | `QUESTION_SUGGEST` | `1` posts the manager's advice as a follow-up under the question ("suggestion only, you decide"). Never an answer, never typed. Default `0`. |
 | `QUESTION_DEBUG` | `1` writes the whole pane to the job log after every key sent to a question box. Default `0`; turn it on once to learn the real box. |
-| `MANAGER_API_BASE`, `MANAGER_API_KEY`, `MANAGER_MODEL` | Any OpenAI-compatible chat endpoint. `MANAGER_MODEL` defaults to `openrouter/free`, which needs the OpenRouter base URL. |
+| `MANAGER_API_BASE`, `MANAGER_API_KEY`, `MANAGER_MODEL` | Any OpenAI-compatible chat endpoint; all three are needed before the manager is used at all. There is no built-in model default, so set `MANAGER_MODEL` yourself, for example `openrouter/free`, which needs the OpenRouter base URL (`https://openrouter.ai/api/v1`). |
 | `MANAGER_FALLBACK_MODELS` | Optional comma-separated fallback model ids. When set, requests also send `"models": [MANAGER_MODEL, ...]` so OpenRouter falls through on a 429 or provider error; empty leaves the payload unchanged. |
+| `MANAGER_TIMEOUT_SECONDS` | Per-request timeout for one manager call; default 120. |
 | `MAX_DIFF_LINES` | Hard diff limit, default 400. |
 | `MAX_REVISE_ROUNDS` | Automatic revision rounds, default 2. |
 | `MAX_PENDING_JOBS` | Queue cap, default 10. |
-| `CHECK/TEST/BUILD/STATUS_TIMEOUT_SECONDS` | Per-stage timeouts. |
+| `CHECK/TEST/BUILD/STATUS_TIMEOUT_SECONDS` | Per-stage timeouts; defaults 1800, 2700, 1800 and 60. |
 
 ## Run on boot (LaunchAgent)
 
@@ -403,9 +409,10 @@ is running another folder, and the startup `code:` line says which one.
 
 What `/dan` may never change: `mac-builder/rules.py`,
 `mac-builder/freebuff_runner.py` (the push path and guard), the allowlist and
-Approve code in `mac-builder/bot.py` (checked line by line in the diff), and the
-tests that pin them (`test_rules.py`, `test_push_guard.py`, `test_dan.py`,
-`test_approve_recheck.py`). Each refusal names the file and the reason, so the
+Approve code in `mac-builder/bot.py` — any changed line naming `ALLOWED_USER_IDS`,
+`allowed_user_ids`, `require_allowed`, `ReviewView`, `approve_and_push` or
+`_approve` — and the tests that pin them (`test_rules.py`,
+`test_push_guard.py`, `test_dan.py`, `test_approve_recheck.py`). Each refusal names the file and the reason, so the
 model can move the change somewhere it is allowed.
 
 Freebuff runs in a tmux server on its own socket (`-L macbuilder`) whose
@@ -434,6 +441,12 @@ arguments (never Discord input).
   404 or a malformed body is not.
 - Log tails in the review prompt are capped at 2500 characters each, so a
   runaway build log cannot push the diff out of the context budget.
+- `MANAGER_FALLBACK_MODELS` (comma-separated) is **OpenRouter only**. When it is
+  set the request adds `"models": [MANAGER_MODEL, ...]`, the array OpenRouter
+  falls through on a 429 or a provider error; another OpenAI-compatible endpoint
+  ignores it and keeps using `model` as before. Empty leaves the payload exactly
+  as it was. There is no backup-provider chain: a provider that rejects the
+  request still goes through the one retry and then falls back to you.
 - `revise` sends concrete notes back to Freebuff, re-runs the checks and reviews
   again, up to `MAX_REVISE_ROUNDS` (2). After that the decision goes to you.
 - `approve` and `ask_user` post an embed with **Approve** / **Reject** buttons.
@@ -485,7 +498,7 @@ The guardrails and parsing are testable without a Mac, Discord or a model:
 ```bash
 cd mac-builder
 .venv/bin/python -m unittest discover -s tests -v
-.venv/bin/python -m py_compile bot.py queue.py jobs.py rules.py manager.py project_context.py freebuff_runner.py questions.py
+.venv/bin/python -m py_compile bot.py queue.py jobs.py rules.py manager.py planner.py project_context.py freebuff_runner.py questions.py
 bash -n scripts/*.sh
 ```
 
@@ -594,7 +607,7 @@ branch and short commit of the code that is running.
 - `/plan` is bounded: at most `MAX_PLAN_CHARS` (60 000 characters) of material
   goes in, and at most `MANAGER_MAX_TOKENS` (default 4000) comes back. A plan that
   hits the output limit is labelled incomplete, not presented as whole.
-- **Free models are retired without notice.** The default `MANAGER_MODEL` is
+- **Free models are retired without notice.** A common `MANAGER_MODEL` is
   `openrouter/free`; when OpenRouter stops serving it the manager answers HTTP
   404 with that reason in the body (now shown in the log and in Discord) or
   returns an empty reply. A paid model is the reliable choice for a bot that

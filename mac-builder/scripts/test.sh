@@ -33,8 +33,10 @@ if [ ! -f ios-app/project.yml ]; then
 fi
 (cd ios-app && xcodegen generate --spec project.yml)
 
-sim_log="$(mktemp -t macbuilder-sim)"
-build_log="$(mktemp -t macbuilder-test)"
+# A template path, not -t: BSD (macOS) mktemp takes a prefix there, while GNU
+# mktemp wants the X's in a template and fails with "too few X's".
+sim_log="$(mktemp "${TMPDIR:-/tmp}/macbuilder-sim.XXXXXX")"
+build_log="$(mktemp "${TMPDIR:-/tmp}/macbuilder-test.XXXXXX")"
 udid=""
 
 cleanup() {
