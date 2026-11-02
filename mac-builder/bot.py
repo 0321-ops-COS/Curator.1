@@ -14,6 +14,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -46,6 +47,7 @@ import project_context  # noqa: E402
 import questions  # noqa: E402
 import rules  # noqa: E402
 import screens  # noqa: E402
+import status_board  # noqa: E402
 from freebuff_runner import FreebuffError, FreebuffRunner  # noqa: E402
 from jobs import Job, ReviewOutcome, tail_text  # noqa: E402
 from manager import Manager, ManagerUnavailable  # noqa: E402
@@ -54,6 +56,43 @@ log = logging.getLogger("macbuilder")
 
 DEFAULT_AUTHORIZED_BRANCH = "freebuff/ce4b8907c250c30103d8993e"
 LOG_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}$")
+# How often the board re-checks queue positions and silent stages.
+BOARD_TICK_SECONDS = 30.0
+
+
+class DiscordBoardTransport(status_board.BoardTransport):
+    """The only Discord-aware piece of the board: send text, edit a message.
+
+    Both calls answer False/None instead of raising, so a deleted board or a
+    failed edit costs one new message and never touches the job.
+    """
+
+    def __init__(self, bot: "MacBuilderBot") -> None:
+        self.bot = bot
+
+    async def send(self, channel_id: int, text: str) -> str | None:
+        channel = self.bot._target_channel(channel_id)
+        if channel is None:
+            return None
+        try:
+            message = await channel.send(text[:1900])
+        except Exception:
+            log.exception("could not post a status board")
+            return None
+        message_id = str(getattr(message, "id", "") or "")
+        return message_id or None
+
+    async def edit(self, channel_id: int, message_id: str, text: str) -> bool:
+        channel = self.bot._target_channel(channel_id)
+        if channel is None:
+            return False
+        try:
+            message = await channel.fetch_message(int(message_id))
+            await message.edit(content=text[:1900])
+        except Exception:
+            # Deleted, or no permission: the caller posts one new board.
+            return False
+        return True
 
 
 class ConfigError(RuntimeError):
@@ -232,6 +271,11 @@ class Settings:
     # A pane and a worktree both unchanged this long is a stuck screen: it is
     # posted once with /screen, /key and /send, and the clocks pause.
     stall_seconds: float = 90.0
+    # The live board: how often one message may be edited, the silence that
+    # earns a ping, and whether pings are sent at all.
+    status_edit_min_seconds: float = 15.0
+    status_stall_ping_seconds: float = 600.0
+    status_pings: bool = True
     # Filled in by main() after the startup preflight; None before that.
     project: "project_context.ProjectContext | None" = None
 
@@ -316,6 +360,9 @@ class Settings:
             question_suggest=_env_bool("QUESTION_SUGGEST", False),
             question_debug=_env_bool("QUESTION_DEBUG", False),
             stall_seconds=_env_float("STALL_SECONDS", 90.0),
+            status_edit_min_seconds=_env_float("STATUS_EDIT_MIN_SECONDS", 15.0),
+            status_stall_ping_seconds=_env_float("STATUS_STALL_PING_SECONDS", 600.0),
+            status_pings=_env_bool("STATUS_PINGS", True),
         )
         if settings.max_pending_jobs < 1:
             raise ConfigError("MAX_PENDING_JOBS must be at least 1")
@@ -329,6 +376,10 @@ class Settings:
             raise ConfigError("QUESTION_MANAGER_COOLDOWN_SECONDS must be 0 or more")
         if settings.stall_seconds < 1:
             raise ConfigError("STALL_SECONDS must be at least 1")
+        if settings.status_edit_min_seconds < 0:
+            raise ConfigError("STATUS_EDIT_MIN_SECONDS must be 0 or more")
+        if settings.status_stall_ping_seconds < 1:
+            raise ConfigError("STATUS_STALL_PING_SECONDS must be at least 1")
         return settings
 
 
@@ -519,6 +570,14 @@ class MacBuilderBot(discord.Client):
             max_tokens=settings.manager_max_tokens,
         )
         self.freebuff = FreebuffRunner(settings)
+        self._board = status_board.BoardPublisher(
+            DiscordBoardTransport(self),
+            edit_min_seconds=settings.status_edit_min_seconds,
+            stall_ping_seconds=settings.status_stall_ping_seconds,
+            pings=settings.status_pings,
+        )
+        self._board_tasks: set[asyncio.Task[None]] = set()
+        self._board_ticker: asyncio.Task[None] | None = None
         self.runner = jobs.JobRunner(
             settings,
             self.manager,
@@ -529,6 +588,7 @@ class MacBuilderBot(discord.Client):
             post_pane=self._post_pane,
             post_screen=self._post_screen,
             post_note=self._post_note,
+            on_stage=self._on_stage,
         )
         self.queue = jobs.JobQueue(
             self.runner.run,
@@ -641,7 +701,16 @@ class MacBuilderBot(discord.Client):
                 callback=self.cmd_send,
             )
         )
+        self.tree.add_command(
+            app_commands.Command(
+                name="board",
+                description="Post a fresh status board for the running job",
+                callback=self.cmd_board,
+            )
+        )
         self.tree.interaction_check = self.require_allowed
+        if self._board_ticker is None or self._board_ticker.done():
+            self._board_ticker = asyncio.create_task(self._board_loop())
         await self.sync_commands()
         if not self._queue_started:
             self.queue.start()
@@ -745,6 +814,9 @@ class MacBuilderBot(discord.Client):
             )
 
     async def close(self) -> None:
+        ticker, self._board_ticker = self._board_ticker, None
+        if ticker is not None:
+            ticker.cancel()
         try:
             await self.runner.shutdown()
             await self.queue.stop()
@@ -775,24 +847,44 @@ class MacBuilderBot(discord.Client):
     # ----------------------------------------------------------------- status
 
     async def cmd_status(self, interaction: discord.Interaction) -> None:
+        """The live board for the running job plus one line per waiting job.
+
+        Read-only and immediate: no probe, no git, nothing that can stall a
+        phone. The numbers are the real stage, the real elapsed time and the
+        real queue position; nothing here guesses at completion.
+        """
         if not await self.require_allowed(interaction):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
+        running = getattr(self.queue, "running", None)
+        publisher = getattr(self, "_board", None)
+        board = None
+        if running is not None and publisher is not None:
+            board = publisher.board_for(running.id)
+        lines: list[str] = []
+        if board is not None:
+            lines.append(status_board.render(board, now=time.time()))
+        elif running is not None:
+            lines.append(
+                f"`{running.id}` · {running.kind} · running "
+                f"{jobs.format_elapsed(running.duration)}"
+            )
+        else:
+            lines.append("No job is running.")
+        waiting_fn = getattr(self.queue, "waiting", None)
+        waiting_jobs = list(waiting_fn()) if callable(waiting_fn) else []
+        waiting = [
+            (position, job.id, job.kind, job.title)
+            for position, job in enumerate(waiting_jobs, start=1)
+        ]
+        lines += ["", "waiting:", status_board.render_waiting(waiting), ""]
         code, output = await jobs.probe_status(self.settings)
         snapshot = self.queue.snapshot()
-        running = snapshot.get("running") or {}
-        ctx = self.settings.project
-        lines: list[str] = []
+        ctx = getattr(self.settings, "project", None)
         if ctx is not None:
             lines += [f"project: {ctx.project_name}", f"target repo: {ctx.target_remote}"]
         lines += [
             f"queue: {snapshot['pending']} waiting",
-            f"running: {running.get('id', 'none')}"
-            + (
-                f" ({running.get('kind')}, {jobs.format_elapsed(running.get('elapsed'))})"
-                if running
-                else ""
-            ),
             f"authorized branch: {self.settings.authorized_branch}",
             f"manager: {'configured' if self.manager.enabled else 'not configured'}",
             f"questions: detection on · wait {int(self.settings.question_wait_seconds)}s"
@@ -804,7 +896,9 @@ class MacBuilderBot(discord.Client):
             "",
             tail_text(output, max_lines=40, max_chars=1400),
         ]
-        await interaction.followup.send("```\n" + "\n".join(lines) + "\n```", ephemeral=True)
+        await interaction.followup.send(
+            "```\n" + "\n".join(lines) + "\n```", ephemeral=True
+        )
 
     async def cmd_project(self, interaction: discord.Interaction) -> None:
         if not await self.require_allowed(interaction):
@@ -1012,6 +1106,7 @@ class MacBuilderBot(discord.Client):
         except jobs.QueueFull as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
+        await self._track_board(job, position)
         warning = "" if self.manager.enabled else " (AI manager is not configured.)"
         await interaction.response.send_message(
             f"Queued Freebuff task `{job.id}` (position {position}).{warning}",
@@ -1041,6 +1136,7 @@ class MacBuilderBot(discord.Client):
         except jobs.QueueFull as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
+        await self._track_board(job, position)
         await interaction.response.send_message(
             f"Queued self-build `{job.id}` (position {position}) on `dan/{job.id}`, "
             "branched from a freshly fetched origin/main. It may edit `mac-builder/` "
@@ -1174,6 +1270,32 @@ class MacBuilderBot(discord.Client):
             f"Typed into Freebuff: `{screens.redact_pane(value)[:100]}`", ephemeral=True
         )
 
+    async def cmd_board(self, interaction: discord.Interaction) -> None:
+        """Re-post the running job's board, for when the message was lost."""
+        if not await self.require_allowed(interaction):
+            return
+        running = getattr(self.queue, "running", None)
+        publisher = getattr(self, "_board", None)
+        if running is None or publisher is None:
+            await interaction.response.send_message(
+                "No job is running, so there is no board to post.", ephemeral=True
+            )
+            return
+        posted = False
+        try:
+            posted = await publisher.repost(running.id)
+        except Exception:
+            log.exception("could not repost the board for job %s", running.id)
+        if posted:
+            await interaction.response.send_message(
+                f"Posted a fresh board for `{running.id}`.", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                "No board is tracked for the running job yet; try again in a moment.",
+                ephemeral=True,
+            )
+
     # ----------------------------------------------------------- ai channel
 
     async def on_message(self, message: discord.Message) -> None:
@@ -1243,6 +1365,83 @@ class MacBuilderBot(discord.Client):
         return "\n".join(part for part in parts if part)
 
     # ------------------------------------------------------------ reporting
+
+    def _board_channel_id(self, job: Job) -> int:
+        """Boards live in NOTIFY_CHANNEL_ID, else where the job was started."""
+        return getattr(self.settings, "notify_channel_id", None) or job.channel_id
+
+    async def _track_board(self, job: Job, position: int) -> None:
+        """Start the live board for a builder job, then post it once."""
+        if job.kind not in ("task", "dan"):
+            return
+        publisher = getattr(self, "_board", None)
+        if publisher is None:  # a bot without a board still queues jobs
+            return
+        ctx = getattr(self.settings, "project", None)
+        try:
+            publisher.track(
+                job.id,
+                channel_id=self._board_channel_id(job),
+                requester_id=job.requester_id,
+                kind=job.kind,
+                project=getattr(ctx, "project_name", "") or "",
+                started_at=getattr(job, "started", None),
+                queue_position=position,
+            )
+            await publisher.report(job.id, status_board.QUEUED, "queued")
+        except Exception:  # a board must never stop a job being queued
+            log.exception("could not post the board for job %s", job.id)
+
+    def _on_stage(self, job: Job, stage: str, detail: str = "") -> None:
+        """THE status hook, installed in JobRunner. Never raises, never waits.
+
+        The board update runs as its own task: a slow Discord call must not add
+        a millisecond to a job, and an exception here is only logged.
+        """
+        if job.kind not in ("task", "dan") or stage == status_board.QUEUED:
+            return
+        publisher = getattr(self, "_board", None)
+        if publisher is None:
+            return
+        screen_kind = detail if stage == status_board.WAITING_ON_YOU else ""
+        try:
+            task = asyncio.create_task(
+                publisher.report(
+                    job.id,
+                    stage,
+                    "" if screen_kind else detail,
+                    screen_kind=screen_kind,
+                    started_at=job.started,
+                )
+            )
+        except Exception:
+            log.exception("could not schedule a board update for job %s", job.id)
+            return
+        self._board_tasks.add(task)
+        task.add_done_callback(self._board_task_done)
+
+    def _board_task_done(self, task: "asyncio.Task[None]") -> None:
+        self._board_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:  # pragma: no cover - defensive
+            return
+        if error is not None:
+            log.warning("a board update failed: %s", error)
+
+    async def _board_loop(self) -> None:
+        """Keep queue positions honest and ping a stage that has not moved."""
+        while True:
+            try:
+                await asyncio.sleep(BOARD_TICK_SECONDS)
+                ids = [job.id for job in self.queue.waiting()]
+                await self._board.tick(queue_ids=ids)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # the board must never stop the bot
+                log.exception("status board tick failed")
 
     def _target_channel(self, channel_id: int) -> discord.abc.Messageable | None:
         channel = self.get_channel(channel_id) if channel_id else None

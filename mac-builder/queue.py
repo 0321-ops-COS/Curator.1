@@ -69,6 +69,8 @@ class JobQueue:
         self._handler = handler
         self._on_crash = on_crash
         self._queue: asyncio.Queue[Job] = asyncio.Queue(maxsize=max_pending)
+        # Submission order, so the status board can name a job's place in line.
+        self._waiting: list[Job] = []
         self._worker: asyncio.Task[None] | None = None
         self._current: Job | None = None
         self._current_task: asyncio.Task[None] | None = None
@@ -95,6 +97,7 @@ class JobQueue:
                 f"queue is full ({self._max_pending} waiting); wait for a job to finish"
             )
         self._queue.put_nowait(job)
+        self._waiting.append(job)
         return self._queue.qsize()
 
     async def stop(self) -> None:
@@ -124,6 +127,10 @@ class JobQueue:
             else None,
             "pending": self.pending_count,
         }
+
+    def waiting(self) -> list[Job]:
+        """Waiting jobs in submission order, as a copy the caller may keep."""
+        return list(self._waiting)
 
     async def cancel(self, job_id: str) -> tuple[str, Job | None]:
         """Cancel the running job or a waiting one by id.
@@ -158,6 +165,7 @@ class JobQueue:
             waiting.append(job)
         for job in waiting:
             self._queue.put_nowait(job)
+        self._waiting = waiting
         if found is None:
             return "unknown", None
         found.status = "cancelled"
@@ -168,6 +176,7 @@ class JobQueue:
     async def _worker_loop(self) -> None:
         while True:
             job = await self._queue.get()
+            self._waiting = [item for item in self._waiting if item is not job]
             self._current = job
             job.status = "running"
             job.started = time.time()

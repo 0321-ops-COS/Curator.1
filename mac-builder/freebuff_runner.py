@@ -34,6 +34,7 @@ from typing import Awaitable, Callable
 import questions
 import rules
 import screens
+import status_board
 
 log = logging.getLogger(__name__)
 
@@ -495,6 +496,9 @@ class FreebuffRunner:
         # Why the session exited, and what the last stall was, for the report.
         self._exit_note = ""
         self._last_stall_kind = ""
+        # ONE hook for real stage changes: (stage, detail). The job runner installs
+        # it; a failure here may never touch the job.
+        self._status_reporter: Callable[[str, str], None] | None = None
         # The tmux server inherits this environment, so the builder never sees
         # the bot's Discord or manager credentials. Everything else (PATH,
         # SSH_AUTH_SOCK, Freebuff's own configuration) is preserved.
@@ -686,6 +690,7 @@ class FreebuffRunner:
         task_text: str,
         log_path: Path,
     ) -> None:
+        self.report_stage(status_board.BRANCH_READY, env.branch)
         try:
             await self._start_session(env, freebuff_argv, log_path)
             env.signature_at_start = await self.repo.signature(env.worktree)
@@ -694,6 +699,7 @@ class FreebuffRunner:
                 "\n--- task sent to Freebuff ---\n" + task_text + "\n--- end task ---\n",
             )
             await self._send_text(env.session, task_text)
+            self.report_stage(status_board.FREEBUFF_WORKING, "task sent")
         except Exception:
             await self.abort(env)
             raise
@@ -874,6 +880,25 @@ class FreebuffRunner:
         return self._question
 
     @property
+    def status_reporter(self) -> Callable[[str, str], None] | None:
+        return self._status_reporter
+
+    @status_reporter.setter
+    def status_reporter(self, reporter: Callable[[str, str], None] | None) -> None:
+        """Installed by the job runner; the board listens on this one hook."""
+        self._status_reporter = reporter
+
+    def report_stage(self, stage: str, detail: str = "") -> None:
+        """Tell the status board about a real stage. Never raises into the job."""
+        reporter = self._status_reporter
+        if reporter is None:
+            return
+        try:
+            reporter(stage, detail)
+        except Exception:  # a status update must never alter a job
+            log.exception("status reporter failed for %s", stage)
+
+    @property
     def pending_screen(self) -> screens.Screen | None:
         """The screen the job is waiting on, or None when it is not waiting."""
         return self._screen
@@ -959,6 +984,7 @@ class FreebuffRunner:
             log_path,
             f"\n[screen {screen.kind} {where}; waiting for the owner]\n{tail}\n",
         )
+        self.report_stage(status_board.WAITING_ON_YOU, screen.kind)
         if self._screen_reporter is None:
             log.warning("no reporter for the %s screen; it is only in the log", screen.kind)
             return
@@ -1644,6 +1670,7 @@ class FreebuffRunner:
             sha = await self.repo.head(env.worktree)
         await self.repo.push_branch(env.worktree, branch, kind=env.kind)
         log.info("pushed %s at %s", branch, sha)
+        self.report_stage(status_board.PUSHED, f"{branch} at {sha[:7]}")
         await self.abort(env)
         await self._repo_for(env).remove_worktree(env.worktree)
         self._remove_guard(env)

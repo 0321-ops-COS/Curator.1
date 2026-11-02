@@ -9,10 +9,10 @@ working day.
 Hustler (the web app, then the native iOS app) is the first project. More
 repositories follow, so nothing below may assume there is exactly one.
 
-Each phase is separately shippable and separately tested. Phase 1 is what this
-document was written for and what is built now.
+Each phase is separately shippable and separately tested. Phase 1 and Phase 1.5
+are built; Phase 1.5 is what is current.
 
-## Phase 1 — every screen Freebuff can show (current)
+## Phase 1 — every screen Freebuff can show (done)
 
 **Problem.** Today a job can sit silently: only the "Some questions for you"
 box and the "quick question n/11" survey are recognized, readiness is "any
@@ -51,6 +51,38 @@ is still thinking.
 
 **Not in this phase.** No new screens invented, no change to the review or
 Approve path, no change to the allowlist, and no multi-repo assumptions.
+
+## Phase 1.5 — the live status board (current)
+
+**Problem.** The owner is on a phone and never at a laptop, but a job announces
+itself in separate posts and the only way to know where it is was `/status`
+plus a log tail. Freebuff reports no progress, so anything that looks like a
+percentage would be invented.
+
+**Build.**
+1. `status_board.py`: the stage model (`queued`, `branch_ready`,
+   `freebuff_working`, `waiting_on_you`, `checks`, `tests`, `manager_review`,
+   `awaiting_approve`, `pushed`, `rejected`, `failed`, `cancelled`,
+   `timed_out`), a seven-slot bar whose fill is the stage number, real elapsed
+   time, the queue position, and a "looks like: <kind>" line carrying the exact
+   command for the screen `screens.py` reported. Pure functions with an injected
+   clock.
+2. One status hook (`stage, detail`) from `jobs.py` and `freebuff_runner.py`,
+   called where Phase 1 already sees branches, questions, stalls, sign-in gates,
+   stage runs, reviews and exits. A status failure never fails or delays a job.
+3. One Discord message per job, posted in `NOTIFY_CHANNEL_ID` (else the job's
+   channel) and edited in place, throttled by `STATUS_EDIT_MIN_SECONDS`; a
+   deleted message costs one new post. Queue positions refresh on a timer.
+4. Pings, as separate messages, only for: waiting on you, review ready, and a
+   job finished, failed or timed out; plus one ping per stall after
+   `STATUS_STALL_PING_SECONDS`. Deduplicated by job and screen kind, never by
+   pane text. `STATUS_PINGS=0` turns them off.
+5. `/status` renders the same board for the running job plus one line per
+   waiting job; `/board` re-posts a lost board. Both allowlist-checked.
+
+**Not in this phase.** No web server, no network endpoint and no iPhone widget:
+that needs its own approval, and the board is deliberately a message the owner
+already reads.
 
 ## Phase 2 — a registry of projects
 

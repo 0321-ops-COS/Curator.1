@@ -25,6 +25,7 @@ from typing import Awaitable, Callable, Sequence
 import questions
 import rules
 import screens
+import status_board
 from freebuff_runner import FreebuffError, FreebuffRunner, TaskEnvironment
 from manager import (
     Manager,
@@ -99,6 +100,9 @@ PostPane = Callable[[Job, str], Awaitable[bool]]
 PostScreen = Callable[[Job, screens.Screen, str], Awaitable[bool]]
 # A manager line for the owner: an auto-answer record or a suggestion.
 PostNote = Callable[[Job, str], Awaitable[None]]
+# ONE status hook: (job, stage, detail). The board listens here; a failure may
+# never fail, delay or alter a job.
+StageHook = Callable[[Job, str, str], None]
 # Reasons from the runner that mean a question box stopped the job.
 QUESTION_REASONS = ("question-timeout", "question-failed")
 # The runner's reason for a screen that never changed and was dismissed.
@@ -363,6 +367,7 @@ class JobRunner:
         post_pane: PostPane | None = None,
         post_screen: PostScreen | None = None,
         post_note: PostNote | None = None,
+        on_stage: StageHook | None = None,
     ) -> None:
         self.settings = settings
         self.manager = manager
@@ -373,6 +378,7 @@ class JobRunner:
         self.post_pane = post_pane
         self.post_screen = post_screen
         self.post_note = post_note
+        self.on_stage = on_stage
         self._last_log: Path | None = None
         self._last_summary = ""
         self._last_diff_excerpt = ""
@@ -438,6 +444,10 @@ class JobRunner:
             summary = f"{summary}\n\n{note}" if summary else note
         job.summary = summary
         self._last_summary = f"{job.kind} {job.id}: {summary}"
+        if job.status == "cancelled":
+            self._stage(job, status_board.CANCELLED, "cancelled; nothing was pushed")
+        elif job.status == "failed":
+            self._stage(job, status_board.FAILED, summary)
         try:
             await self.post_job(job, ok, summary)
         except Exception:  # pragma: no cover - Discord can fail independently
@@ -486,6 +496,10 @@ class JobRunner:
         # A screen that needs a person is reported through the same Discord
         # channel as the job, before and during the wait for the first screen.
         self.freebuff.screen_reporter = self._screen_handler(job)
+        # The runner reports real stages through this one hook as well.
+        self.freebuff.status_reporter = lambda stage, detail: self._stage(
+            job, stage, detail
+        )
         try:
             env = await self.freebuff.start_task(
                 job_id=job.id,
@@ -508,6 +522,7 @@ class JobRunner:
                 # Stop the session before counting: collect() runs git and can
                 # raise, and a timed-out Freebuff must not keep running because
                 # the count failed.
+                self._stage(job, status_board.TIMED_OUT, "hit FREEBUFF_TIMEOUT_SECONDS")
                 await self.freebuff.abort(env)
                 try:
                     changes = await self.freebuff.collect(
@@ -555,6 +570,9 @@ class JobRunner:
                     )
                 )
                 if violations:
+                    self._stage(
+                        job, status_board.FAILED, "blocked by the hard rules"
+                    )
                     await self.freebuff.abort(env)
                     outcome = ReviewOutcome(
                         job=job,
@@ -586,6 +604,11 @@ class JobRunner:
                     round_number=env.round,
                     project_context=_project_block(self.settings),
                 )
+                self._stage(
+                    job,
+                    status_board.MANAGER_REVIEW,
+                    f"reviewing {changes.diff_lines} changed lines",
+                )
                 review = await self.manager.review(brief)
                 verdict = review.verdict
                 notes = review.notes
@@ -611,6 +634,9 @@ class JobRunner:
                     if followup_reason in QUESTION_REASONS:
                         return await self._question_stopped(job, env, followup_reason)
                     if followup_reason == "timeout":
+                        self._stage(
+                            job, status_board.TIMED_OUT, "hit FREEBUFF_TIMEOUT_SECONDS"
+                        )
                         await self.freebuff.abort(env)
                         return (
                             False,
@@ -625,6 +651,12 @@ class JobRunner:
                         "The last review notes were:\n\n" + notes
                     )
 
+                self._stage(
+                    job,
+                    status_board.AWAITING_APPROVE,
+                    f"{changes.diff_lines} changed lines, checks {check_state}, "
+                    f"tests {test_state}",
+                )
                 await self.freebuff.abort(env)
                 outcome = ReviewOutcome(
                     job=job,
@@ -650,8 +682,9 @@ class JobRunner:
                 await self.freebuff.abort(env)
             return False, f"Freebuff job failed: {exc}"
         finally:
-            # The reporter belongs to this job: a later job installs its own.
+            # The reporters belong to this job: a later job installs its own.
             self.freebuff.screen_reporter = None
+            self.freebuff.status_reporter = None
 
     # ------------------------------------------------------------- questions
 
@@ -675,6 +708,16 @@ class JobRunner:
                 log.exception("could not post the pane tail for job %s", job.id)
 
         return handle
+
+    def _stage(self, job: Job, stage: str, detail: str = "") -> None:
+        """Report a real stage through the one hook. Never raises into the job."""
+        hook = getattr(self, "on_stage", None)
+        if hook is None:
+            return
+        try:
+            hook(job, stage, detail)
+        except Exception:  # a status update must never alter a job
+            log.exception("status hook failed for job %s", job.id)
 
     def _screen_handler(self, job: Job):
         """The callback for a screen that needs a person, with its pane text."""
@@ -758,6 +801,7 @@ class JobRunner:
             return None
         # The question is already posted: advice may follow it, and that advice
         # can never hold the question up, block /answer or reach the pane.
+        self._stage(job, status_board.WAITING_ON_YOU, screens.QUESTION_BOX)
         self._schedule_suggestion(job, question)
         return None
 
@@ -1003,6 +1047,11 @@ class JobRunner:
         self, job: Job, env: TaskEnvironment, kind: str
     ) -> tuple[str, str, bool | None]:
         _log_separator(job, f"/{kind} in {env.worktree}")
+        self._stage(
+            job,
+            status_board.CHECKS if kind == "check" else status_board.TESTS,
+            f"/{kind} running",
+        )
         if job.kind == "dan":
             # A self-build ships Python and shell, not Swift: the Mac's
             # xcodebuild stages would tell her nothing about her own change.
