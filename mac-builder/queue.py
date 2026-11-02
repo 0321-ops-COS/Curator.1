@@ -37,6 +37,8 @@ class Job:
     # done | failed | cancelled
     status: str = "queued"
     summary: str = ""
+    # What the job's branch was cut from, filled in once it starts.
+    base_label: str = ""
 
     @property
     def duration(self) -> float | None:

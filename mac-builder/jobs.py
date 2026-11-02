@@ -515,6 +515,16 @@ class JobRunner:
                 kind=job.kind,
             )
             self._running_env = env
+            # The base commit belongs on the job card, so the owner can see
+            # which commit the branch was actually cut from.
+            job.base_label = (
+                f"{env.base_branch} @ {env.base_commit}"
+                if env.base_commit
+                else env.base_branch
+            )
+            self._stage(
+                job, status_board.FREEBUFF_WORKING, f"launched from {job.base_label}"
+            )
             reason = await self.freebuff.wait_for_changes(
                 env,
                 job.log_path,

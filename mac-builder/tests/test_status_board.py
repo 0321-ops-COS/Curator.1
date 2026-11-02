@@ -827,5 +827,19 @@ class StatusCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(transport.boards), 1, "no board was posted for a stranger")
 
 
+class BaseLabelTests(unittest.TestCase):
+    def test_the_board_shows_what_the_job_was_cut_from(self) -> None:
+        board = status_board.Board(
+            job_id="j", kind="task", base="origin/freebuff/base @ 0123456"
+        )
+        self.assertIn(
+            "base: origin/freebuff/base @ 0123456", status_board.render(board, now=0)
+        )
+
+    def test_a_job_without_a_known_base_has_no_base_line(self) -> None:
+        board = status_board.Board(job_id="j", kind="task")
+        self.assertNotIn("base:", status_board.render(board, now=0))
+
+
 if __name__ == "__main__":
     unittest.main()
