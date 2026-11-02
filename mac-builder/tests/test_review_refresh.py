@@ -183,6 +183,14 @@ class RoadmapAdvanceTests(unittest.IsolatedAsyncioTestCase):
                                        roadmap.Step("Refactor the parser.", "task")]
             instance._roadmap_jobs, instance._roadmap_job = {}, None
             instance._roadmap_paused = True
+            instance._roadmap_merge = None
+            instance._roadmap_channel_id, instance._roadmap_requester_id = 1, 42
+            instance._target_channel = lambda channel_id: None
+
+            async def merged(branch: str, base: str, kind: str) -> bool:
+                return True
+
+            instance._roadmap_merged = merged
             review_record.save(instance.settings, outcome(worktree))
             approved = jobs.Job(id=JOB_ID, kind="task", title="t", channel_id=1,
                                 requester_id=42, log_path=root / "j.log")
