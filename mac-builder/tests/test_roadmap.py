@@ -46,16 +46,19 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         self.bot._roadmap_steps, self.bot._roadmap_jobs = [], {}
         self.bot._roadmap_job, self.bot._roadmap_channel_id = None, 0
         self.bot._roadmap_requester_id = 0
+        self.bot._roadmap_reminder = {}
         self.bot._target_channel = lambda channel_id: self.channel  # type: ignore[method-assign]
 
-    async def start(self, sheet: str = SHEET, user_id: int = 42) -> SimpleNamespace:
+    async def start(self, sheet: str = SHEET, user_id: int = 42,
+                    action: str | None = None) -> SimpleNamespace:
         async def read() -> bytes:
             return sheet.encode("utf-8")
 
         fake = SimpleNamespace(
             user=SimpleNamespace(id=user_id), channel_id=1,
             response=SimpleNamespace(is_done=lambda: False, send_message=mock.AsyncMock()))
-        await self.bot.cmd_roadmap(fake, sheet=SimpleNamespace(filename="sheet.md", read=read))
+        await self.bot.cmd_roadmap(fake, sheet=SimpleNamespace(filename="sheet.md", read=read),
+                                   action=action)
         return fake
 
     async def test_the_next_job_queues_only_after_the_first_is_approved(self) -> None:
@@ -89,6 +92,45 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         self.bot.queue.submitted[1].status = "approved"
         await self.bot._roadmap_tick()
         self.assertEqual(len(self.bot.queue.submitted), 2)
+
+    async def test_preview_lists_the_plan_and_queues_nothing(self) -> None:
+        fake = await self.start(action="preview")
+        text = fake.response.send_message.await_args.args[0]
+        self.assertEqual(self.bot.queue.submitted, [])
+        self.assertFalse((Path(self._tmp.name) / "roadmap.json").exists(), "nothing was saved")
+        self.assertEqual(text.splitlines()[:2],
+                         ["Preview: 2 job(s), nothing queued or saved", "1. `task` Add a button."])
+        self.assertIn("2. `dan` Refactor the parser.", text)
+
+    async def test_preview_reports_a_bad_sheet(self) -> None:
+        fake = await self.start("# Empty\nNo jobs here.\n", action="preview")
+        text = fake.response.send_message.await_args.args[0]
+        self.assertEqual(self.bot.queue.submitted, [])
+        self.assertIn('no "## Job" heading', text)
+        self.assertFalse((Path(self._tmp.name) / "roadmap.json").exists())
+
+    async def test_a_waiting_review_is_pinged_every_six_hours_until_approved(self) -> None:
+        await self.start()
+        first = self.bot.queue.submitted[0]
+        first.status = "awaiting_review"
+        clock = [1_000_000.0]
+        with mock.patch("bot.time.time", lambda: clock[0]):
+            await self.bot._roadmap_tick()  # schedules the first reminder
+            self.assertEqual(self.channel.send.await_count, 0)
+            clock[0] += 6 * 3600 - 1
+            await self.bot._roadmap_tick()
+            self.assertEqual(self.channel.send.await_count, 0, "not yet six hours")
+            clock[0] += 1
+            await self.bot._roadmap_tick()
+            self.assertEqual(self.channel.send.await_args.args[0],
+                             f"Roadmap waiting on your Approve: `{first.id}`")
+            clock[0] += 6 * 3600
+            await self.bot._roadmap_tick()
+            self.assertEqual(self.channel.send.await_count, 2, "one ping per six hours")
+            first.status = "approved"
+            await self.bot._roadmap_tick()  # the reminder stops; the next job queues
+            self.assertEqual((self.channel.send.await_count, len(self.bot.queue.submitted)),
+                             (2, 2))
 
     async def test_a_ninth_job_and_a_denied_user_queue_nothing(self) -> None:
         fake = await self.start("".join(f"## Job\nTask {n}.\n" for n in range(9)))

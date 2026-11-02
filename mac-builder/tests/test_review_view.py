@@ -67,6 +67,10 @@ class ApproveButtonTests(unittest.TestCase):
     def test_passing_stages_stay_approvable(self) -> None:
         self.assertIn("Approve", self.labels())
 
+    def test_the_buttons_never_time_out(self) -> None:
+        view = bot.ReviewView(SimpleNamespace(), outcome())
+        self.assertIsNone(view.timeout, "a review must wait for a decision however long")
+
     def test_stale_press_is_refused_even_with_a_button(self) -> None:
         self.assertFalse(bot.is_approvable(outcome(check_ok=False)))
         self.assertFalse(bot.is_approvable(outcome(test_ok=False)))
