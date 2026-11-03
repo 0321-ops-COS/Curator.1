@@ -13,6 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import bot  # noqa: E402
+import review_record  # noqa: E402
 import roadmap  # noqa: E402
 from freebuff_runner import FreebuffError  # noqa: E402
 
@@ -472,6 +473,187 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot._roadmap_waiting[42][1], "start")
         await self.command(action="stop")
         self.assertEqual(self.bot._roadmap_waiting, {})
+
+    # --------------------------------------------------------- places of its own
+
+    def record(self, job_id: str, *, status: str = "awaiting_review",
+               branch: str = "freebuff/abc12345") -> Path:
+        """The record a posted review leaves behind, written as the bot writes it."""
+        path = review_record.record_path(self.bot.settings, job_id)
+        path.write_text(json.dumps({
+            "status": status, "saved": 1.0,
+            "job": {"id": job_id, "kind": "task", "title": "Add a button.",
+                    "channel_id": 1, "requester_id": 42, "text": "Add a button.",
+                    "branch": branch, "repo_slug": "",
+                    "log": str(Path(self._tmp.name) / f"{job_id}.log")},
+            "env": {"branch": branch,
+                    "worktree": str(Path(self._tmp.name) / "worktree"),
+                    "base_branch": "freebuff/base", "kind": "task",
+                    "base_commit": "abc1234"},
+            "review": {"verdict": "ok", "notes": "", "check_state": "passed",
+                       "test_state": "passed", "diff_lines": 3,
+                       "changed_files": ["bot.py"], "check_ok": True,
+                       "test_ok": True, "snapshot": "snap"},
+        }), "utf-8")
+        return path
+
+    def restarted(self) -> bot.MacBuilderBot:
+        """A fresh process on the same log dir: only what is on disk comes back."""
+        fresh = bot.MacBuilderBot.__new__(bot.MacBuilderBot)
+        fresh.settings = self.bot.settings
+        fresh.queue, fresh.freebuff, fresh._board = self.bot.queue, self.bot.freebuff, None
+        (fresh._roadmap_steps, fresh._roadmap_channel_id, fresh._roadmap_requester_id,
+         fresh._roadmap_paused) = roadmap.load(Path(self._tmp.name) / "roadmap.json")
+        fresh._roadmap_jobs, fresh._roadmap_job = {}, None
+        fresh._roadmap_reminder, fresh._roadmap_waiting = {}, {}
+        fresh._roadmap_merge = fresh._roadmap_merge_load()
+        fresh._roadmap_restored = len(fresh._roadmap_steps)
+        fresh._roadmap_stuck = ""
+        fresh._roadmap_job = fresh._roadmap_restore_current()
+        fresh._target_channel = lambda channel_id: self.channel
+        fresh._roadmap_merged = self.bot._roadmap_merged
+        return fresh
+
+    def saved(self) -> dict:
+        return json.loads((Path(self._tmp.name) / "roadmap.json").read_text("utf-8"))
+
+    def test_the_current_job_is_saved_with_the_roadmap(self) -> None:
+        path = Path(self._tmp.name) / "roadmap.json"
+        roadmap.save(path, [roadmap.Step("Add a button.", "task", "j1")], current="j1")
+        self.assertEqual(roadmap.current(path), "j1")
+        self.assertEqual(roadmap.load(path)[0][0].job_id, "j1", "the steps still load")
+        path.write_text(json.dumps([{"text": "Old.", "kind": "task", "job_id": "j9"}]))
+        self.assertEqual(roadmap.current(path), "", "an old bare list has no current job")
+
+    async def test_the_queued_job_is_saved_as_the_place_of_the_roadmap(self) -> None:
+        await self.start()
+        first = self.bot.queue.submitted[0]
+        self.assertEqual(self.saved()["current_job"], first.id)
+        first.branch, first.status = "freebuff/abc12345", "approved"
+        self.merged = True
+        await self.bot._roadmap_tick()
+        second = self.bot.queue.submitted[1]
+        self.assertEqual((self.saved()["current_job"], second.kind),
+                         (second.id, "dan"), "the next job becomes the place")
+
+    async def test_a_refreshed_approve_saves_its_job_even_while_paused(self) -> None:
+        await self.start()
+        first = self.bot.queue.submitted[0]
+        await self.command(action="pause")
+        self.record(first.id)
+        first.branch = "freebuff/abc12345"
+        self.bot.review_decided(first, "approved")  # the refreshed card's Approve
+        self.assertEqual(self.saved()["current_job"], first.id)
+        self.assertIs(self.bot._roadmap_job, first)
+
+    async def test_a_restart_restores_the_job_a_paused_roadmap_was_following(self) -> None:
+        await self.start()
+        first = self.bot.queue.submitted[0]
+        first.branch, first.status = "freebuff/abc12345", "approved"
+        self.record(first.id, status="approved")
+        await self.command(action="pause")  # paused before the restart
+        restarted = self.restarted()
+        self.assertTrue(restarted._roadmap_paused)
+        self.assertIsNotNone(restarted._roadmap_job, "the saved job comes back")
+        self.assertEqual((restarted._roadmap_job.id, restarted._roadmap_job.status),
+                         (first.id, "approved"))
+        await restarted._roadmap_tick()
+        self.assertEqual(len(self.bot.queue.submitted), 1, "a pause still holds the tick")
+        restarted._roadmap_set_paused(False)
+        self.merged = True
+        await restarted._roadmap_tick()
+        self.assertEqual([job.kind for job in self.bot.queue.submitted], ["task", "dan"])
+        self.assertIn("Merged: `freebuff/abc12345` is in `freebuff/base`",
+                      self.channel.send.await_args.args[0])
+
+    async def test_a_restart_restores_a_waiting_review_and_keeps_reminding(self) -> None:
+        await self.start()
+        first = self.bot.queue.submitted[0]
+        first.branch, first.status = "freebuff/abc12345", "awaiting_review"
+        self.record(first.id)
+        restarted = self.restarted()
+        self.assertEqual((restarted._roadmap_job.id, restarted._roadmap_job.status),
+                         (first.id, "awaiting_review"))
+        clock = [1_000_000.0]
+        with mock.patch("bot.time.time", lambda: clock[0]):
+            await restarted._roadmap_tick()  # schedules the reminder, posts nothing
+            self.assertEqual(self.channel.send.await_count, 0)
+            clock[0] += 6 * 3600
+            await restarted._roadmap_tick()
+        self.assertIn(f"Roadmap waiting on your Approve: `{first.id}`",
+                      self.channel.send.await_args.args[0])
+        self.assertEqual(len(self.bot.queue.submitted), 1, "nothing was queued")
+
+    async def test_a_restart_does_not_restore_a_job_without_a_saved_review(self) -> None:
+        await self.start()
+        first = self.bot.queue.submitted[0]
+        first.status = "approved"
+        restarted = self.restarted()
+        self.assertIsNone(restarted._roadmap_job, "no record, no job to restore")
+
+    async def test_a_roadmap_with_no_current_job_says_it_is_stuck_once(self) -> None:
+        (Path(self._tmp.name) / "roadmap.json").write_text(json.dumps({
+            "channel_id": 1, "requester_id": 42, "paused": False, "current_job": "",
+            "steps": [{"text": "Add a button.", "kind": "task", "job_id": "gone1234"},
+                      {"text": "Refactor the parser.", "kind": "dan", "job_id": ""}],
+        }), "utf-8")
+        restarted = self.restarted()
+        self.assertIsNone(restarted._roadmap_job)
+        await restarted._roadmap_tick()
+        text = self.channel.send.await_args.args[0]
+        self.assertIn("Roadmap is stuck", text)
+        self.assertIn("1 job(s) left", text)
+        self.assertIn("`gone1234`", text)
+        self.assertIn("/roadmap action:skip", text)
+        await restarted._roadmap_tick()
+        self.assertEqual(self.channel.send.await_count, 1, "said once, not every tick")
+
+    async def test_a_paused_roadmap_says_nothing_about_being_stuck(self) -> None:
+        (Path(self._tmp.name) / "roadmap.json").write_text(json.dumps({
+            "channel_id": 1, "requester_id": 42, "paused": True, "current_job": "",
+            "steps": [{"text": "Add a button.", "kind": "task", "job_id": "gone1234"},
+                      {"text": "Refactor the parser.", "kind": "dan", "job_id": ""}],
+        }), "utf-8")
+        restarted = self.restarted()
+        await restarted._roadmap_tick()
+        self.assertEqual(self.channel.send.await_count, 0, "a pause is silent")
+
+    async def test_skip_needs_a_pause_or_a_stuck_roadmap(self) -> None:
+        await self.start()
+        first = self.bot.queue.submitted[0]
+        first.status = "awaiting_review"
+        text = (await self.command(action="skip")).response.send_message.await_args.args[0]
+        self.assertIn("skip needs the roadmap paused", text)
+        self.assertEqual(self.bot._roadmap_steps[0].job_id, first.id, "nothing was skipped")
+        self.assertEqual(len(self.bot.queue.submitted), 1)
+
+    async def test_skip_marks_the_step_done_and_queues_the_next(self) -> None:
+        await self.start()
+        first = self.bot.queue.submitted[0]
+        await self.command(action="pause")
+        text = (await self.command(action="skip")).response.send_message.await_args.args[0]
+        self.assertIn(f"Skipped `{first.id}`", text)
+        self.assertIn("never pushed or merged", text)
+        second = self.bot.queue.submitted[1]
+        self.assertEqual((second.kind, second.text), ("dan", "Refactor the parser."))
+        self.assertEqual([step.job_id for step in self.bot._roadmap_steps], [second.id])
+        self.assertIs(self.bot._roadmap_job, second)
+        self.assertEqual((self.saved()["current_job"], self.saved()["paused"]),
+                         (second.id, True), "the new job is saved, the pause kept")
+        await self.bot._roadmap_tick()
+        self.assertEqual(len(self.bot.queue.submitted), 2, "the new job still waits")
+
+    async def test_skipping_the_last_job_finishes_the_roadmap(self) -> None:
+        await self.start("## Job\nOnly one.\n")
+        first = self.bot.queue.submitted[0]
+        await self.command(action="pause")
+        text = (await self.command(action="skip")).response.send_message.await_args.args[0]
+        self.assertIn("no job(s) left, roadmap done", text)
+        self.assertEqual((self.bot._roadmap_steps, self.bot._roadmap_job), ([], None))
+        self.assertEqual(self.saved()["steps"], [])
+        self.assertTrue(self.channel.send.await_args.args[0].endswith(
+            "without Approve; nothing was pushed or merged."))
+        self.assertFalse((Path(self._tmp.name) / bot.ROADMAP_MERGE_FILE).exists())
 
 
 if __name__ == "__main__":
