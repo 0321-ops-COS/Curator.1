@@ -194,22 +194,28 @@ def remote_key(url: str) -> str:
     return cleaned.strip("/").lower()
 
 
-def matches_protected(project: Project, path: str) -> bool:
-    """True when a repo-relative path is one this project protects.
+def path_is_protected(entries: Sequence[str], path: str) -> bool:
+    """True when a repo-relative path matches one of these protected entries.
 
     An entry is an exact file, or a directory when it ends with "/" (the
-    directory and everything below it), compared as the diff reports it.
+    directory and everything below it), compared as the diff reports it. The
+    gates share it so /merge reads a project's paths exactly as review does.
     """
     value = rules.normalize_path(path)
     if not value:
         return False
-    for entry in project.protected_paths:
+    for entry in entries:
         wanted = rules.normalize_path(entry)
         if wanted.endswith("/") and value.startswith(wanted):
             return True
         if value in (wanted, wanted.rstrip("/")):
             return True
     return False
+
+
+def matches_protected(project: Project, path: str) -> bool:
+    """True when a repo-relative path is one this project protects."""
+    return path_is_protected(project.protected_paths, path)
 
 
 def protected_violations(

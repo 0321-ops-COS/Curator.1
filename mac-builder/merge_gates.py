@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import projects
 import rules
 
 
@@ -25,6 +26,9 @@ class MergeFacts:
     head_sha: str
     approved_sha: str | None
     dry_run_sha: str | None
+    # A non-default project's own paths; empty for the default project.
+    project_id: str = ""
+    project_protected: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -78,6 +82,10 @@ def _protected(facts: MergeFacts) -> tuple[bool, str]:
     bad = [path for path in paths if _forbidden(path)]
     if bad:
         return False, "protected: " + ", ".join(bad[:3])
+    own = [path for path in paths
+           if projects.path_is_protected(facts.project_protected, path)]
+    if own:
+        return False, f"protected by project {_text(facts.project_id)}: " + ", ".join(own[:3])
     return True, f"{len(paths)} paths, none protected"
 
 def _pull_request(facts: MergeFacts) -> tuple[bool, str]:

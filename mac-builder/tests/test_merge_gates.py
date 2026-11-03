@@ -63,6 +63,18 @@ class GateTests(unittest.TestCase):
         self.assertFalse(gate.passed)
         self.assertIn("ios-app/project.yml", gate.reason)
 
+    def test_a_projects_own_protected_path_is_refused_at_merge(self) -> None:
+        gate = gates(changed_paths=("src/app.py", "secrets/key.txt"),
+                     project_id="notes", project_protected=("secrets/",))["protected paths"]
+        self.assertFalse(gate.passed)
+        self.assertIn("protected by project notes: secrets/key.txt", gate.reason)
+
+    def test_no_project_entries_matches_the_old_behaviour(self) -> None:
+        # The default project passes no entries, so Hustler is checked as before.
+        gate = gates(changed_paths=("secrets/key.txt",))["protected paths"]
+        self.assertTrue(gate.passed)
+        self.assertEqual(gate.reason, "1 paths, none protected")
+
     def test_missing_shas_ask_for_a_dry_run(self) -> None:
         got = evaluate_gates(facts(approved_sha=None, dry_run_sha=None), max_diff_lines=MAX)
         self.assertEqual(next(g.reason for g in got if g.name == "head unchanged"),
