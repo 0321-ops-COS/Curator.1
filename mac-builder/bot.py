@@ -614,6 +614,9 @@ def review_embed(settings: object, outcome: ReviewOutcome) -> discord.Embed:
     embed.add_field(name="Files", value=str(len(outcome.changed_files)), inline=True)
     embed.add_field(name="Job", value=f"`{outcome.job.id}`", inline=True)
     embed.add_field(name="Log", value=f"`{outcome.job.log_path.name}`", inline=False)
+    if outcome.check_lines:  # the project's own checks, one line each
+        embed.add_field(name="Checks", inline=False,
+                        value="\n".join(outcome.check_lines)[:1000])
     if outcome.changed_files:
         embed.add_field(name="Uncommitted", inline=False, value=(
             f"{len(outcome.changed_files)} file(s) not committed yet; Approve "

@@ -68,6 +68,16 @@ class Project:
     def is_default(self) -> bool:
         return self.id == DEFAULT_PROJECT
 
+    @property
+    def uses_checks(self) -> bool:
+        """True when this project's own checks replace the Mac's scripts.
+
+        Only a non-default python project runs checks: ``hustler`` keeps
+        scripts/check.sh and scripts/test.sh whatever its entry says, so a job
+        on the Mac's own checkout behaves exactly as it did before projects.
+        """
+        return not self.is_default and self.kind == "python"
+
     def summary(self) -> str:
         """One line for /project."""
         tail = " (default)" if self.is_default else ""
@@ -182,6 +192,55 @@ def remote_key(url: str) -> str:
     if cleaned.endswith(".git"):
         cleaned = cleaned[:-4]
     return cleaned.strip("/").lower()
+
+
+def matches_protected(project: Project, path: str) -> bool:
+    """True when a repo-relative path is one this project protects.
+
+    An entry is an exact file, or a directory when it ends with "/" (the
+    directory and everything below it), compared as the diff reports it.
+    """
+    value = rules.normalize_path(path)
+    if not value:
+        return False
+    for entry in project.protected_paths:
+        wanted = rules.normalize_path(entry)
+        if wanted.endswith("/") and value.startswith(wanted):
+            return True
+        if value in (wanted, wanted.rstrip("/")):
+            return True
+    return False
+
+
+def protected_violations(
+    project: Project, changed_paths: Sequence[str]
+) -> list[rules.RuleViolation]:
+    """A project's own protected-path refusals, worded like the global ones.
+
+    The caller adds these to ``rules.evaluate_change``'s list: a project may
+    only protect more paths, so the global list still rejects for all.
+    """
+    bad = sorted(
+        {
+            rules.normalize_path(path)
+            for path in changed_paths
+            if matches_protected(project, path)
+        }
+    )
+    violations = [
+        rules.RuleViolation(
+            code="protected_path",
+            detail=f"Protected path changed in project '{project.id}': {path}",
+            path=path,
+        )
+        for path in bad[: rules.MAX_PROTECTED_REPORTS]
+    ]
+    if len(bad) > rules.MAX_PROTECTED_REPORTS:
+        rest = len(bad) - rules.MAX_PROTECTED_REPORTS
+        violations.append(rules.RuleViolation(
+            code="protected_path",
+            detail=f"... and {rest} more protected paths in project '{project.id}'."))
+    return violations
 
 
 def _path_key(path: Path) -> str:
