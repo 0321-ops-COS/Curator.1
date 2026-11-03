@@ -89,16 +89,39 @@ def preview(steps: list[Step]) -> str:
 
 
 def save(path: Path, steps: list[Step], *, channel_id: int = 0,
-         requester_id: int = 0, paused: bool = False) -> None:
-    """Write the roadmap, where it started and whether it is paused."""
+         requester_id: int = 0, paused: bool = False, current: str = "") -> None:
+    """Write the roadmap, where it started, whether it is paused, and its place.
+
+    ``current`` is the job the roadmap is following. It is saved here rather than
+    beside the merge wait, which was only written while the tick ran: a pause
+    before a restart left the roadmap with no place to resume from.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "channel_id": int(channel_id),
         "requester_id": int(requester_id),
         "paused": bool(paused),
+        "current_job": str(current or ""),
         "steps": [asdict(step) for step in steps],
     }
     path.write_text(json.dumps(payload, indent=2), "utf-8")
+
+
+def current(path: Path) -> str:
+    """The job the roadmap was following when it was last saved, or "".
+
+    A file written before this field existed has none and loads as no current
+    job; the roadmap then adopts one from the queue, or says plainly that it is
+    stuck instead of going quiet.
+    """
+    try:
+        data = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    job_id = data.get("current_job")
+    return job_id if isinstance(job_id, str) else ""
 
 
 def load(path: Path) -> tuple[list[Step], int, int, bool]:
