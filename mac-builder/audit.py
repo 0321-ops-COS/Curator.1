@@ -170,3 +170,28 @@ def summary(stamp: str, results: list[TargetResult], filename: str) -> str:
     return (head + (f"\nFailures on: {', '.join(failed)}." if failed else "")
             + f"\nFull report: `{filename}`.\nRead-only: nothing committed, pushed, merged "
             "or approved. CI results are not visible from here.")[:1900]
+
+
+FIX_TEXT_LIMIT = 3800  # a job edited in a Discord modal stays under its 4000
+
+
+def _fix_job(title: str, body: list[str]) -> str:
+    return f"## Job\nkind: task\n" + "\n".join([title, *body])[:FIX_TEXT_LIMIT]
+
+
+def fix_sheet(stamp: str, results: list[TargetResult]) -> str:
+    """One '## Job' per failed branch or stage, ready for /roadmap as a draft."""
+    jobs = []
+    for result in results:
+        if result.error:
+            jobs.append(_fix_job(f"Fix `{result.branch}`: the audit worktree failed",
+                                 [result.error, f"Audit `{stamp}`."]))
+        for stage in result.stages:
+            if stage.state != FAILED:
+                continue
+            tail = [f"- {item}" for item in parse_failures("\n".join(stage.tail))]
+            tail += [f"  {line}" for line in stage.tail[-6:]]
+            jobs.append(_fix_job(f"Fix `{result.branch}` {stage.name}",
+                                 [f"Audit `{stamp}`: the {stage.name} stage failed on "
+                                  f"`{result.branch}`.", *tail]))
+    return "\n\n".join(jobs)
