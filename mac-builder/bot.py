@@ -8,6 +8,7 @@ plain task text for Freebuff; buttons check the allowlist again on every press.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -68,6 +69,8 @@ LOG_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}$")
 BOARD_TICK_SECONDS = 30.0
 # A roadmap review that nobody has approved yet is re-pinged this often.
 ROADMAP_PING_SECONDS = 6 * 3600.0
+# Waiting for a merge survives a restart, so it is written beside the roadmap.
+ROADMAP_MERGE_FILE = "roadmap-merge.json"
 # How long a /roadmap without a sheet waits for that sheet as the next message.
 ROADMAP_WAIT_SECONDS = 10 * 60.0
 # How often the working job's pane is read for the heartbeat.
@@ -744,6 +747,8 @@ class MacBuilderBot(discord.Client):
         self._roadmap_reminder: dict[str, float] = {}
         # Requester id -> (channel id, mode, expiry) for a sheet still to arrive.
         self._roadmap_waiting: dict[int, tuple[int, str, float]] = {}
+        # The approved job whose merge the next sheet job waits for, if any.
+        self._roadmap_merge: dict | None = self._roadmap_merge_load()
         self.runner = jobs.JobRunner(
             settings,
             self.manager,
@@ -1888,32 +1893,188 @@ class MacBuilderBot(discord.Client):
         return job
 
     async def _roadmap_tick(self) -> None:
-        """Queue the next job only after the current one is approved; status only.
+        """Queue the next job only after the current one is approved and merged.
 
-        Paused, it does nothing at all: nothing is queued, pinged or stopped. A
-        job already queued or running keeps going and still waits for Approve.
+        Approve only pushes, so an approved job waits for its branch to reach the
+        authorized branch; the next job queues when the merge is seen. Paused, it
+        does nothing at all: nothing is queued, pinged or stopped. A job already
+        queued or running keeps going and still waits for Approve.
         """
         if self._roadmap_paused:
             return
         if not self._roadmap_job and self._roadmap_steps:
-            self._roadmap_job = self._roadmap_adopt()
+            self._roadmap_job = self._roadmap_adopt() or self._roadmap_merge_job()
         current = self._roadmap_job
         if current is None or not self._roadmap_steps:
             return
         if current.status in roadmap.STOPPED_STATUSES:
             await self._roadmap_finish(
                 f"Roadmap stopped: `{current.id}` {current.status}. Nothing else was queued.")
+        elif current.status == "merged":
+            await self._roadmap_next_step(current)
         elif current.status == "approved":
-            step = next((item for item in self._roadmap_steps if not item.job_id), None)
-            if step is None:
-                await self._roadmap_finish("roadmap done")
-            elif await self._queue_roadmap_step(step) is not None:
-                roadmap.save(self._roadmap_path(), self._roadmap_steps,
-                             channel_id=self._roadmap_channel_id,
-                             requester_id=self._roadmap_requester_id,
-                             paused=self._roadmap_paused)
+            await self._roadmap_wait_merge(current)
         elif current.status == "awaiting_review":
             await self._roadmap_remind(current)
+
+    async def _roadmap_next_step(self, job: Job) -> None:
+        """Queue the next sheet job, or finish the roadmap when there is none."""
+        step = next((item for item in self._roadmap_steps if not item.job_id), None)
+        if step is None:
+            await self._roadmap_finish("roadmap done")
+        elif await self._queue_roadmap_step(step) is not None:
+            roadmap.save(self._roadmap_path(), self._roadmap_steps,
+                         channel_id=self._roadmap_channel_id,
+                         requester_id=self._roadmap_requester_id,
+                         paused=self._roadmap_paused)
+
+    async def _roadmap_wait_merge(self, job: Job) -> None:
+        """Hold the next job until this one's branch is in the authorized branch.
+
+        Approve only pushes; merging is the owner's. So the roadmap says once
+        that it is waiting (with the compare link), re-pings every
+        ROADMAP_PING_SECONDS, and queues the next job only once the branch tip
+        is an ancestor of ``origin/<base>``. That job fetches the base before it
+        cuts its own branch, so it starts with the merge already in it.
+        """
+        branch, base = self._roadmap_merge_target(job)
+        if not branch:
+            log.warning("roadmap job %s has no branch; not waiting for a merge", job.id)
+            await self._roadmap_next_step(job)
+            return
+        merged = await self._roadmap_merged(branch, base, job.kind)
+        wait = self._roadmap_merge
+        if not merged:  # False, or None when the check could not run this tick
+            now = time.time()
+            if wait is None or wait.get("job_id") != job.id:
+                self._roadmap_merge = {
+                    "job_id": job.id, "branch": branch, "base": base,
+                    "kind": job.kind, "since": now,
+                    "due": now + ROADMAP_PING_SECONDS,
+                }
+                self._roadmap_merge_save()
+                await self._roadmap_say(self._roadmap_merge_text(branch, base, job.kind))
+            elif now >= float(wait.get("due") or 0.0):
+                wait["due"] = now + ROADMAP_PING_SECONDS
+                self._roadmap_merge_save()
+                await self._roadmap_say(self._roadmap_merge_text(branch, base, job.kind,
+                                                                first=False))
+            return
+        job.status = "merged"
+        self._roadmap_merge = None
+        self._roadmap_merge_save()
+        await self._roadmap_say(
+            f"Merged: `{branch}` is in `{base}`. Queuing the next job, which is "
+            f"cut from the fetched `{base}`.")
+        await self._roadmap_next_step(job)
+
+    def _roadmap_merge_target(self, job: Job) -> tuple[str, str]:
+        """The branch Approve pushed and the base it has to land in."""
+        record = review_record.load_one(self.settings, job.id) or {}
+        env = record.get("env") or {}
+        branch = str(env.get("branch") or job.branch or "")
+        base = str(env.get("base_branch") or "")
+        if base.startswith("origin/"):
+            base = base[len("origin/"):]
+        return branch, base or self._roadmap_base(job.kind)
+
+    def _roadmap_base(self, kind: str) -> str:
+        """Where a job's work lands: main for a /dan, else the authorized branch."""
+        if kind == "dan":
+            return "main"
+        return str(getattr(self.settings, "authorized_branch", "") or "")
+
+    async def _roadmap_merged(self, branch: str, base: str, kind: str) -> bool | None:
+        """Is ``origin/<branch>`` already in ``origin/<base>``? Fetch only.
+
+        Read-only: a fetch moves remote-tracking refs and nothing else, and no
+        branch, worktree or origin is written. None means the question could not
+        be asked this tick (no remote, a failed fetch); that is not a merge, so
+        nothing is queued and the next tick tries again.
+        """
+        if not branch or not base:
+            return None
+        repo = self.freebuff.self_repo if kind == "dan" else self.freebuff.repo
+        try:
+            await repo.fetch_branch(base)
+            await repo.fetch_branch(branch)
+        except FreebuffError as exc:
+            log.warning("roadmap merge check could not fetch: %s", exc)
+            return None
+        probe = await repo._run(
+            ["merge-base", "--is-ancestor", f"origin/{branch}", f"origin/{base}"],
+            check=False,
+        )
+        if probe.code == 0:
+            return True
+        return False if probe.code == 1 else None
+
+    def _roadmap_merge_text(self, branch: str, base: str, kind: str, *,
+                            first: bool = True) -> str:
+        """The one waiting message and its six-hour re-ping, with the compare link."""
+        link = self._roadmap_merge_link(branch, base, kind)
+        head = (f"Approved. Roadmap waiting for the merge of `{branch}` into `{base}` "
+                "before the next job is queued." if first
+                else f"Still waiting for the merge of `{branch}` into `{base}`.")
+        return head + "\n" + (f"Open and merge: {link}" if link
+                              else "No compare link available")
+
+    def _roadmap_merge_link(self, branch: str, base: str, kind: str) -> str | None:
+        """The GitHub compare link for the waiting branch, when it can exist."""
+        project = getattr(self.settings, "project", None)
+        if project is None:
+            return None
+        remote = (getattr(project, "self_remote", "") if kind == "dan"
+                  else getattr(project, "target_remote", ""))
+        return compare_link.compare_url(remote, base, branch)
+
+    def _roadmap_merge_path(self) -> Path:
+        return Path(self.settings.log_dir) / ROADMAP_MERGE_FILE
+
+    def _roadmap_merge_load(self) -> dict | None:
+        """The merge the roadmap was waiting for before the last restart."""
+        try:
+            data = json.loads(self._roadmap_merge_path().read_text("utf-8"))
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) and data.get("job_id") else None
+
+    def _roadmap_merge_save(self) -> None:
+        """Keep the wait across a restart, or forget it once the merge is seen."""
+        path = self._roadmap_merge_path()
+        try:
+            if self._roadmap_merge is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(json.dumps(self._roadmap_merge, indent=2), "utf-8")
+        except OSError:
+            log.exception("could not save the roadmap merge wait")
+
+    def _roadmap_merge_job(self) -> Job | None:
+        """After a restart: the approved job whose merge the roadmap waits on."""
+        wait = self._roadmap_merge or {}
+        step = next((item for item in self._roadmap_steps
+                     if item.job_id and item.job_id == wait.get("job_id")), None)
+        if step is None or not wait.get("branch"):
+            return None
+        job = Job(id=step.job_id, kind=step.kind, title=step.text[:100],
+                  channel_id=self._roadmap_channel_id,
+                  requester_id=self._roadmap_requester_id,
+                  log_path=Path(self.settings.log_dir) / f"{step.job_id}.log",
+                  text=step.text, branch=str(wait["branch"]))
+        job.status = "approved"
+        self._roadmap_jobs[job.id] = job
+        return job
+
+    async def _roadmap_say(self, text: str) -> None:
+        """One line where the roadmap was started; a lost channel is not fatal."""
+        who = f"<@{self._roadmap_requester_id}> " if self._roadmap_requester_id else ""
+        try:
+            channel = self._target_channel(self._roadmap_channel_id)
+            if channel is not None:
+                await channel.send(who + text)
+        except Exception:
+            log.exception("could not post a roadmap update")
 
     def _roadmap_adopt(self) -> Job | None:
         """After a restart: the roadmap's own job, if the queue still has it."""
@@ -1945,10 +2106,13 @@ class MacBuilderBot(discord.Client):
         """One line per sheet job: its number, kind, job id and recorded state."""
         if not self._roadmap_steps:
             return "No roadmap is queued."
+        waiting = (self._roadmap_merge or {}).get("job_id")
         rows = []
         for number, step in enumerate(self._roadmap_steps, start=1):
             job = self._roadmap_jobs.get(step.job_id)
             state = job.status if job else ("queued" if step.job_id else "waiting")
+            if step.job_id and step.job_id == waiting:
+                state = "approved, waiting for merge"
             rows.append(f"{number}. {step.kind} · `{step.job_id or 'not queued'}` · {state}")
         header = f"Roadmap: {len(rows)} jobs"
         if self._roadmap_paused:
@@ -1961,6 +2125,8 @@ class MacBuilderBot(discord.Client):
         self._roadmap_steps, self._roadmap_job = [], None
         self._roadmap_jobs.clear()
         self._roadmap_reminder.clear()
+        self._roadmap_merge = None
+        self._roadmap_merge_save()
         self._roadmap_paused = False
         roadmap.save(self._roadmap_path(), [])
         if not dropped:
@@ -1970,18 +2136,14 @@ class MacBuilderBot(discord.Client):
 
     async def _roadmap_finish(self, text: str) -> None:
         """End the roadmap and say why, once, where it was started."""
-        channel = self._target_channel(self._roadmap_channel_id)
-        who = f"<@{self._roadmap_requester_id}> " if self._roadmap_requester_id else ""
         self._roadmap_steps, self._roadmap_job = [], None
         self._roadmap_jobs.clear()
         self._roadmap_reminder.clear()
+        self._roadmap_merge = None
+        self._roadmap_merge_save()
         self._roadmap_paused = False
         roadmap.save(self._roadmap_path(), [])
-        try:
-            if channel is not None:
-                await channel.send(who + text)
-        except Exception:
-            log.exception("could not post the roadmap result")
+        await self._roadmap_say(text)
 
     def _board_channel_id(self, job: Job) -> int:
         """Boards live in NOTIFY_CHANNEL_ID, else where the job was started."""

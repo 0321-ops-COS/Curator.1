@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import bot  # noqa: E402
 import roadmap  # noqa: E402
+from freebuff_runner import FreebuffError  # noqa: E402
 
 SHEET = """# Build sheet
 ## Job
@@ -36,10 +37,32 @@ def attachment(text: str, filename: str = "sheet.md") -> SimpleNamespace:
 class FakeQueue:
     def __init__(self) -> None:
         self.submitted: list[object] = []
+        self.running = None
+
+    def waiting(self) -> list[object]:
+        return []
 
     async def submit(self, job: object) -> int:
         self.submitted.append(job)
         return len(self.submitted)
+
+
+class FakeGit:
+    """A checkout that records what the read-only merge check asks it."""
+
+    def __init__(self, *, merged: bool = False) -> None:
+        self.merged, self.fail = merged, False
+        self.fetched: list[str] = []
+        self.runs: list[tuple[str, ...]] = []
+
+    async def fetch_branch(self, branch: str, remote: str = "origin") -> None:
+        self.fetched.append(branch)
+        if self.fail:
+            raise FreebuffError(f"could not fetch {remote} {branch}: boom")
+
+    async def _run(self, args: list[str], *, check: bool = True) -> SimpleNamespace:
+        self.runs.append(tuple(args))
+        return SimpleNamespace(code=0 if self.merged else 1, stdout="", stderr="")
 
 
 class RoadmapTests(unittest.IsolatedAsyncioTestCase):
@@ -48,8 +71,19 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self._tmp.cleanup)
         self.channel = mock.AsyncMock()
         self.bot = bot.MacBuilderBot.__new__(bot.MacBuilderBot)
-        self.bot.settings = SimpleNamespace(log_dir=Path(self._tmp.name), notify_channel_id=None,
-                                            allowed_user_ids=frozenset({42}))
+        self.bot.settings = SimpleNamespace(
+            log_dir=Path(self._tmp.name), notify_channel_id=None,
+            allowed_user_ids=frozenset({42}), authorized_branch="freebuff/base",
+            project=SimpleNamespace(target_remote="https://github.com/o/r",
+                                    self_remote="https://github.com/o/self"))
+        self.bot.freebuff = SimpleNamespace()
+        # What the merge check answers; the git call it makes is pinned below.
+        self.merged: bool | None = False
+
+        async def merged(branch: str, base: str, kind: str) -> bool | None:
+            return self.merged
+
+        self.bot._roadmap_merged = merged
         self.bot.queue = FakeQueue()
         self.bot._board = None
         self.bot._roadmap_steps, self.bot._roadmap_jobs = [], {}
@@ -58,6 +92,7 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         self.bot._roadmap_reminder = {}
         self.bot._roadmap_waiting = {}
         self.bot._roadmap_paused = False
+        self.bot._roadmap_merge = None
         self.bot._target_channel = lambda channel_id: self.channel  # type: ignore[method-assign]
 
     async def start(self, sheet: str = SHEET, user_id: int = 42,
@@ -96,7 +131,13 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         first.status = "awaiting_review"
         await self.bot._roadmap_tick()
         self.assertEqual(len(self.bot.queue.submitted), 1, "a review is not an approval")
+        first.branch = "freebuff/abc12345"
         first.status = "approved"
+        await self.bot._roadmap_tick()
+        self.assertEqual(len(self.bot.queue.submitted), 1, "the next job waits for the merge")
+        self.assertIn("waiting for the merge of `freebuff/abc12345`",
+                      self.channel.send.await_args.args[0])
+        self.merged = True
         await self.bot._roadmap_tick()
         second = self.bot.queue.submitted[1]
         self.assertEqual((second.kind, second.text), ("dan", "Refactor the parser."))
@@ -192,10 +233,12 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
             clock[0] += 6 * 3600
             await self.bot._roadmap_tick()
             self.assertEqual(self.channel.send.await_count, 2, "one ping per six hours")
+            first.branch = "freebuff/abc12345"
             first.status = "approved"
-            await self.bot._roadmap_tick()  # the reminder stops; the next job queues
+            self.merged = True
+            await self.bot._roadmap_tick()  # the reminder stops; the merge lets the next go
             self.assertEqual((self.channel.send.await_count, len(self.bot.queue.submitted)),
-                             (2, 2))
+                             (3, 2), "one merge message, and then the next job queues")
 
     def test_a_saved_roadmap_loads_back_with_its_channel(self) -> None:
         path = Path(self._tmp.name) / "roadmap.json"
@@ -311,10 +354,12 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         reply = (await self.command(action="pause")).response.send_message.await_args.args[0]
         self.assertIn("paused, 1 job(s) left", reply)
         self.assertIn("paused, 1 job(s) left", self.bot._roadmap_status())
+        first.branch = "freebuff/abc12345"
         first.status = "approved"
         await self.bot._roadmap_tick()
         self.assertEqual(len(self.bot.queue.submitted), 1, "the next job waits while paused")
         self.assertEqual(first.status, "approved", "the queued job is left alone")
+        self.merged = True
         self.assertIn("Roadmap resumed", (await self.command(action="resume"))
                       .response.send_message.await_args.args[0])
         await self.bot._roadmap_tick()
@@ -337,6 +382,89 @@ class RoadmapTests(unittest.IsolatedAsyncioTestCase):
         steps, channel_id, requester_id, paused = roadmap.load(path)
         self.assertEqual(([step.text for step in steps], channel_id, requester_id, paused),
                          (["Old job."], 0, 0, False))
+
+    async def test_the_next_job_waits_for_the_merge_and_pings_every_six_hours(self) -> None:
+        await self.start()
+        first = self.bot.queue.submitted[0]
+        first.branch = "freebuff/abc12345"
+        first.status = "approved"
+        clock = [1_000_000.0]
+        with mock.patch("bot.time.time", lambda: clock[0]):
+            await self.bot._roadmap_tick()
+            self.assertEqual(len(self.bot.queue.submitted), 1, "nothing queues before the merge")
+            text = self.channel.send.await_args.args[0]
+            self.assertIn("waiting for the merge of `freebuff/abc12345` into `freebuff/base`",
+                          text)
+            self.assertIn("https://github.com/o/r/compare/freebuff/base...freebuff/abc12345",
+                          text)
+            self.assertIn(f"`{first.id}` · approved, waiting for merge",
+                          self.bot._roadmap_status())
+            clock[0] += 6 * 3600 - 1
+            await self.bot._roadmap_tick()
+            self.assertEqual(self.channel.send.await_count, 1, "one message when waiting starts")
+            clock[0] += 1
+            await self.bot._roadmap_tick()
+            self.assertEqual(self.channel.send.await_count, 2, "then one ping every six hours")
+            self.assertIn("Still waiting", self.channel.send.await_args.args[0])
+
+    async def test_a_seen_merge_queues_the_next_job_once(self) -> None:
+        await self.start()
+        first = self.bot.queue.submitted[0]
+        first.branch = "freebuff/abc12345"
+        first.status = "approved"
+        await self.bot._roadmap_tick()  # waiting
+        self.merged = True
+        await self.bot._roadmap_tick()  # merge seen
+        self.assertEqual((first.status, [job.kind for job in self.bot.queue.submitted]),
+                         ("merged", ["task", "dan"]))
+        text = self.channel.send.await_args.args[0]
+        self.assertIn("Merged: `freebuff/abc12345` is in `freebuff/base`", text)
+        self.assertIn("cut from the fetched `freebuff/base`", text)
+        self.assertFalse((Path(self._tmp.name) / bot.ROADMAP_MERGE_FILE).exists())
+        await self.bot._roadmap_tick()
+        self.assertEqual(len(self.bot.queue.submitted), 2, "the new job is not approved yet")
+
+    async def test_the_merge_check_only_fetches_and_asks_git(self) -> None:
+        repo = FakeGit(merged=True)
+        self.bot.freebuff = SimpleNamespace(repo=repo, self_repo=repo)
+        check = bot.MacBuilderBot._roadmap_merged.__get__(self.bot)
+        self.assertTrue(await check("freebuff/abc12345", "freebuff/base", "task"))
+        self.assertEqual(repo.fetched, ["freebuff/base", "freebuff/abc12345"])
+        self.assertEqual(repo.runs,
+                         [("merge-base", "--is-ancestor", "origin/freebuff/abc12345",
+                           "origin/freebuff/base")])
+        repo.merged = False
+        self.assertFalse(await check("freebuff/abc12345", "freebuff/base", "task"))
+        repo.fail = True
+        self.assertIsNone(await check("freebuff/abc12345", "freebuff/base", "task"),
+                          "a failed fetch is not a merge and queues nothing")
+
+    async def test_a_restart_keeps_waiting_for_the_same_merge(self) -> None:
+        await self.start()
+        first = self.bot.queue.submitted[0]
+        first.branch = "freebuff/abc12345"
+        first.status = "approved"
+        await self.bot._roadmap_tick()
+        self.assertTrue((Path(self._tmp.name) / bot.ROADMAP_MERGE_FILE).exists())
+
+        restarted = bot.MacBuilderBot.__new__(bot.MacBuilderBot)
+        restarted.settings = self.bot.settings
+        restarted.queue = self.bot.queue
+        restarted._roadmap_steps = self.bot._roadmap_steps
+        restarted._roadmap_jobs, restarted._roadmap_job = {}, None
+        restarted._roadmap_channel_id = self.bot._roadmap_channel_id
+        restarted._roadmap_requester_id = 42
+        restarted._roadmap_paused = False
+        restarted._roadmap_reminder, restarted._roadmap_waiting = {}, {}
+        restarted._roadmap_merge = restarted._roadmap_merge_load()
+        restarted._target_channel = lambda channel_id: self.channel
+        restarted._roadmap_merged = self.bot._roadmap_merged
+        await restarted._roadmap_tick()
+        self.assertEqual(len(self.bot.queue.submitted), 1, "a restart waits for the same merge")
+        self.assertIn(f"`{first.id}` · approved, waiting for merge", restarted._roadmap_status())
+        self.merged = True
+        await restarted._roadmap_tick()
+        self.assertEqual(len(self.bot.queue.submitted), 2)
 
     async def test_a_new_roadmap_replaces_the_waiting_one_and_stop_clears_it(self) -> None:
         await self.command(action="preview")
