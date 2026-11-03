@@ -307,6 +307,13 @@ async def run_project_checks(
     return tuple(results)
 
 
+def project_check_note(project: projects.Project | None) -> str:
+    """What /check ran, for a forced-revise note: one command, or neutral ""."""
+    if project is None or not project.uses_checks:
+        return "swift test"  # the iOS scripts, worded exactly as they always were
+    return project.checks[0][:60] if len(project.checks) == 1 else ""
+
+
 def resolve_branch(settings: object, value: str | None) -> str:
     """The branch /build or /check will use, or ValueError saying why not.
 
@@ -934,7 +941,8 @@ class JobRunner:
                 verdict = review.verdict
                 notes = review.notes
                 forced = rules.force_revise_reason(
-                    check_ok, test_ok, dan=job.kind == "dan"
+                    check_ok, test_ok, dan=job.kind == "dan",
+                    check_note=project_check_note(self._project_for(job)),
                 )
                 if forced:
                     verdict = "revise"

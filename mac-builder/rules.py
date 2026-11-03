@@ -338,17 +338,24 @@ def assert_not_main(branch: str) -> str:
 
 
 def force_revise_reason(
-    check_ok: bool, test_ok: bool | None, *, dan: bool = False
+    check_ok: bool, test_ok: bool | None, *, dan: bool = False,
+    check_note: str = "swift test",
 ) -> str | None:
     """Return a hard reason to revise when a real check or test failed.
 
     `test_ok=None` means the test stage was unavailable (for example the Xcode
     scheme has no test action), which is reported but cannot fail a diff. A dan
-    job runs different stages, so the message names those instead.
+    job runs different stages, so the message names those instead. `check_note`
+    is what /check ran: a project's own single command, or "" when the stage has
+    no single command to name.
     """
     failures = []
     if not check_ok:
-        failures.append("/check (unittest discover) failed" if dan else "/check (swift test) failed")
+        if dan:
+            failures.append("/check (unittest discover) failed")
+        else:
+            note = check_note.strip()
+            failures.append(f"/check ({note}) failed" if note else "/check failed")
     if test_ok is False:
         failures.append(
             "/test (py_compile + bash -n) failed"

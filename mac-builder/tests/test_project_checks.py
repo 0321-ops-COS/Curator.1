@@ -162,6 +162,8 @@ class ProjectChecksTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(posted[0].verdict, "approve")
         self.assertIn("failed (exit 7)", posted[0].check_state)
         self.assertIn("Fix the failure", posted[0].notes)
+        self.assertIn("/check (printf boom; exit 7) failed", posted[0].notes)
+        self.assertNotIn("swift test", posted[0].notes)  # not a project check
         self.assertIn("- printf boom; exit 7: failed (exit 7)", posted[0].notes)
 
     async def test_a_protected_path_in_a_non_default_project_is_rejected(self) -> None:
@@ -216,6 +218,8 @@ class ProjectChecksTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(posted[0].check_state, "no checks configured")
         self.assertEqual(posted[0].check_lines, ("no checks configured",))
         self.assertNotEqual(posted[0].verdict, "approve")
+        self.assertIn("/check failed.", posted[0].notes)  # nothing single to name
+        self.assertNotIn("swift test", posted[0].notes)
         self.assertIn("- no checks configured", posted[0].notes)
 
     async def test_a_default_projects_protected_paths_are_ignored(self) -> None:

@@ -124,6 +124,17 @@ class VerdictTests(unittest.TestCase):
     def test_failed_check_forces_revise(self) -> None:
         self.assertIn("/check", rules.force_revise_reason(False, True) or "")
 
+    def test_the_check_wording_follows_the_project(self) -> None:
+        # Hustler's wording must not change; a project's own check names its one
+        # command, and a stage with no single command stays neutral.
+        self.assertIn("/check (swift test) failed",
+                      rules.force_revise_reason(False, True) or "")
+        self.assertIn("/check (pytest -q) failed",
+                      rules.force_revise_reason(False, True, check_note="pytest -q") or "")
+        neutral = rules.force_revise_reason(False, True, check_note="") or ""
+        self.assertIn("/check failed. Fix the failure", neutral)
+        self.assertNotIn("swift", neutral)
+
     def test_failed_test_forces_revise(self) -> None:
         self.assertIn("/test", rules.force_revise_reason(True, False) or "")
 
