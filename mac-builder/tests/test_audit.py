@@ -12,8 +12,29 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import audit  # noqa: E402
+import roadmap  # noqa: E402
+from manager import (Manager, ManagerUnavailable,  # noqa: E402
+                     build_cause_messages, parse_cause)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def failed_stage(name: str = "check", fixture: str = "audit-check.log") -> audit.StageResult:
+    tail = (FIXTURES / fixture).read_text("utf-8").splitlines()
+    return audit.StageResult(name, audit.FAILED, 65, tail=tail)
+
+
+class FakeManager:
+    """Only the cause call; the real Manager owns the HTTP and JSON parsing."""
+
+    def __init__(self, reply: str = "", error: Exception | None = None) -> None:
+        self.reply, self.error, self.calls = reply, error, []
+
+    async def cause(self, **kwargs) -> str:
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return self.reply
 
 
 class TargetTests(unittest.TestCase):
@@ -106,3 +127,80 @@ class ReportTests(unittest.TestCase):
         self.assertIn("`freebuff/aaaa` drift", text)
         self.assertIn("passed 1 · failed 1 · unavailable 1 · not run 1",
                       audit.summary("20260101-000000", results, "audit-x.md"))
+
+
+class CauseTests(unittest.IsolatedAsyncioTestCase):
+    """The model's opinion sits beside the raw errors, never instead of them."""
+
+    async def test_every_failed_stage_gets_one_opinion_with_fixture_evidence(self) -> None:
+        results = [audit.TargetResult("freebuff/aaaa", [failed_stage(),
+                                                        audit.StageResult("build", audit.PASSED, 0)])]
+        manager = FakeManager("A theme symbol is referenced but never defined.")
+        await audit.add_causes(manager, results)
+        self.assertEqual(manager.calls[0]["stage"], "check")
+        self.assertTrue(any("RootView.swift:42" in line for line in manager.calls[0]["errors"]))
+        self.assertIn("cannot find 'theme' in scope", manager.calls[0]["tail"])
+        text = audit.report("20260101-000000", results, "freebuff/base")
+        self.assertIn("cannot find 'theme' in scope", text)
+        self.assertIn("likely cause (model opinion) for check: "
+                      "A theme symbol is referenced but never defined.", text)
+        self.assertEqual(len(manager.calls), 1, "a passing stage is never asked about")
+
+    async def test_an_unavailable_manager_says_so_and_keeps_the_evidence(self) -> None:
+        results = [audit.TargetResult("freebuff/aaaa", [failed_stage()])]
+        await audit.add_causes(FakeManager(error=ManagerUnavailable("no key")), results)
+        text = audit.report("20260101-000000", results, "freebuff/base")
+        self.assertIn("manager unavailable", text)
+        self.assertIn("cannot find 'theme' in scope", text)
+
+
+class ManagerCauseTests(unittest.IsolatedAsyncioTestCase):
+    """The cause reuses the manager's gate, JSON parsing and redaction."""
+
+    async def test_owner_only_evidence_is_not_sent_to_the_model(self) -> None:
+        self.assertEqual(await Manager().cause(stage="check", errors=[],
+                                               tail="change project.yml", diff_stat=""), "")
+
+    def test_the_cause_json_is_parsed_and_the_evidence_is_redacted(self) -> None:
+        self.assertEqual(parse_cause('{"cause":"Fix the theme."}'), "Fix the theme.")
+        self.assertEqual(parse_cause("prose, not json"), "")
+        messages = build_cause_messages(stage="check", errors=["x"],
+                                        tail="api_key=supersecret123", diff_stat="")
+        self.assertNotIn("supersecret123", messages[1]["content"])
+
+
+class SheetTests(unittest.TestCase):
+    """One parseable job per distinct failure, the authorized branch first."""
+
+    def test_jobs_are_parseable_and_ordered_with_the_rules_block(self) -> None:
+        results = [
+            audit.TargetResult("freebuff/job", [failed_stage("build", "audit-drift.log")]),
+            audit.TargetResult("freebuff/base", [failed_stage()]),
+            audit.TargetResult("freebuff/base", [audit.StageResult("drift", audit.PASSED, 0)]),
+            audit.TargetResult("freebuff/gone", error="could not fetch it: nope"),
+        ]
+        steps = roadmap.parse(audit.fix_sheet("20260101-000000", results, "freebuff/base"))
+        self.assertEqual([step.kind for step in steps], ["task", "task", "task"])
+        self.assertIn("freebuff/base", steps[0].text)
+        self.assertIn("freebuff/job", steps[1].text)
+        self.assertIn("freebuff/gone", steps[2].text)
+        for step in steps:
+            self.assertIn("Rules for this job", step.text)
+            self.assertIn("project.yml", step.text)
+            self.assertIn("under 300 lines", step.text)
+            self.assertIn("real test results", step.text)
+            self.assertLessEqual(len(step.text), 4000)
+        self.assertIn("cannot find 'theme' in scope", steps[0].text)
+
+    def test_a_long_failure_keeps_the_rules_and_the_limit(self) -> None:
+        long = audit.StageResult("test", audit.FAILED, 65,
+                                 tail=[f"x.swift:{n}: error: boom" for n in range(300)])
+        step = roadmap.parse(audit.fix_sheet(
+            "s", [audit.TargetResult("freebuff/base", [long])], "freebuff/base"))[0]
+        self.assertLessEqual(len(step.text), 4000)
+        self.assertIn("Rules for this job", step.text)
+        self.assertIn("under 300 lines", step.text)
+
+    def test_nothing_failed_means_no_sheet(self) -> None:
+        results = [audit.TargetResult("freebuff/base", [audit.StageResult("check", audit.PASSED, 0)])]
+        self.assertEqual(audit.fix_sheet("s", results, "freebuff/base"), "")

@@ -9,12 +9,16 @@ logs with plain patterns, never by asking the model, and CI is never queried.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from manager import ManagerUnavailable
+
+log = logging.getLogger(__name__)
 KIND = "audit"
 STAGES = ("check", "build", "test", "drift")
 PASSED, FAILED, UNAVAILABLE, NOT_RUN = "passed", "failed", "unavailable", "not run"
@@ -34,6 +38,8 @@ class StageResult:
     seconds: float = 0.0
     tail: list[str] = field(default_factory=list)
     note: str = ""
+    cause: str = ""  # the model's opinion, never instead of the raw errors
+    cause_error: str = ""
 
 
 @dataclass
@@ -41,6 +47,7 @@ class TargetResult:
     branch: str
     stages: list[StageResult] = field(default_factory=list)
     error: str = ""
+    diff_stat: str = ""
 
 
 def safe_name(branch: str) -> str:
@@ -125,6 +132,63 @@ def parse_failures(raw: object) -> list[str]:
     return found[:MAX_FAILURES]
 
 
+async def add_causes(manager, results: list[TargetResult]) -> None:
+    """One plain-words opinion per failed stage; the raw errors always stay."""
+    for result in results:
+        for stage in result.stages:
+            if stage.state != FAILED:
+                continue
+            try:
+                stage.cause = await manager.cause(
+                    stage=stage.name, errors=parse_failures("\n".join(stage.tail)),
+                    tail="\n".join(stage.tail), diff_stat=result.diff_stat)
+            except ManagerUnavailable:
+                stage.cause_error = "manager unavailable"
+            except Exception:  # an opinion must never fail an audit
+                log.exception("could not get a cause for %s", stage.name)
+                stage.cause_error = "manager error"
+
+
+JOB_LIMIT = 3800  # one job stays editable in a Discord modal, which holds 4000
+RULES = """Rules for this job
+- Do not change project.yml, *.xcconfig, .github/, .env* or signing/provisioning files.
+- Keep the change under 300 lines.
+- Report the real test results; never weaken, skip or delete a test."""
+
+
+def _job(stage: StageResult, result: TargetResult, stamp: str) -> str:
+    """One sheet job: the stage, its exact errors, the branch and what to change."""
+    errors = parse_failures("\n".join(stage.tail)) or stage.tail[-8:]
+    body = "\n".join([
+        "## Job", "kind: task",
+        f"Fix the {stage.name} failure on `{result.branch}`",
+        f"Audit `{stamp}` ran {stage.name} on `{result.branch}` and it failed.",
+        "Exact error lines:", *[f"- {item}" for item in errors],
+        "What to change: fix the errors above and rerun the same stage; if you cannot, "
+        "say plainly what is still wrong instead of changing the test."])
+    return (body[:JOB_LIMIT - len(RULES) - 2].rstrip() + "\n\n" + RULES)[:JOB_LIMIT]
+
+
+def fix_sheet(stamp: str, results: list[TargetResult], base: str = "") -> str:
+    """One job per distinct failure, the authorized branch's first; '' if none.
+
+    `base` orders and dedupes the jobs; without it the results keep their order.
+    """
+    jobs: list[str] = []
+    seen: set[tuple[str, ...]] = set()
+    for result in sorted(results, key=lambda item: item.branch != base):
+        broken = [stage for stage in result.stages if stage.state == FAILED]
+        if result.error:
+            broken.append(StageResult("worktree", FAILED, tail=[result.error]))
+        for stage in broken:
+            key = (result.branch, stage.name, *parse_failures("\n".join(stage.tail)))
+            if key in seen:
+                continue
+            seen.add(key)
+            jobs.append(_job(stage, result, stamp))
+    return "\n\n".join(jobs)
+
+
 def report(stamp: str, results: list[TargetResult], base: str) -> str:
     """The markdown report: a table per branch, then one section per state."""
     lines = [f"# Audit {stamp}", "",
@@ -146,6 +210,12 @@ def report(stamp: str, results: list[TargetResult], base: str) -> str:
             buckets.setdefault(stage.state, []).append(f"`{result.branch}` {name}")
         failures = parse_failures("\n".join("\n".join(stage.tail) for stage in result.stages))
         lines += ["", "Failures:", *[f"- {item}" for item in failures]] if failures else [""]
+        for stage in result.stages:
+            if stage.cause:
+                lines += [f"- likely cause (model opinion) for {stage.name}: {stage.cause}"]
+            elif stage.cause_error:
+                lines += [f"- likely cause (model opinion) for {stage.name}: "
+                          f"{stage.cause_error}; see the raw errors above."]
     for state, title in ((PASSED, "Passed"), (FAILED, "Failed"), (UNAVAILABLE, "Unavailable"),
                          (NOT_RUN, "Not run")):
         lines += ["", f"## {title}", ""]
@@ -171,27 +241,3 @@ def summary(stamp: str, results: list[TargetResult], filename: str) -> str:
             + f"\nFull report: `{filename}`.\nRead-only: nothing committed, pushed, merged "
             "or approved. CI results are not visible from here.")[:1900]
 
-
-FIX_TEXT_LIMIT = 3800  # a job edited in a Discord modal stays under its 4000
-
-
-def _fix_job(title: str, body: list[str]) -> str:
-    return f"## Job\nkind: task\n" + "\n".join([title, *body])[:FIX_TEXT_LIMIT]
-
-
-def fix_sheet(stamp: str, results: list[TargetResult]) -> str:
-    """One '## Job' per failed branch or stage, ready for /roadmap as a draft."""
-    jobs = []
-    for result in results:
-        if result.error:
-            jobs.append(_fix_job(f"Fix `{result.branch}`: the audit worktree failed",
-                                 [result.error, f"Audit `{stamp}`."]))
-        for stage in result.stages:
-            if stage.state != FAILED:
-                continue
-            tail = [f"- {item}" for item in parse_failures("\n".join(stage.tail))]
-            tail += [f"  {line}" for line in stage.tail[-6:]]
-            jobs.append(_fix_job(f"Fix `{result.branch}` {stage.name}",
-                                 [f"Audit `{stamp}`: the {stage.name} stage failed on "
-                                  f"`{result.branch}`.", *tail]))
-    return "\n\n".join(jobs)
