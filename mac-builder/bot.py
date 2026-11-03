@@ -58,6 +58,7 @@ import screens  # noqa: E402
 import selftest  # noqa: E402
 import heartbeat
 import status_board  # noqa: E402
+import update_watch  # noqa: E402
 from freebuff_runner import FreebuffError, FreebuffRunner  # noqa: E402
 from jobs import Job, ReviewOutcome, tail_text  # noqa: E402
 from manager import Manager, ManagerUnavailable  # noqa: E402
@@ -308,6 +309,8 @@ class Settings:
     stall_no_output_seconds: float = 300.0
     # While Freebuff works, one short digest ping this often; 0 turns it off.
     status_digest_seconds: float = 900.0
+    # How often to look for newer code on origin; 0 disables the check.
+    update_check_seconds: float = 600.0
     # Filled in by main() after the startup preflight; None before that.
     project: "project_context.ProjectContext | None" = None
 
@@ -397,6 +400,7 @@ class Settings:
             stall_no_output_seconds=_env_float("STALL_NO_OUTPUT_SECONDS", 300.0),
             status_pings=_env_bool("STATUS_PINGS", True),
             status_digest_seconds=_env_float("STATUS_DIGEST_SECONDS", 900.0),
+            update_check_seconds=_env_float("UPDATE_CHECK_SECONDS", 600.0),
         )
         if settings.max_pending_jobs < 1:
             raise ConfigError("MAX_PENDING_JOBS must be at least 1")
@@ -418,6 +422,8 @@ class Settings:
             raise ConfigError("STALL_NO_OUTPUT_SECONDS must be at least 1")
         if settings.status_digest_seconds < 0:
             raise ConfigError("STATUS_DIGEST_SECONDS must be 0 or more")
+        if settings.update_check_seconds < 0:
+            raise ConfigError("UPDATE_CHECK_SECONDS must be 0 or more")
         return settings
 
 
@@ -711,6 +717,14 @@ class MacBuilderBot(discord.Client):
         intents.guild_messages = True
         super().__init__(intents=intents)
         self.settings = settings
+        # Read-only: fetch and inspect only, never a pull or a checkout.
+        self._update_watcher = update_watch.UpdateWatcher(
+            root=REPO_ROOT,
+            repo_dir=getattr(settings, "repo_dir", REPO_ROOT),
+            branch=getattr(settings, "authorized_branch", ""),
+            interval_seconds=getattr(settings, "update_check_seconds", 600.0),
+        )
+        self._update_ticker: asyncio.Task[None] | None = None
         self.tree = app_commands.CommandTree(self)
         self.manager = Manager(
             api_base=settings.manager_api_base,
@@ -899,6 +913,10 @@ class MacBuilderBot(discord.Client):
             self._board_ticker = asyncio.create_task(self._board_loop())
         if self._heartbeat_ticker is None or self._heartbeat_ticker.done():
             self._heartbeat_ticker = asyncio.create_task(self._heartbeat_loop())
+        if self._update_watcher.enabled and (
+            self._update_ticker is None or self._update_ticker.done()
+        ):
+            self._update_ticker = asyncio.create_task(self._update_loop())
         await self.sync_commands()
         if not self._queue_started:
             self.queue.start()
@@ -1011,8 +1029,8 @@ class MacBuilderBot(discord.Client):
                 log.warning("could not announce the restored roadmap")
 
     async def close(self) -> None:
-        tickers = [self._board_ticker, self._heartbeat_ticker]
-        self._board_ticker = self._heartbeat_ticker = None
+        tickers = [self._board_ticker, self._heartbeat_ticker, self._update_ticker]
+        self._board_ticker = self._heartbeat_ticker = self._update_ticker = None
         for ticker in tickers:
             if ticker is not None:
                 ticker.cancel()
@@ -1084,7 +1102,9 @@ class MacBuilderBot(discord.Client):
         ctx = getattr(self.settings, "project", None)
         if ctx is not None:
             lines += [f"project: {ctx.project_name}", f"target repo: {ctx.target_remote}"]
+        watcher = getattr(self, "_update_watcher", None)
         lines += [
+            f"update: {watcher.status_line() if watcher else 'not checked yet'}",
             f"queue: {snapshot['pending']} waiting",
             f"authorized branch: {self.settings.authorized_branch}",
             f"manager: {'configured' if self.manager.enabled else 'not configured'}",
@@ -2268,6 +2288,28 @@ class MacBuilderBot(discord.Client):
                 await self._board.transport.send(channel_id, action.text)
             except Exception:  # a message must never touch the job
                 log.warning("could not post a heartbeat for %s", board.job_id)
+
+    async def _update_loop(self) -> None:
+        """UPDATE_CHECK_SECONDS: read-only git in a thread, then the notices.
+
+        A failed check or post is logged and never stops the bot, and nothing
+        here changes a branch or a worktree.
+        """
+        while True:
+            try:
+                notices = await asyncio.to_thread(self._update_watcher.check)
+                for text in notices:
+                    channel_id = getattr(self.settings, "notify_channel_id", None)
+                    channel = self._target_channel(channel_id) if channel_id else None
+                    if channel is None:
+                        log.warning("no NOTIFY_CHANNEL_ID for an update notice")
+                        continue
+                    await channel.send(text)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # an update notice must never stop the bot
+                log.exception("update check failed")
+            await asyncio.sleep(max(1.0, self._update_watcher.interval))
 
     def _target_channel(self, channel_id: int) -> discord.abc.Messageable | None:
         channel = self.get_channel(channel_id) if channel_id else None

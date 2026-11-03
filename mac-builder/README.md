@@ -263,6 +263,7 @@ are kept for inspection.
 | `PROJECT_NAME`, `BUILDER_NAME`, `BOT_NAME` | Labels for `/project` and the manager; default to the target folder name, `Freebuff`, `Melisa`. |
 | `LOG_DIR` | Job logs; default `mac-builder/logs`. |
 | `WORKTREE_ROOT` | Per-task worktrees; default `~/mac-builder-worktrees`. |
+| `UPDATE_CHECK_SECONDS` | How often to check origin for newer code (default 600); 0 disables it. Read-only: a check never pulls, resets or checks anything out. |
 | `HUSTLERCORE_DIR` | Swift package path; default `ios-app/HustlerCore`. |
 | `XCODE_PROJECT`, `XCODE_SCHEME` | `ios-app/Hustler.xcodeproj`, `Hustler`. |
 | `SIMULATOR_NAME` | Preferred simulator; falls back to first available iPhone. |
