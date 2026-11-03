@@ -42,6 +42,7 @@ import discord  # noqa: E402
 from discord import app_commands  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
+import audit  # noqa: E402
 import compare_link  # noqa: E402
 import github_client  # noqa: E402
 import jobs  # noqa: E402
@@ -762,7 +763,7 @@ class MacBuilderBot(discord.Client):
             on_stage=self._on_stage,
         )
         self.queue = jobs.JobQueue(
-            self.runner.run,
+            self._run_job,
             max_pending=settings.max_pending_jobs,
             on_crash=self._on_job_crash,
         )
@@ -888,6 +889,9 @@ class MacBuilderBot(discord.Client):
         self.tree.add_command(app_commands.Command(
             name="review", callback=self.cmd_review,
             description="Re-post live Approve/Reject cards for reviews waiting on you"))
+        self.tree.add_command(app_commands.Command(
+            name="audit", callback=self.cmd_audit,
+            description="Run check, build, test and the parity drift on detached worktrees"))
         self.tree.add_command(app_commands.Command(
             name="selftest", callback=self.cmd_selftest, description="Run each stage on fakes"))
         self.tree.interaction_check = self.require_allowed
@@ -2421,6 +2425,112 @@ class MacBuilderBot(discord.Client):
         elif job.duration is not None:
             embed.add_field(name="Took", value=f"{job.duration:.0f}s", inline=True)
         await channel.send(embed=embed)
+
+    # ----------------------------------------------------------------- audit
+
+    @app_commands.describe(branch="Audit only this branch; empty audits the base and unmerged reviews")
+    async def cmd_audit(
+        self, interaction: discord.Interaction, branch: Optional[str] = None
+    ) -> None:
+        """Queue one read-only audit; it waits behind any running Freebuff job."""
+        if not await self.require_allowed(interaction):
+            return
+        await interaction.response.defer(thinking=True)
+        try:
+            requested = jobs.resolve_branch(self.settings, branch) if (branch or "").strip() else ""
+            picked = await self._audit_targets(requested)
+        except (ValueError, FreebuffError) as exc:
+            await interaction.followup.send(f"Cannot audit that: {exc}")
+            return
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        job = jobs.make_job(
+            self.settings, kind=audit.KIND, title=f"audit {len(picked)} branch(es)",
+            channel_id=interaction.channel_id or 0, requester_id=interaction.user.id,
+            text=json.dumps({"stamp": stamp, "targets": picked}))
+        try:
+            position = await self.queue.submit(job)
+        except jobs.QueueFull as exc:
+            await interaction.followup.send(str(exc))
+            return
+        names = ", ".join(f"`{name}`" for name in picked)
+        await interaction.followup.send(
+            f"Audit `{job.id}` queued (position {position}) for {names}. Check, build, test "
+            f"and the parity drift run one after another in a detached worktree under "
+            f"`audit-{stamp}`, which is removed again. Read-only: nothing is committed, "
+            "pushed, merged or approved.")
+
+    async def _audit_targets(self, requested: str) -> list[str]:
+        """One requested branch, else the base and every review not merged into it.
+
+        Read-only: the merge check the roadmap merge gate uses; a branch that
+        cannot be fetched is audited anyway and its report says why.
+        """
+        base = str(self.settings.authorized_branch)
+        reviewed = audit.reviewed(self.settings)
+        if requested or not reviewed:
+            return audit.targets(base, requested=requested)
+        await self.freebuff.repo.fetch_branch(base)
+        skip = {branch for branch, _status in reviewed
+                if await self._roadmap_merged(branch, base, "task")}
+        return audit.targets(base, reviewed=reviewed, skip=skip)
+
+    async def _run_job(self, job: Job) -> None:
+        """Audits report themselves; every other kind is the Freebuff runner's."""
+        if job.kind == audit.KIND:
+            await self._audit_run(job)
+        else:
+            await self.runner.run(job)
+
+    async def _audit_run(self, job: Job) -> None:
+        """One worktree per branch, the four stages, then one file and one message."""
+        payload = json.loads(job.text or "{}")
+        stamp = str(payload.get("stamp") or time.strftime("%Y%m%d-%H%M%S"))
+        results = [await self._audit_one(str(name), stamp) for name in payload.get("targets") or []]
+        report = audit.report(stamp, results, str(self.settings.authorized_branch))
+        path = Path(self.settings.log_dir) / f"audit-{stamp}.md"
+        try:
+            path.write_text(report, "utf-8")
+        except OSError as exc:
+            job.summary = f"audit {stamp}: could not write the report: {exc}"
+            return
+        job.summary = audit.summary(stamp, results, path.name)
+        channel = self._target_channel(job.channel_id)
+        if channel is None:
+            log.warning("no Discord channel for the audit in job %s", job.id)
+            return
+        await channel.send(job.summary, file=discord.File(path, filename=path.name))
+
+    async def _audit_one(self, branch: str, stamp: str) -> audit.TargetResult:
+        """A detached worktree at origin/<branch>, the stages, then remove it."""
+        repo = self.freebuff.repo
+        worktree = Path(self.settings.worktree_root) / f"audit-{stamp}" / audit.safe_name(branch)
+        try:
+            await repo.fetch_branch(branch)
+        except FreebuffError as exc:
+            return audit.TargetResult(branch, error=f"could not fetch it: {exc}")
+        added = await repo._run(
+            ["worktree", "add", "--detach", str(worktree), f"origin/{branch}"], check=False)
+        if added.code != 0:
+            return audit.TargetResult(branch, error=f"no worktree: {added.stderr.strip()[:300]}")
+        try:
+            env = jobs.build_script_env(self.settings, worktree)
+            stages = []
+            for name, script, timeout in (
+                ("check", "check.sh", self.settings.check_timeout_seconds),
+                ("build", "build.sh", self.settings.build_timeout_seconds),
+                ("test", "test.sh", self.settings.test_timeout_seconds),
+            ):
+                path = HERE / "scripts" / script
+                stages.append(await asyncio.to_thread(
+                    audit.run_stage, name, ["bash", str(path)], worktree, env,
+                    float(timeout), path))
+            drift = worktree / "ios-app/tools/parity/drift.mjs"
+            stages.append(await asyncio.to_thread(
+                audit.run_stage, "drift", ["node", "ios-app/tools/parity/drift.mjs"],
+                worktree, env, 1800.0, drift))
+            return audit.TargetResult(branch, stages)
+        finally:
+            await repo._run(["worktree", "remove", "--force", str(worktree)], check=False)
 
     async def _on_job_crash(self, job: Job, exc: BaseException) -> None:
         channel = self._target_channel(job.channel_id)

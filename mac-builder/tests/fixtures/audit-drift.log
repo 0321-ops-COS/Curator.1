@@ -1,0 +1,2 @@
+✘ Test themeContrasts() recorded an issue at ThemeTests.swift:31:2
+Test Case '-[HustlerCoreTests.ThemeTests testAccentContrast]' failed (0.021 seconds).

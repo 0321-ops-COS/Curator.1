@@ -1,0 +1,4 @@
+/Users/mac/audit-20260101-000000/authorized/ios-app/HustlerCore/Sources/RootView.swift:42: error: cannot find 'theme' in scope
+/Users/mac/audit-20260101-000000/authorized/ios-app/HustlerCore/Sources/Theme.swift:7: error: value of type 'Color' has no member 'accent'
+Test Case '-[HustlerCoreTests.ThemeTests testAccentContrast]' failed (0.021 seconds).
+error: fatalError
