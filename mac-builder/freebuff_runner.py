@@ -519,7 +519,6 @@ class FreebuffRunner:
         self.repo = GitRepo(self.repo_dir, self.git_bin)
         # One GitRepo per project; the default project reuses self.repo, so the
         # single-checkout path is byte for byte what it was.
-        self._project_repos: dict[str, GitRepo] = {}
         self._registry: projects.Registry | None = None
         self._self_git: GitRepo | None = None
         self._active: TaskEnvironment | None = None
@@ -666,79 +665,37 @@ class FreebuffRunner:
             self._registry = cached
         return cached
 
-    def repo_for_project(self, project_id: str = "") -> GitRepo:
-        """The GitRepo of one registered project, created once per checkout."""
+    def _require_project(self, project_id: str = "") -> projects.Project:
+        """The project a job names, or FreebuffError listing the known ones."""
         try:
-            project = self.projects.require(project_id or projects.DEFAULT_PROJECT)
+            return self.projects.require(project_id or projects.DEFAULT_PROJECT)
         except ValueError as exc:
             raise FreebuffError(str(exc)) from exc
+
+    def repo_for_project(self, project_id: str = "") -> GitRepo:
+        """The GitRepo of one registered project, created once per checkout."""
+        project = self._require_project(project_id)
         if project.is_default:
             # The default project is this runner's own checkout: the very object
             # every single-project code path already used.
             return self.repo
-        root = Path(project.path)
-        repos = getattr(self, "_project_repos", None)
-        if repos is None:
-            repos = self._project_repos = {}
-        existing = repos.get(project.id)
-        if existing is None or existing.root != root:
-            existing = GitRepo(root, getattr(self, "git_bin", "git"))
-            repos[project.id] = existing
-        return existing
-
-    def worktree_path(self, project_id: str, job_id: str) -> Path:
-        """Where a job's worktree goes: the root itself for the default project.
-
-        The default keeps the path every existing worktree and log already uses,
-        so nothing on the Mac moves; a second project is nested under its id, so
-        two jobs with the same id can never collide.
-        """
-        if project_id in ("", projects.DEFAULT_PROJECT):
-            return self.worktree_root / job_id
-        return self.worktree_root / project_id / job_id
-
-    async def _worktree_facts(self, worktree: Path) -> tuple[Path | None, str]:
-        """The checkout a worktree belongs to and its origin URL, or (None, "")."""
-        probe = GitRepo(worktree, getattr(self, "git_bin", "git"))
-        try:
-            common = await probe._run(
-                ["rev-parse", "--git-common-dir"], cwd=worktree, check=False, timeout=30
-            )
-            origin = await probe._run(
-                ["config", "--get", "remote.origin.url"], cwd=worktree, check=False, timeout=30
-            )
-        except FreebuffError:
-            return None, ""
-        if common.code != 0 or not common.stdout.strip():
-            return None, ""
-        git_dir = Path(common.stdout.strip())
-        if not git_dir.is_absolute():
-            git_dir = worktree / git_dir
-        git_dir = git_dir.resolve()
-        root = git_dir.parent if git_dir.name == ".git" else git_dir
-        return root, origin.stdout.strip() if origin.code == 0 else ""
+        return GitRepo(Path(project.path), getattr(self, "git_bin", "git"))
 
     async def _check_worktree(self, env: TaskEnvironment) -> None:
         """Refuse a worktree that is not the checkout of the job's own project.
 
-        Runs before Freebuff launches and again before a push, so a job can never
-        build or push in a project it was not queued for, even if the worktree
-        was moved or its origin was repointed while the job waited.
+        The comparison is projects.check_worktree's; the refusal is raised here so
+        the job fails as a git error would. It runs before Freebuff launches and
+        again before a push.
         """
         if env.kind == "dan":
             return  # her own checkout, not a registered project
         if not env.worktree.is_dir():
-            # Nothing has been created at this path (a direct launch, or a
-            # worktree already gone): there is no checkout to check, and the
-            # session cannot start in it anyway.
-            return
-        try:
-            project = self.projects.require(env.project or projects.DEFAULT_PROJECT)
-        except ValueError as exc:
-            raise FreebuffError(str(exc)) from exc
-        root, origin = await self._worktree_facts(env.worktree)
-        refusal = projects.mixing_refusal(
-            project, worktree=env.worktree, root=root, origin=origin
+            return  # nothing was created here, and git would fail anyway
+        refusal = await projects.check_worktree(
+            self._require_project(env.project),
+            env.worktree,
+            git_bin=getattr(self, "git_bin", "git"),
         )
         if refusal:
             raise FreebuffError(refusal)
@@ -751,10 +708,7 @@ class FreebuffRunner:
             return await self._start_dan_task(
                 job_id=job_id, task_text=task_text, log_path=log_path
             )
-        try:
-            target = self.projects.require(project or projects.DEFAULT_PROJECT)
-        except ValueError as exc:
-            raise FreebuffError(str(exc)) from exc
+        target = self._require_project(project)
         repo = self.repo_for_project(target.id)
         base = rules.assert_not_main(
             target.authorized_branch or str(getattr(self.settings, "authorized_branch"))
@@ -777,7 +731,7 @@ class FreebuffRunner:
             raise FreebuffError("could not allocate a unique freebuff/* branch")
 
         start = f"origin/{base}"
-        worktree = self.worktree_path(target.id, job_id)
+        worktree = projects.worktree_path(self.worktree_root, target.id, job_id)
         await repo.create_worktree(branch, worktree, start)
         base_commit = (await repo.head(worktree))[:7]
         guard_root = self._write_push_guard(job_id)
@@ -1906,10 +1860,11 @@ class FreebuffRunner:
         else:
             env = None
         removed: list[str] = []
-        if env is not None and env.worktree.name == job_id:
-            worktree = env.worktree
-        else:
-            worktree = self._job_worktree(job_id)
+        worktree = (
+            env.worktree
+            if env is not None and env.worktree.name == job_id
+            else projects.job_worktree(self.worktree_root, self.projects, job_id)
+        )
         if worktree is not None:
             owner = self._repo_for(env)
             gone = await owner.remove_worktree(worktree)
@@ -1933,19 +1888,6 @@ class FreebuffRunner:
             shutil.rmtree(guard, ignore_errors=True)
             removed.append("push guard")
         return removed
-
-    def _job_worktree(self, job_id: str) -> Path | None:
-        """The first existing worktree for a job: the default path, then projects."""
-        candidates = [self.worktree_path(projects.DEFAULT_PROJECT, job_id)]
-        candidates += [
-            self.worktree_path(project_id, job_id)
-            for project_id in self.projects.ids()
-            if project_id != projects.DEFAULT_PROJECT
-        ]
-        for path in candidates:
-            if path.exists():
-                return path
-        return None
 
     def _remove_guard(self, env: TaskEnvironment) -> None:
         if env.guard_dir is None:

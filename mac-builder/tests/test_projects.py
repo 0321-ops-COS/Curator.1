@@ -303,10 +303,12 @@ class ProjectRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_worktree_paths_are_distinct_per_project(self) -> None:
         runner = self.runner(self.registry())
         self.assertEqual(
-            runner.worktree_path("hustler", "job-1"), self.worktrees / "job-1"
+            projects.worktree_path(self.worktrees, "hustler", "job-1"),
+            self.worktrees / "job-1",
         )
         self.assertEqual(
-            runner.worktree_path("notes", "job-1"), self.worktrees / "notes" / "job-1"
+            projects.worktree_path(self.worktrees, "notes", "job-1"),
+            self.worktrees / "notes" / "job-1",
         )
 
     async def test_an_unregistered_project_is_refused_before_any_git(self) -> None:

@@ -16,12 +16,17 @@ Extra projects come from an optional ``projects.json`` beside this file::
 
 A bad extra entry is skipped with one log line and listed in ``/project``: a
 typo in a file beside the bot is never a reason to refuse to start, and
-``hustler`` itself is never skipped. Nothing here runs git commands or touches a
-checkout; the module exists so routing can be tested without a Mac.
+``hustler`` itself is never skipped.
+
+Where a job's worktree goes, which checkout it really belongs to, and whether
+that checkout may build and push for the project all live here rather than in
+the runner. The only git calls are two read-only probes of a worktree; nothing
+here writes a ref or a file.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -430,4 +435,89 @@ def mixing_refusal(
             f"({project_context.redact_remote(project.remote)}). "
             "Nothing was launched or pushed."
         )
+    return None
+
+
+# How long one read-only git probe of a worktree may take.
+GIT_TIMEOUT_SECONDS = 30.0
+
+
+def worktree_path(root: Path, project_id: str = "", job_id: str = "") -> Path:
+    """Where a job's worktree goes: ``<root>/<job>`` for the default project.
+
+    The default keeps the path every existing worktree and log already uses, so
+    nothing on the Mac moves; any other project nests under its id, so two jobs
+    with the same id can never collide.
+    """
+    if project_id in ("", DEFAULT_PROJECT):
+        return Path(root) / job_id
+    return Path(root) / project_id / job_id
+
+
+async def _git(cwd: Path, *args: str, git_bin: str = "git") -> tuple[int, str]:
+    """One read-only git command in ``cwd``: (exit code, stripped stdout)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            git_bin,
+            "-C",
+            str(cwd),
+            *args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return 1, ""
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=GIT_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:  # pragma: no cover - a hung git is not a checkout
+        proc.kill()
+        await proc.wait()
+        return 1, ""
+    return proc.returncode, out.decode("utf-8", "replace").strip()
+
+
+async def worktree_facts(
+    worktree: Path, *, git_bin: str = "git"
+) -> tuple[Path | None, str]:
+    """The checkout a worktree belongs to and its origin URL, or (None, "").
+
+    ``--git-common-dir`` is the main repository's ``.git`` for a linked
+    worktree, so a job can be tied back to the project it was queued for rather
+    than to wherever the worktree was created.
+    """
+    worktree = Path(worktree)
+    code, common = await _git(worktree, "rev-parse", "--git-common-dir", git_bin=git_bin)
+    if code != 0 or not common:
+        return None, ""
+    git_dir = Path(common)
+    if not git_dir.is_absolute():
+        git_dir = worktree / git_dir
+    git_dir = git_dir.resolve()
+    root = git_dir.parent if git_dir.name == ".git" else git_dir
+    code, origin = await _git(worktree, "config", "--get", "remote.origin.url", git_bin=git_bin)
+    return root, origin if code == 0 else ""
+
+
+async def check_worktree(
+    project: Project, worktree: Path, *, git_bin: str = "git"
+) -> str | None:
+    """None when this worktree may build and push for the project, else why not."""
+    root, origin = await worktree_facts(worktree, git_bin=git_bin)
+    return mixing_refusal(
+        project, worktree=Path(worktree), root=root, origin=origin
+    )
+
+
+def job_worktree(root: Path, registry: Registry, job_id: str) -> Path | None:
+    """The first existing worktree for a job: the default path, then projects."""
+    candidates = [worktree_path(root, DEFAULT_PROJECT, job_id)]
+    candidates += [
+        worktree_path(root, project_id, job_id)
+        for project_id in registry.ids()
+        if project_id != DEFAULT_PROJECT
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
     return None
