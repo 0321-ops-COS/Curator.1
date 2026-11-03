@@ -20,7 +20,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable, Sequence
+from typing import Awaitable, Callable, NamedTuple, Sequence
 
 import merge_command
 import projects
@@ -74,6 +74,10 @@ BRANCH_PREFIXES = ("freebuff/", "dan/")
 # reused, so DerivedData survives and a second build is not a cold one.
 BUILD_TREE_NAME = "_build"
 GIT_TIMEOUT_SECONDS = 120.0
+# A project's own checks (projects.json "checks"): their timeout, and how much
+# of each one's output a job keeps.
+PROJECT_CHECK_TIMEOUT_SECONDS = 900.0
+PROJECT_CHECK_TAIL_LINES = 40
 # What a passing run says, so the card names the outcome in the script's words.
 SCRIPT_HEADLINES = {
     "build": "BUILD SUCCEEDED",
@@ -101,6 +105,8 @@ class ReviewOutcome:
     # HEAD plus the staged-change digest the review saw; Approve re-checks it.
     snapshot: str = ""
     violations: tuple[rules.RuleViolation, ...] = ()
+    # One "command: state" line per check a python project ran, for the card.
+    check_lines: tuple[str, ...] = ()
 
 
 @dataclass
@@ -109,6 +115,21 @@ class ExecOutcome:
     timed_out: bool
     tail: list[str] = field(default_factory=list)
     output: list[str] = field(default_factory=list)
+
+
+class CheckOutcome(NamedTuple):
+    """One of a project's own checks: what ran, how it ended, what it printed."""
+
+    command: str
+    state: str
+    tail: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return self.state == "passed"
+
+    def line(self) -> str:
+        return f"{self.command}: {self.state}"
 
 
 PostJob = Callable[[Job, bool, str], Awaitable[None]]
@@ -245,6 +266,45 @@ def build_script_env(settings: object, repo_dir: Path) -> dict[str, str]:
     env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
     env["HOMEBREW_NO_INSTALL_CLEANUP"] = "1"
     return env
+
+
+def check_env() -> dict[str, str]:
+    """The minimal environment for a project's check: PATH, HOME, LANG only.
+
+    The bot's environment holds the Discord token and the manager key, so a
+    command from projects.json never inherits it.
+    """
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+    for key in ("HOME", "LANG"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    return env
+
+
+async def run_project_checks(
+    project: projects.Project, worktree: Path, *, log_path: Path | None = None
+) -> tuple[CheckOutcome, ...]:
+    """Each check in the project's own list, in order, in the job worktree.
+
+    A check is a shell command line from projects.json, with a minimal
+    environment and its own timeout, and a failure never stops the next one.
+    """
+    results: list[CheckOutcome] = []
+    for command in project.checks:
+        outcome = await _exec(
+            ["/bin/bash", "-c", command], cwd=Path(worktree), env=check_env(),
+            timeout=PROJECT_CHECK_TIMEOUT_SECONDS, log_path=log_path,
+            max_tail=PROJECT_CHECK_TAIL_LINES,
+        )
+        if outcome.timed_out:
+            state = f"timed out after {int(PROJECT_CHECK_TIMEOUT_SECONDS)}s"
+        elif outcome.code == 0:
+            state = "passed"
+        else:
+            state = f"failed (exit {outcome.code})"
+        results.append(CheckOutcome(command, state, tuple(outcome.tail)))
+    return tuple(results)
 
 
 def resolve_branch(settings: object, value: str | None) -> str:
@@ -822,6 +882,12 @@ class JobRunner:
                         diff=changes.diff,
                     )
                 )
+                project = self._project_for(job)
+                if project is not None:
+                    # A project's own protected list adds to the global one.
+                    violations += tuple(
+                        projects.protected_violations(project, all_paths)
+                    )
                 if violations:
                     self._stage(
                         job, status_board.FAILED, "blocked by the hard rules"
@@ -841,7 +907,8 @@ class JobRunner:
                     await self.post_review(outcome)
                     return False, "Blocked by rules; the manager was not called."
 
-                check_state, check_tail, check_ok = await self._run_stage(job, env, "check")
+                check_state, check_tail, check_ok, check_lines = (
+                    await self._stage_outcome(job, env, "check"))
                 test_state, test_tail, test_ok = await self._run_stage(job, env, "test")
 
                 brief = ReviewBrief(
@@ -870,6 +937,8 @@ class JobRunner:
                 )
                 if forced:
                     verdict = "revise"
+                    if check_lines and check_ok is False:
+                        forced += "\n" + "\n".join(f"- {line}" for line in check_lines)
                     notes = forced + (f"\n\n{notes}" if notes else "")
 
                 if verdict == "revise" and env.round < int(
@@ -929,6 +998,7 @@ class JobRunner:
                     check_ok=check_ok,
                     test_ok=test_ok,
                     snapshot=changes.snapshot,
+                    check_lines=check_lines,
                 )
                 await self.post_review(outcome)
                 return verdict == "approve", f"review: {verdict}"
@@ -1335,9 +1405,29 @@ class JobRunner:
             line += f": {reason}"
         return f"{line} (suggestion only, you decide)"
 
+    def _project_for(self, job: Job) -> projects.Project | None:
+        """The registered project a job builds; None when startup built no registry."""
+        registry = getattr(self.settings, "projects", None)
+        if not isinstance(registry, projects.Registry):
+            return None
+        return registry.get(getattr(job, "project", ""))
+
     async def _run_stage(
         self, job: Job, env: TaskEnvironment, kind: str
     ) -> tuple[str, str, bool | None]:
+        state, tail, ok, _checks = await self._stage_outcome(job, env, kind)
+        return state, tail, ok
+
+    async def _stage_outcome(
+        self, job: Job, env: TaskEnvironment, kind: str
+    ) -> tuple[str, str, bool | None, tuple[str, ...]]:
+        """One stage, plus the per-check lines a python project reports."""
+        project = self._project_for(job)
+        if job.kind != "dan" and project is not None and project.uses_checks:
+            if kind != "check":
+                # Its checks are the check stage; it ships no iOS scripts.
+                return "not used (project checks)", "", None, ()
+            return await self._run_project_check_stage(job, env, project)
         _log_separator(job, f"/{kind} in {env.worktree}")
         self._stage(
             job,
@@ -1347,10 +1437,11 @@ class JobRunner:
         if job.kind == "dan":
             # A self-build ships Python and shell, not Swift: the Mac's
             # xcodebuild stages would tell her nothing about her own change.
-            return await self._run_dan_stage(job, env, kind)
+            state, tail, ok = await self._run_dan_stage(job, env, kind)
+            return state, tail, ok, ()
         script = SCRIPT_DIR / f"{kind}.sh"
         if not script.is_file():
-            return "missing script", f"scripts/{script.name} not found", False
+            return "missing script", f"scripts/{script.name} not found", False, ()
         outcome = await _exec(
             ["/bin/bash", str(script)],
             cwd=env.worktree,
@@ -1362,12 +1453,28 @@ class JobRunner:
         tail = "\n".join(outcome.tail[-40:])
         if kind == "test" and outcome.code == 78:
             state = "unavailable (scheme has no test action)"
-            return state, tail, None
+            return state, tail, None, ()
         if outcome.timed_out:
             state = "timed out"
-            return state, tail, False
+            return state, tail, False, ()
         state = "passed" if outcome.code == 0 else f"failed (exit {outcome.code})"
-        return state, tail, outcome.code == 0
+        return state, tail, outcome.code == 0, ()
+
+    async def _run_project_check_stage(
+        self, job: Job, env: TaskEnvironment, project: projects.Project
+    ) -> tuple[str, str, bool | None, tuple[str, ...]]:
+        """The project's checks after the job's edits; a clean run says "passed"."""
+        _log_separator(job, f"project checks in {env.worktree}")
+        self._stage(job, status_board.CHECKS,
+                    f"{len(project.checks)} project check(s) running")
+        checks = await run_project_checks(
+            project, env.worktree, log_path=job.log_path)
+        lines = tuple(check.line() for check in checks) or (
+            "no project checks configured",)
+        failed = tuple(check.line() for check in checks if not check.ok)
+        tail = "\n".join(
+            "\n".join((f"$ {check.command}", *check.tail)) for check in checks)
+        return "; ".join(failed) or "passed", tail, not failed, lines
 
     async def _run_dan_stage(
         self, job: Job, env: TaskEnvironment, stage: str
