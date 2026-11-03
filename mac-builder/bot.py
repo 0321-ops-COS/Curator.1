@@ -2486,19 +2486,34 @@ class MacBuilderBot(discord.Client):
         payload = json.loads(job.text or "{}")
         stamp = str(payload.get("stamp") or time.strftime("%Y%m%d-%H%M%S"))
         results = [await self._audit_one(str(name), stamp) for name in payload.get("targets") or []]
-        report = audit.report(stamp, results, str(self.settings.authorized_branch))
+        await audit.add_causes(self.manager, results)
+        base = str(self.settings.authorized_branch)
+        report = audit.report(stamp, results, base)
         path = Path(self.settings.log_dir) / f"audit-{stamp}.md"
         try:
             path.write_text(report, "utf-8")
         except OSError as exc:
             job.summary = f"audit {stamp}: could not write the report: {exc}"
             return
-        job.summary = audit.summary(stamp, results, path.name)
+        files = [discord.File(path, filename=path.name)]
+        extra = "\nNo failures, so no fix sheet was generated."
+        sheet = audit.fix_sheet(stamp, results, base)
+        if sheet:
+            sheet_path = Path(self.settings.log_dir) / f"audit-{stamp}-sheet.md"
+            try:
+                sheet_path.write_text(sheet, "utf-8")
+                steps = roadmap.parse(sheet)
+            except (OSError, roadmap.RoadmapError) as exc:
+                extra = f"\nThe fix sheet could not be posted: {exc}"
+            else:
+                files.append(discord.File(sheet_path, filename=sheet_path.name))
+                extra = f"\nFix sheet: `{sheet_path.name}`, {len(steps)} job(s); nothing queued."
+        job.summary = audit.summary(stamp, results, path.name) + extra
         channel = self._target_channel(job.channel_id)
         if channel is None:
             log.warning("no Discord channel for the audit in job %s", job.id)
             return
-        await channel.send(job.summary, file=discord.File(path, filename=path.name))
+        await channel.send(job.summary, files=files)
 
     async def _audit_one(self, branch: str, stamp: str) -> audit.TargetResult:
         """A detached worktree at origin/<branch>, the stages, then remove it."""
@@ -2528,7 +2543,11 @@ class MacBuilderBot(discord.Client):
             stages.append(await asyncio.to_thread(
                 audit.run_stage, "drift", ["node", "ios-app/tools/parity/drift.mjs"],
                 worktree, env, 1800.0, drift))
-            return audit.TargetResult(branch, stages)
+            stat = await repo._run(
+                ["diff", "--stat", f"origin/{self.settings.authorized_branch}...origin/{branch}"],
+                check=False)
+            return audit.TargetResult(
+                branch, stages, diff_stat=stat.stdout.strip() if stat.code == 0 else "")
         finally:
             await repo._run(["worktree", "remove", "--force", str(worktree)], check=False)
 
