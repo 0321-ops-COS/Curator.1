@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import compare_link
 import github_client
 import merge_gates
+import projects
 from merge_gates import MergeFacts
 
 
@@ -21,13 +22,10 @@ def _text(value: object) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def repo_slug_for(settings: object, kind: str) -> str:
-    """``OWNER/REPO`` behind a job: her own checkout for /dan, the target otherwise."""
-    ctx = getattr(settings, "project", None)
-    if ctx is None:
-        return ""
-    remote = getattr(ctx, "self_remote" if _text(kind) == "dan" else "target_remote", "")
-    return compare_link.owner_repo(str(remote or "")) or ""
+def repo_slug_for(settings: object, kind: str, project: str = "") -> str:
+    """``OWNER/REPO`` behind a job: her own checkout for /dan, its project else."""
+    remote = projects.remote_for(settings, project, dan=_text(kind) == "dan")
+    return compare_link.owner_repo(remote) or ""
 
 
 @dataclass(frozen=True)

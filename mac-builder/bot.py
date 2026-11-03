@@ -52,6 +52,7 @@ import roadmap  # noqa: E402
 import test_card  # noqa: E402
 import planner  # noqa: E402
 import project_context  # noqa: E402
+import projects  # noqa: E402
 import questions  # noqa: E402
 import rules  # noqa: E402
 import screens  # noqa: E402
@@ -318,6 +319,8 @@ class Settings:
     update_check_seconds: float = 600.0
     # Filled in by main() after the startup preflight; None before that.
     project: "project_context.ProjectContext | None" = None
+    # The projects jobs may be routed to; "hustler" is always in it.
+    projects: "projects.Registry | None" = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -351,6 +354,15 @@ class Settings:
 
         freebuff_args_raw = _env("FREEBUFF_ARGS")
         freebuff_args = tuple(shlex.split(freebuff_args_raw)) if freebuff_args_raw else ()
+
+        # "hustler" is this checkout, so a Mac with no projects.json is exactly
+        # the single-project bot it was; extras come from that optional file.
+        registry = projects.load(
+            repo_dir=repo_dir,
+            authorized_branch=branch,
+            project_name=_env("PROJECT_NAME"),
+            path=HERE / "projects.json",
+        )
 
         settings = cls(
             token=token,
@@ -406,6 +418,7 @@ class Settings:
             status_pings=_env_bool("STATUS_PINGS", True),
             status_digest_seconds=_env_float("STATUS_DIGEST_SECONDS", 900.0),
             update_check_seconds=_env_float("UPDATE_CHECK_SECONDS", 600.0),
+            projects=registry,
         )
         if settings.max_pending_jobs < 1:
             raise ConfigError("MAX_PENDING_JOBS must be at least 1")
@@ -493,6 +506,17 @@ class TaskProposalView(discord.ui.View):
         )
 
 
+def project_label(settings: object, job: object) -> str:
+    """The project a job builds, in words, for /status and a review card.
+
+    A /dan job builds mac-builder/ in her own checkout, which is not one of the
+    registered projects, so it says so instead of naming the default project.
+    """
+    if str(getattr(job, "kind", "")) == "dan":
+        return "mac-builder (her own code)"
+    return projects.label_for(settings, getattr(job, "project", ""))
+
+
 def review_compare_url(settings: object, outcome: ReviewOutcome) -> str | None:
     """The GitHub compare link for a review card, or None when it cannot exist.
 
@@ -504,10 +528,13 @@ def review_compare_url(settings: object, outcome: ReviewOutcome) -> str | None:
     project = getattr(settings, "project", None)
     if env is None or project is None:
         return None
-    if getattr(env, "kind", "task") == "dan":
-        remote = getattr(project, "self_remote", "")
-    else:
-        remote = getattr(project, "target_remote", "")
+    remote = projects.remote_for(
+        settings,
+        getattr(outcome.job, "project", ""),
+        dan=getattr(env, "kind", "task") == "dan",
+    )
+    if not remote:
+        return None
     base = getattr(env, "base_branch", "") or ""
     if base.startswith("origin/"):
         base = base[len("origin/"):]
@@ -579,6 +606,7 @@ def review_embed(settings: object, outcome: ReviewOutcome) -> discord.Embed:
                      f"{outcome.notes[:3000] or '(none)'}"),
         color=colors.get(outcome.verdict, discord.Color.orange()))
     branch = outcome.environment.branch if outcome.environment else "?"
+    embed.add_field(name="Project", value=project_label(settings, outcome.job), inline=True)
     embed.add_field(name="Branch", value=f"`{branch}`", inline=True)
     embed.add_field(name="Changed lines", value=str(outcome.diff_lines), inline=True)
     embed.add_field(name="Check", value=outcome.check_state[:100], inline=True)
@@ -1161,6 +1189,11 @@ class MacBuilderBot(discord.Client):
         ctx = getattr(self.settings, "project", None)
         if ctx is not None:
             lines += [f"project: {ctx.project_name}", f"target repo: {ctx.target_remote}"]
+        registry = getattr(self.settings, "projects", None)
+        if isinstance(registry, projects.Registry):
+            lines.append(f"projects: {', '.join(registry.ids())}")
+            if running is not None:
+                lines.append(f"job project: {project_label(self.settings, running)}")
         watcher = getattr(self, "_update_watcher", None)
         lines += [
             f"update: {watcher.status_line(getattr(self, '_supervised', None)) if watcher else 'not checked yet'}",
@@ -1185,6 +1218,9 @@ class MacBuilderBot(discord.Client):
             return
         ctx = self.settings.project
         text = ctx.summary() if ctx is not None else "Project context is not loaded."
+        registry = getattr(self.settings, "projects", None)
+        if isinstance(registry, projects.Registry):
+            text += "\n\n" + "\n".join(registry.summary_lines())
         await interaction.response.send_message("```\n" + text + "\n```", ephemeral=True)
 
     @app_commands.describe(job_id="Job id to cancel; empty cancels the running job")
@@ -1430,21 +1466,47 @@ class MacBuilderBot(discord.Client):
             return None
         return combined
 
+    async def task_project_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """The registry's projects, filtered by what has been typed so far."""
+        registry = getattr(self.settings, "projects", None)
+        if not isinstance(registry, projects.Registry):
+            return []
+        typed = (current or "").strip().lower()
+        return [
+            app_commands.Choice(name=f"{name} ({project_id})", value=project_id)
+            for project_id, name in registry.choices()
+            if typed in project_id.lower() or typed in name.lower()
+        ][:25]
+
     @app_commands.describe(
         text="What Freebuff should do on a fresh freebuff/* branch",
         attachment="Optional .txt or .md file (max 200 KB) appended to the text",
+        project="Which registered project to build; empty is hustler",
     )
+    @app_commands.autocomplete(project=task_project_autocomplete)
     async def cmd_task(
         self,
         interaction: discord.Interaction,
         text: app_commands.Range[str, 1, rules.MAX_TASK_CHARS] = "",
         attachment: Optional[discord.Attachment] = None,
+        project: Optional[str] = None,
     ) -> None:
+        """A Freebuff task on its own branch; its project is fixed when queued."""
         if not await self.require_allowed(interaction):
             return
         refusal = self._update_refusal()
         if refusal:
             await interaction.response.send_message(refusal, ephemeral=True)
+            return
+        chosen = (project or "").strip()
+        registry = getattr(self.settings, "projects", None)
+        if chosen and isinstance(registry, projects.Registry) and registry.get(chosen) is None:
+            await interaction.response.send_message(
+                f"Unknown project {chosen!r}. Known: {', '.join(registry.ids())}.",
+                ephemeral=True,
+            )
             return
         task_text = await self._task_text(interaction, text, attachment)
         if task_text is None:
@@ -1456,6 +1518,7 @@ class MacBuilderBot(discord.Client):
             channel_id=interaction.channel_id or 0,
             requester_id=interaction.user.id,
             text=task_text,
+            project=chosen,
         )
         try:
             position = await self.queue.submit(job)
@@ -1464,8 +1527,9 @@ class MacBuilderBot(discord.Client):
             return
         await self._track_board(job, position)
         warning = "" if self.manager.enabled else " (AI manager is not configured.)"
+        where = f" on project `{job.project}`" if chosen else ""
         await interaction.response.send_message(
-            f"Queued Freebuff task `{job.id}` (position {position}).{warning}",
+            f"Queued Freebuff task `{job.id}` (position {position}){where}.{warning}",
             ephemeral=True,
         )
 
@@ -1910,6 +1974,15 @@ class MacBuilderBot(discord.Client):
             steps = roadmap.parse(data.decode("utf-8", "replace"))
         except roadmap.RoadmapError as exc:
             return _clip_reply(f"Not {'previewed' if mode == 'preview' else 'queued'}: {exc}.")
+        registry = getattr(self.settings, "projects", None)
+        if isinstance(registry, projects.Registry):
+            unknown = sorted(
+                {step.project for step in steps if registry.get(step.project) is None}
+            )
+            if unknown:
+                return _clip_reply(
+                    f"Not {'previewed' if mode == 'preview' else 'queued'}: unknown "
+                    f"project {unknown[0]!r}. Known: {', '.join(registry.ids())}.")
         if mode == "draft":
             return await sheet_card.replace_draft(self, steps, channel_id, requester_id)
         if mode == "preview":
@@ -2107,7 +2180,8 @@ class MacBuilderBot(discord.Client):
         """Queue one sheet job exactly as /task or /dan would, then record it."""
         job = jobs.make_job(self.settings, kind=step.kind, title=step.text[:100],
                             channel_id=self._roadmap_channel_id, text=step.text,
-                            requester_id=self._roadmap_requester_id)
+                            requester_id=self._roadmap_requester_id,
+                            project=step.project)
         try:
             position = await self.queue.submit(job)
         except jobs.QueueFull as exc:
@@ -2207,10 +2281,34 @@ class MacBuilderBot(discord.Client):
         return branch, base or self._roadmap_base(job.kind)
 
     def _roadmap_base(self, kind: str) -> str:
-        """Where a job's work lands: main for a /dan, else the authorized branch."""
+        """Where a job's work lands: main for a /dan, else its project's branch."""
         if kind == "dan":
             return "main"
+        registry = getattr(self.settings, "projects", None)
+        if isinstance(registry, projects.Registry):
+            job = getattr(self, "_roadmap_job", None)
+            project = registry.get(getattr(job, "project", ""))
+            if project is not None:
+                return project.authorized_branch
         return str(getattr(self.settings, "authorized_branch", "") or "")
+
+    def _roadmap_repo(self, kind: str):
+        """The checkout a roadmap job's branch lives in: her own, or its project's."""
+        if kind == "dan":
+            return self.freebuff.self_repo
+        job = getattr(self, "_roadmap_job", None)
+        project_id = str(getattr(job, "project", "") or "")
+        registry = getattr(self.settings, "projects", None)
+        resolver = getattr(self.freebuff, "repo_for_project", None)
+        if (
+            project_id
+            and project_id != projects.DEFAULT_PROJECT
+            and callable(resolver)
+            and isinstance(registry, projects.Registry)
+            and registry.get(project_id) is not None
+        ):
+            return resolver(project_id)
+        return self.freebuff.repo
 
     async def _roadmap_merged(self, branch: str, base: str, kind: str) -> bool | None:
         """Is ``origin/<branch>`` already in ``origin/<base>``? Fetch only.
@@ -2222,7 +2320,7 @@ class MacBuilderBot(discord.Client):
         """
         if not branch or not base:
             return None
-        repo = self.freebuff.self_repo if kind == "dan" else self.freebuff.repo
+        repo = self._roadmap_repo(kind)
         try:
             await repo.fetch_branch(base)
             await repo.fetch_branch(branch)
@@ -2252,8 +2350,12 @@ class MacBuilderBot(discord.Client):
         project = getattr(self.settings, "project", None)
         if project is None:
             return None
-        remote = (getattr(project, "self_remote", "") if kind == "dan"
-                  else getattr(project, "target_remote", ""))
+        job = getattr(self, "_roadmap_job", None)
+        remote = projects.remote_for(
+            self.settings, getattr(job, "project", ""), dan=kind == "dan"
+        )
+        if not remote:
+            return None
         return compare_link.compare_url(remote, base, branch)
 
     def _roadmap_merge_path(self) -> Path:

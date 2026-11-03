@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 import jobs
+import projects
 from freebuff_runner import TaskEnvironment
 
 log = logging.getLogger(__name__)
@@ -22,7 +23,7 @@ log = logging.getLogger(__name__)
 AWAITING = "awaiting_review"
 DECIDED = ("approved", "rejected")
 JOB_FIELDS = ("id", "kind", "title", "channel_id", "requester_id", "text",
-              "branch", "repo_slug")
+              "branch", "project", "repo_slug")
 REVIEW_FIELDS = ("verdict", "notes", "check_state", "test_state", "diff_lines",
                  "changed_files", "check_ok", "test_ok", "snapshot")
 
@@ -111,6 +112,9 @@ def outcome(record: dict) -> jobs.ReviewOutcome:
         log_path=Path(str(data.get("log", ""))),
         channel_id=int(data.get("channel_id") or 0),
         requester_id=int(data.get("requester_id") or 0),
+        # A record written before projects existed has no project, and belonged
+        # to the one checkout there was.
+        project=str(data.get("project") or projects.DEFAULT_PROJECT),
         **{name: str(data.get(name, "")) for name in
            ("id", "kind", "title", "text", "branch", "repo_slug")},
     )

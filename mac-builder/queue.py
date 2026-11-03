@@ -44,11 +44,24 @@ class Job:
     commit_label: str = ""
     elapsed_label: str = ""
     base: str = ""
+    # Which registered project the job builds. It is fixed when the job is made
+    # (see __setattr__): a queued job can never be re-routed to another checkout.
+    project: str = "hustler"
     repo_slug: str = ""  # OWNER/REPO the branch can be merged in
     check_state: str = ""
     diff_lines: int = 0
     changed_paths: tuple[str, ...] = ()
     merge_dry_run_sha: str = ""  # the PR head a dry run saw
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """A job's project is set once, when it is made, and never changed."""
+        # __dict__, not getattr: a dataclass field default is also a class
+        # attribute, so getattr would see "hustler" before __init__ set it.
+        if name == "project" and self.__dict__.get("project"):
+            raise AttributeError(
+                f"job {getattr(self, 'id', '?')}: its project is fixed when the job is made"
+            )
+        super().__setattr__(name, value)
 
     @property
     def duration(self) -> float | None:

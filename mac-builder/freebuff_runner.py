@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 import questions
+import projects
 import rules
 import screens
 import status_board
@@ -176,6 +177,8 @@ class TaskEnvironment:
     signature_at_start: str = ""
     # "task" (freebuff/*, the target checkout) or "dan" (dan/*, her own code).
     kind: str = "task"
+    # The registered project this worktree belongs to. A job never changes it.
+    project: str = "hustler"
     # The commit the branch was cut from, short form; the job card shows it.
     base_commit: str = ""
 
@@ -514,6 +517,10 @@ class FreebuffRunner:
         self.git_bin = shutil.which("git") or "/usr/bin/git"
         self.tmux_bin = shutil.which("tmux") or "/opt/homebrew/bin/tmux"
         self.repo = GitRepo(self.repo_dir, self.git_bin)
+        # One GitRepo per project; the default project reuses self.repo, so the
+        # single-checkout path is byte for byte what it was.
+        self._project_repos: dict[str, GitRepo] = {}
+        self._registry: projects.Registry | None = None
         self._self_git: GitRepo | None = None
         self._active: TaskEnvironment | None = None
         # The one question open right now, and the future /answer resolves.
@@ -639,22 +646,123 @@ class FreebuffRunner:
         """The checkout a job's worktree belongs to.
 
         A dan worktree is created in her own checkout, so its removal has to run
-        against self_repo; anything else uses the target checkout.
+        against self_repo; anything else uses the checkout of the job's project.
         """
-        return self.self_repo if env is not None and env.kind == "dan" else self.repo
+        if env is not None and env.kind == "dan":
+            return self.self_repo
+        if env is not None and env.project:
+            return self.repo_for_project(env.project)
+        return self.repo
+
+    @property
+    def projects(self) -> projects.Registry:
+        """The registry: from settings when the bot built one, else synthesized."""
+        existing = getattr(getattr(self, "settings", None), "projects", None)
+        if isinstance(existing, projects.Registry):
+            return existing
+        cached = getattr(self, "_registry", None)
+        if cached is None:
+            cached = projects.from_settings(self.settings)
+            self._registry = cached
+        return cached
+
+    def repo_for_project(self, project_id: str = "") -> GitRepo:
+        """The GitRepo of one registered project, created once per checkout."""
+        try:
+            project = self.projects.require(project_id or projects.DEFAULT_PROJECT)
+        except ValueError as exc:
+            raise FreebuffError(str(exc)) from exc
+        if project.is_default:
+            # The default project is this runner's own checkout: the very object
+            # every single-project code path already used.
+            return self.repo
+        root = Path(project.path)
+        repos = getattr(self, "_project_repos", None)
+        if repos is None:
+            repos = self._project_repos = {}
+        existing = repos.get(project.id)
+        if existing is None or existing.root != root:
+            existing = GitRepo(root, getattr(self, "git_bin", "git"))
+            repos[project.id] = existing
+        return existing
+
+    def worktree_path(self, project_id: str, job_id: str) -> Path:
+        """Where a job's worktree goes: the root itself for the default project.
+
+        The default keeps the path every existing worktree and log already uses,
+        so nothing on the Mac moves; a second project is nested under its id, so
+        two jobs with the same id can never collide.
+        """
+        if project_id in ("", projects.DEFAULT_PROJECT):
+            return self.worktree_root / job_id
+        return self.worktree_root / project_id / job_id
+
+    async def _worktree_facts(self, worktree: Path) -> tuple[Path | None, str]:
+        """The checkout a worktree belongs to and its origin URL, or (None, "")."""
+        probe = GitRepo(worktree, getattr(self, "git_bin", "git"))
+        try:
+            common = await probe._run(
+                ["rev-parse", "--git-common-dir"], cwd=worktree, check=False, timeout=30
+            )
+            origin = await probe._run(
+                ["config", "--get", "remote.origin.url"], cwd=worktree, check=False, timeout=30
+            )
+        except FreebuffError:
+            return None, ""
+        if common.code != 0 or not common.stdout.strip():
+            return None, ""
+        git_dir = Path(common.stdout.strip())
+        if not git_dir.is_absolute():
+            git_dir = worktree / git_dir
+        git_dir = git_dir.resolve()
+        root = git_dir.parent if git_dir.name == ".git" else git_dir
+        return root, origin.stdout.strip() if origin.code == 0 else ""
+
+    async def _check_worktree(self, env: TaskEnvironment) -> None:
+        """Refuse a worktree that is not the checkout of the job's own project.
+
+        Runs before Freebuff launches and again before a push, so a job can never
+        build or push in a project it was not queued for, even if the worktree
+        was moved or its origin was repointed while the job waited.
+        """
+        if env.kind == "dan":
+            return  # her own checkout, not a registered project
+        if not env.worktree.is_dir():
+            # Nothing has been created at this path (a direct launch, or a
+            # worktree already gone): there is no checkout to check, and the
+            # session cannot start in it anyway.
+            return
+        try:
+            project = self.projects.require(env.project or projects.DEFAULT_PROJECT)
+        except ValueError as exc:
+            raise FreebuffError(str(exc)) from exc
+        root, origin = await self._worktree_facts(env.worktree)
+        refusal = projects.mixing_refusal(
+            project, worktree=env.worktree, root=root, origin=origin
+        )
+        if refusal:
+            raise FreebuffError(refusal)
 
     async def start_task(
-        self, *, job_id: str, task_text: str, log_path: Path, kind: str = "task"
+        self, *, job_id: str, task_text: str, log_path: Path, kind: str = "task",
+        project: str = "",
     ) -> TaskEnvironment:
         if kind == "dan":
             return await self._start_dan_task(
                 job_id=job_id, task_text=task_text, log_path=log_path
             )
-        base = rules.assert_not_main(str(getattr(self.settings, "authorized_branch")))
+        try:
+            target = self.projects.require(project or projects.DEFAULT_PROJECT)
+        except ValueError as exc:
+            raise FreebuffError(str(exc)) from exc
+        repo = self.repo_for_project(target.id)
+        base = rules.assert_not_main(
+            target.authorized_branch or str(getattr(self.settings, "authorized_branch"))
+        )
         # Merge on GitHub, and the Mac's local copy is behind immediately. Fetch
         # first, so a failure stops the job instead of building on stale code.
-        await self.repo.fetch_branch(base)
-        await self.repo.verify_base(base)
+        await repo.fetch_branch(base)
+        await repo.verify_base(base)
         if not Path(self.tmux_bin).is_file():
             raise FreebuffError(f"tmux not found at {self.tmux_bin}; install tmux")
         freebuff_argv = self._freebuff_argv()
@@ -662,16 +770,16 @@ class FreebuffRunner:
         branch = ""
         for _ in range(6):
             candidate = f"{rules.TASK_BRANCH_PREFIX}{secrets.token_hex(4)}"
-            if not await self.repo.branch_exists(candidate):
+            if not await repo.branch_exists(candidate):
                 branch = candidate
                 break
         if not branch:
             raise FreebuffError("could not allocate a unique freebuff/* branch")
 
         start = f"origin/{base}"
-        worktree = self.worktree_root / job_id
-        await self.repo.create_worktree(branch, worktree, start)
-        base_commit = (await self.repo.head(worktree))[:7]
+        worktree = self.worktree_path(target.id, job_id)
+        await repo.create_worktree(branch, worktree, start)
+        base_commit = (await repo.head(worktree))[:7]
         guard_root = self._write_push_guard(job_id)
         session = f"macbuilder-{job_id[-8:]}"
         env = TaskEnvironment(
@@ -681,10 +789,12 @@ class FreebuffRunner:
             base_branch=start,
             guard_dir=guard_root,
             base_commit=base_commit,
+            project=target.id,
         )
         self._append_log(
             log_path,
-            f"\n=== Freebuff task ===\nbranch: {branch}\nworktree: {worktree}\n"
+            f"\n=== Freebuff task ===\nproject: {target.id} ({target.name})\n"
+            f"repo: {target.path}\nbranch: {branch}\nworktree: {worktree}\n"
             f"base: {start} @ {base_commit} (just fetched)\n",
         )
         await self._launch(env, freebuff_argv, task_text, log_path)
@@ -738,10 +848,13 @@ class FreebuffRunner:
         task_text: str,
         log_path: Path,
     ) -> None:
+        repo = self._repo_for(env)
+        # Never launch Freebuff in a worktree that is not this job's project.
+        await self._check_worktree(env)
         self.report_stage(status_board.BRANCH_READY, env.branch)
         try:
             await self._start_session(env, freebuff_argv, log_path)
-            env.signature_at_start = await self.repo.signature(env.worktree)
+            env.signature_at_start = await repo.signature(env.worktree)
             self._append_log(
                 log_path,
                 "\n--- task sent to Freebuff ---\n" + task_text + "\n--- end task ---\n",
@@ -1587,7 +1700,7 @@ class FreebuffRunner:
         # only keeps a test or a direct caller from busy-looping.
         stall = max(0.01, float(getattr(self.settings, "stall_seconds", STALL_DEFAULT_SECONDS)))
         deadline = time.monotonic() + timeout
-        last_signature = env.signature_at_start or await self.repo.signature(env.worktree)
+        last_signature = env.signature_at_start or await self._repo_for(env).signature(env.worktree)
         last_change: float | None = None
         last_pane = await self._pane(env.session)
         last_pane_at = time.monotonic()
@@ -1614,12 +1727,12 @@ class FreebuffRunner:
                 if outcome == "failed":
                     return "question-failed"
                 self._remember_box(box.key)
-                last_signature = await self.repo.signature(env.worktree)
+                last_signature = await self._repo_for(env).signature(env.worktree)
                 last_change = time.monotonic()
                 last_pane = await self._pane(env.session)
                 last_pane_at = last_change
                 continue
-            signature = await self.repo.signature(env.worktree)
+            signature = await self._repo_for(env).signature(env.worktree)
             now = time.monotonic()
             if signature != last_signature:
                 last_signature = signature
@@ -1688,30 +1801,31 @@ class FreebuffRunner:
         self._append_log(log_path, f"\n--- round {env.round}: reviewer notes sent ---\n{text}\n---\n")
         if not await self._session_alive(env.session):
             await self._start_session(env, self._freebuff_argv(), log_path)
-        env.signature_at_start = await self.repo.signature(env.worktree)
+        env.signature_at_start = await self._repo_for(env).signature(env.worktree)
         await self._send_text(env.session, text)
         return await self.wait_for_changes(
             env, log_path, on_question=on_question, on_pane=on_pane
         )
 
     async def collect(self, env: TaskEnvironment, max_diff_lines: int) -> ChangeSet:
-        await self.repo.stage_all(env.worktree)
-        status = await self.repo.status(env.worktree)
-        paths = await self.repo.status_paths(env.worktree)
-        total, _ = await self.repo.numstat(env.worktree, env.base_branch)
+        repo = self._repo_for(env)
+        await repo.stage_all(env.worktree)
+        status = await repo.status(env.worktree)
+        paths = await repo.status_paths(env.worktree)
+        total, _ = await repo.numstat(env.worktree, env.base_branch)
         # Only load the text when rules can still accept it. A huge diff must not
         # have to fit in memory on an 8 GB machine.
         diff = ""
         if total <= max_diff_lines:
-            diff = await self.repo.diff(env.worktree, env.base_branch)
+            diff = await repo.diff(env.worktree, env.base_branch)
         else:
             log.warning(
                 "branch %s: diff has %d lines; diff text not loaded",
                 env.branch,
                 total,
             )
-        head = await self.repo.head(env.worktree)
-        snapshot = await self.repo.snapshot(env.worktree, env.base_branch)
+        head = await repo.head(env.worktree)
+        snapshot = await repo.snapshot(env.worktree, env.base_branch)
         return ChangeSet(
             diff=diff,
             diff_lines=total,
@@ -1737,6 +1851,10 @@ class FreebuffRunner:
             raise FreebuffError(
                 "no reviewed snapshot was recorded for this job; refusing to push"
             )
+        # Again, before anything leaves this machine: the worktree must still be
+        # the checkout of the project this job was queued for.
+        await self._check_worktree(env)
+        repo = self._repo_for(env)
         await self.abort(env)
         max_diff_lines = int(getattr(self.settings, "max_diff_lines"))
         changes = await self.collect(env, max_diff_lines)
@@ -1761,13 +1879,13 @@ class FreebuffRunner:
                 "the change no longer passes the hard rules; nothing was pushed.\n"
                 + rules.protected_summary(violations)
             )
-        await self.repo.stage_all(env.worktree)
-        if await self.repo.status_paths(env.worktree):
-            sha = await self.repo.commit_all(env.worktree, message)
+        await repo.stage_all(env.worktree)
+        if await repo.status_paths(env.worktree):
+            sha = await repo.commit_all(env.worktree, message)
         else:
             # Freebuff may have committed its own work; push that commit.
-            sha = await self.repo.head(env.worktree)
-        await self.repo.push_branch(env.worktree, branch, kind=env.kind)
+            sha = await repo.head(env.worktree)
+        await repo.push_branch(env.worktree, branch, kind=env.kind)
         log.info("pushed %s at %s", branch, sha)
         self.report_stage(status_board.PUSHED, f"{branch} at {sha[:7]}")
         await self.abort(env)
@@ -1788,13 +1906,17 @@ class FreebuffRunner:
         else:
             env = None
         removed: list[str] = []
-        worktree = self.worktree_root / job_id
-        if worktree.exists():
+        if env is not None and env.worktree.name == job_id:
+            worktree = env.worktree
+        else:
+            worktree = self._job_worktree(job_id)
+        if worktree is not None:
             owner = self._repo_for(env)
             gone = await owner.remove_worktree(worktree)
-            if not gone and env is None and worktree.exists():
-                # Nothing names the kind any more: a worktree left by an earlier
-                # run may be a dan worktree, which belongs to her checkout.
+            if not gone and env is None:
+                # Nothing names the kind or the project any more: a worktree left
+                # by an earlier run may be a dan worktree or another project's,
+                # so her own checkout gets the last word.
                 gone = await self.self_repo.remove_worktree(worktree)
             if gone:
                 removed.append("worktree")
@@ -1811,6 +1933,19 @@ class FreebuffRunner:
             shutil.rmtree(guard, ignore_errors=True)
             removed.append("push guard")
         return removed
+
+    def _job_worktree(self, job_id: str) -> Path | None:
+        """The first existing worktree for a job: the default path, then projects."""
+        candidates = [self.worktree_path(projects.DEFAULT_PROJECT, job_id)]
+        candidates += [
+            self.worktree_path(project_id, job_id)
+            for project_id in self.projects.ids()
+            if project_id != projects.DEFAULT_PROJECT
+        ]
+        for path in candidates:
+            if path.exists():
+                return path
+        return None
 
     def _remove_guard(self, env: TaskEnvironment) -> None:
         if env.guard_dir is None:
