@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable, NamedTuple, Sequence
 
+import dan_review
 import merge_command
 import projects
 import questions
@@ -919,6 +920,15 @@ class JobRunner:
                     await self._stage_outcome(job, env, "check"))
                 test_state, test_tail, test_ok = await self._run_stage(job, env, "test")
 
+                # Deterministic /dan checks: plain code, folded into the same
+                # forced-revise path as a failed stage (MAX_REVISE_ROUNDS).
+                dan_problems = (
+                    dan_review.problems(
+                        job.text, all_paths, worktree=env.worktree,
+                        base_ref=env.base_branch or dan_review.DEFAULT_BASE_REF,
+                    ) if job.kind == "dan" else []
+                )
+
                 brief = ReviewBrief(
                     task=job.text,
                     diff=changes.diff,
@@ -944,6 +954,10 @@ class JobRunner:
                     check_ok, test_ok, dan=job.kind == "dan",
                     check_note=project_check_note(self._project_for(job)),
                 )
+                if dan_problems:
+                    forced = "Deterministic /dan checks found:\n" + "\n".join(
+                        f"- {problem}" for problem in dan_problems
+                    ) + (f"\n\n{forced}" if forced else "")
                 if forced:
                     verdict = "revise"
                     if check_lines and check_ok is False:
