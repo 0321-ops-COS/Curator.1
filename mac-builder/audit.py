@@ -149,7 +149,7 @@ async def add_causes(manager, results: list[TargetResult]) -> None:
                 stage.cause_error = "manager error"
 
 
-JOB_LIMIT = 4000
+JOB_LIMIT = 3800  # one job stays editable in a Discord modal, which holds 4000
 RULES = """Rules for this job
 - Do not change project.yml, *.xcconfig, .github/, .env* or signing/provisioning files.
 - Keep the change under 300 lines.
@@ -169,8 +169,11 @@ def _job(stage: StageResult, result: TargetResult, stamp: str) -> str:
     return (body[:JOB_LIMIT - len(RULES) - 2].rstrip() + "\n\n" + RULES)[:JOB_LIMIT]
 
 
-def fix_sheet(stamp: str, results: list[TargetResult], base: str) -> str:
-    """One job per distinct failure, the authorized branch's first; '' if none."""
+def fix_sheet(stamp: str, results: list[TargetResult], base: str = "") -> str:
+    """One job per distinct failure, the authorized branch's first; '' if none.
+
+    `base` orders and dedupes the jobs; without it the results keep their order.
+    """
     jobs: list[str] = []
     seen: set[tuple[str, ...]] = set()
     for result in sorted(results, key=lambda item: item.branch != base):
@@ -237,3 +240,4 @@ def summary(stamp: str, results: list[TargetResult], filename: str) -> str:
     return (head + (f"\nFailures on: {', '.join(failed)}." if failed else "")
             + f"\nFull report: `{filename}`.\nRead-only: nothing committed, pushed, merged "
             "or approved. CI results are not visible from here.")[:1900]
+

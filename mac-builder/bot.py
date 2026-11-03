@@ -56,6 +56,7 @@ import questions  # noqa: E402
 import rules  # noqa: E402
 import screens  # noqa: E402
 import selftest  # noqa: E402
+import sheet_card  # noqa: E402
 import heartbeat
 import status_board  # noqa: E402
 import supervision  # noqa: E402
@@ -740,6 +741,7 @@ class UpdateNoticeView(discord.ui.View):
 
 class MacBuilderBot(discord.Client):
     _update_waiting: dict | None = None
+    _sheet_draft: sheet_card.Draft | None = None
 
     def __init__(self, settings: Settings) -> None:
         intents = discord.Intents.default()
@@ -797,6 +799,7 @@ class MacBuilderBot(discord.Client):
         self._roadmap_waiting: dict[int, tuple[int, str, float]] = {}
         # The approved job whose merge the next sheet job waits for, if any.
         self._roadmap_merge: dict | None = self._roadmap_merge_load()
+        self._sheet_draft = sheet_card.load(self._sheet_draft_path())
         self.runner = jobs.JobRunner(
             settings,
             self.manager,
@@ -1076,6 +1079,8 @@ class MacBuilderBot(discord.Client):
                     self._roadmap_restored = 0
             except Exception:
                 log.warning("could not announce the restored roadmap")
+        if self._sheet_draft is not None:
+            await self._restore_sheet_draft()
 
     async def close(self) -> None:
         tickers = [self._board_ticker, self._heartbeat_ticker, self._update_ticker]
@@ -1898,8 +1903,15 @@ class MacBuilderBot(discord.Client):
             steps = roadmap.parse(data.decode("utf-8", "replace"))
         except roadmap.RoadmapError as exc:
             return _clip_reply(f"Not {'previewed' if mode == 'preview' else 'queued'}: {exc}.")
+        if mode == "draft":
+            return await sheet_card.replace_draft(self, steps, channel_id, requester_id)
         if mode == "preview":
             return _clip_reply(roadmap.preview(steps))
+        return await self._roadmap_start(steps, channel_id, requester_id)
+
+    async def _roadmap_start(self, steps: list[roadmap.Step], channel_id: int,
+                             requester_id: int) -> str:
+        """Start a parsed sheet: ONE first job, the roadmap saved, nothing else."""
         if self._update_waiting is not None:
             return _clip_reply(self._update_refusal())
         self._roadmap_steps = steps
@@ -1942,6 +1954,13 @@ class MacBuilderBot(discord.Client):
 
     def _roadmap_path(self) -> Path:
         return Path(self.settings.log_dir) / "roadmap.json"
+
+    def _sheet_draft_path(self) -> Path:
+        return Path(self.settings.log_dir) / sheet_card.DRAFT_FILE
+
+    async def _restore_sheet_draft(self) -> None:
+        await sheet_card.post(self, self._target_channel(self._sheet_draft.channel_id),
+                              note="Restored after a restart; nothing is queued.")
 
     def _roadmap_left(self) -> int:
         """Jobs the sheet never queued: the only ones a pause holds back."""
@@ -2703,6 +2722,7 @@ class MacBuilderBot(discord.Client):
             return
         files = [discord.File(path, filename=path.name)]
         extra = "\nNo failures, so no fix sheet was generated."
+        steps: list[roadmap.Step] = []
         sheet = audit.fix_sheet(stamp, results, base)
         if sheet:
             sheet_path = Path(self.settings.log_dir) / f"audit-{stamp}-sheet.md"
@@ -2720,6 +2740,11 @@ class MacBuilderBot(discord.Client):
             log.warning("no Discord channel for the audit in job %s", job.id)
             return
         await channel.send(job.summary, files=files)
+        if not steps:
+            return
+        self._sheet_draft = sheet_card.Draft(steps, job.channel_id, job.requester_id)
+        sheet_card.save(self._sheet_draft_path(), self._sheet_draft)
+        await sheet_card.post(self, channel, note=f"From audit `{stamp}`.")
 
     async def _audit_one(self, branch: str, stamp: str) -> audit.TargetResult:
         """A detached worktree at origin/<branch>, the stages, then remove it."""
