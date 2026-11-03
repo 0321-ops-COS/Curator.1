@@ -58,6 +58,7 @@ import screens  # noqa: E402
 import selftest  # noqa: E402
 import heartbeat
 import status_board  # noqa: E402
+import supervision  # noqa: E402
 import update_watch  # noqa: E402
 from freebuff_runner import FreebuffError, FreebuffRunner  # noqa: E402
 from jobs import Job, ReviewOutcome, tail_text  # noqa: E402
@@ -75,6 +76,9 @@ ROADMAP_PING_SECONDS = 6 * 3600.0
 ROADMAP_MERGE_FILE = "roadmap-merge.json"
 # How long a /roadmap without a sheet waits for that sheet as the next message.
 ROADMAP_WAIT_SECONDS = 10 * 60.0
+# A waiting update re-checks idle this often, and pings the channel this often.
+UPDATE_TICK_SECONDS = 30.0
+UPDATE_PING_SECONDS = 3600.0
 # How often the working job's pane is read for the heartbeat.
 HEARTBEAT_TICK_SECONDS = 20.0
 # Discord rejects a message over 2000 characters; every /roadmap reply fits this.
@@ -709,7 +713,34 @@ class ReviewView(discord.ui.View):
         )
 
 
+class UpdateNoticeView(discord.ui.View):
+    """The update offer; every button checks the allowlist again."""
+
+    def __init__(self, bot: "MacBuilderBot", tip: str) -> None:
+        super().__init__(timeout=None)
+        self.bot, self.tip = bot, tip
+
+    @discord.ui.button(label="Update when idle", style=discord.ButtonStyle.success)
+    async def update(self, i: discord.Interaction, b: discord.ui.Button) -> None:
+        if await self.bot.require_allowed(i):
+            await self.bot.start_update_wait(i, self.tip)
+
+    @discord.ui.button(label="Later", style=discord.ButtonStyle.secondary)
+    async def later(self, i: discord.Interaction, b: discord.ui.Button) -> None:
+        if await self.bot.require_allowed(i):
+            await i.response.send_message("OK, later. Nothing changed.", ephemeral=True)
+
+    @discord.ui.button(label="Skip this version", style=discord.ButtonStyle.danger)
+    async def skip(self, i: discord.Interaction, b: discord.ui.Button) -> None:
+        if await self.bot.require_allowed(i):
+            self.bot._skipped_tip = self.tip
+            await i.response.send_message(
+                f"Skipped `{self.tip[:7]}`; I won't offer it again.", ephemeral=True)
+
+
 class MacBuilderBot(discord.Client):
+    _update_waiting: dict | None = None
+
     def __init__(self, settings: Settings) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
@@ -725,6 +756,8 @@ class MacBuilderBot(discord.Client):
             interval_seconds=getattr(settings, "update_check_seconds", 600.0),
         )
         self._update_ticker: asyncio.Task[None] | None = None
+        self.supervisor = supervision.Supervisor(REPO_ROOT, settings.log_dir)
+        self._supervised = supervision.is_supervised()
         self.tree = app_commands.CommandTree(self)
         self.manager = Manager(
             api_base=settings.manager_api_base,
@@ -1018,6 +1051,22 @@ class MacBuilderBot(discord.Client):
             log.warning(
                 "manager is not configured; reviews will ask for a human decision"
             )
+        applied = self.supervisor.take_applied() if getattr(self, "supervisor", None) else None
+        if applied:
+            self._roadmap_restored = 0
+            left = len(self._roadmap_steps)
+            channel = self._target_channel(int(applied.get("channel_id") or 0))
+            state = f"Roadmap restored: {left} job(s) left." if left else "No roadmap was queued."
+            try:
+                if channel is not None:
+                    await channel.send(
+                        f"Updated `{applied['old'][:7]}` -> `{applied['new'][:7]}`: "
+                        f"{applied.get('subjects') or 'no commits'}. {state}")
+                    posted = await self._repost_reviews(channel)
+                    if posted:
+                        await channel.send(f"Re-posted `{', '.join(posted)}`; nothing was approved.")
+            except Exception:
+                log.exception("could not announce the applied update")
         if self._roadmap_restored:
             channel = self._target_channel(self._roadmap_channel_id)
             try:
@@ -1104,7 +1153,7 @@ class MacBuilderBot(discord.Client):
             lines += [f"project: {ctx.project_name}", f"target repo: {ctx.target_remote}"]
         watcher = getattr(self, "_update_watcher", None)
         lines += [
-            f"update: {watcher.status_line() if watcher else 'not checked yet'}",
+            f"update: {watcher.status_line(getattr(self, '_supervised', None)) if watcher else 'not checked yet'}",
             f"queue: {snapshot['pending']} waiting",
             f"authorized branch: {self.settings.authorized_branch}",
             f"manager: {'configured' if self.manager.enabled else 'not configured'}",
@@ -1383,6 +1432,10 @@ class MacBuilderBot(discord.Client):
     ) -> None:
         if not await self.require_allowed(interaction):
             return
+        refusal = self._update_refusal()
+        if refusal:
+            await interaction.response.send_message(refusal, ephemeral=True)
+            return
         task_text = await self._task_text(interaction, text, attachment)
         if task_text is None:
             return
@@ -1418,6 +1471,10 @@ class MacBuilderBot(discord.Client):
     ) -> None:
         """A self-build: her own checkout, branched from a freshly fetched origin/main."""
         if not await self.require_allowed(interaction):
+            return
+        refusal = self._update_refusal()
+        if refusal:
+            await interaction.response.send_message(refusal, ephemeral=True)
             return
         task_text = await self._task_text(interaction, text, attachment)
         if task_text is None:
@@ -1460,7 +1517,10 @@ class MacBuilderBot(discord.Client):
         self._roadmap_waiting.pop(interaction.user.id, None)
         choice = (action or "").strip().lower()
         if choice in ("status", "stop", "pause", "resume"):
-            if choice in ("pause", "resume"):
+            if choice == "status" and self._update_waiting is not None:
+                text = (f"Roadmap paused while an update waits: "
+                        f"{self._roadmap_left()} job(s) left.")
+            elif choice in ("pause", "resume"):
                 text = self._roadmap_set_paused(choice == "pause")
             else:
                 text = self._roadmap_status() if choice == "status" else self._roadmap_stop()
@@ -1840,6 +1900,8 @@ class MacBuilderBot(discord.Client):
             return _clip_reply(f"Not {'previewed' if mode == 'preview' else 'queued'}: {exc}.")
         if mode == "preview":
             return _clip_reply(roadmap.preview(steps))
+        if self._update_waiting is not None:
+            return _clip_reply(self._update_refusal())
         self._roadmap_steps = steps
         self._roadmap_channel_id = channel_id
         self._roadmap_requester_id = requester_id
@@ -1924,7 +1986,7 @@ class MacBuilderBot(discord.Client):
         does nothing at all: nothing is queued, pinged or stopped. A job already
         queued or running keeps going and still waits for Approve.
         """
-        if self._roadmap_paused:
+        if self._roadmap_paused or self._update_waiting is not None:
             return
         if not self._roadmap_job and self._roadmap_steps:
             self._roadmap_job = self._roadmap_adopt() or self._roadmap_merge_job()
@@ -2296,20 +2358,122 @@ class MacBuilderBot(discord.Client):
         here changes a branch or a worktree.
         """
         while True:
+            if self._update_waiting is not None:
+                try:
+                    await self._update_wait_tick()
+                except Exception:
+                    log.exception("the update wait failed; still waiting")
+                await asyncio.sleep(UPDATE_TICK_SECONDS)
+                continue
             try:
                 notices = await asyncio.to_thread(self._update_watcher.check)
-                for text in notices:
+                skipped = getattr(self, "_skipped_tip", "")
+                for notice in notices:
+                    if getattr(notice, "kind", "") == "self" and notice.tip == skipped:
+                        continue
                     channel_id = getattr(self.settings, "notify_channel_id", None)
                     channel = self._target_channel(channel_id) if channel_id else None
                     if channel is None:
                         log.warning("no NOTIFY_CHANNEL_ID for an update notice")
                         continue
-                    await channel.send(text)
+                    offer = UpdateNoticeView(self, notice.tip) if getattr(notice, "kind", "") == "self" else None
+                    await channel.send(str(notice), view=offer)
             except asyncio.CancelledError:
                 raise
             except Exception:  # an update notice must never stop the bot
                 log.exception("update check failed")
             await asyncio.sleep(max(1.0, self._update_watcher.interval))
+
+    async def start_update_wait(self, interaction: discord.Interaction, tip: str) -> None:
+        """Offer accepted: wait for idle, then verify, pull and exit for launchd."""
+        if not getattr(self, "_supervised", False):
+            await interaction.response.send_message(supervision.manual_restart(), ephemeral=True)
+            return
+        reason = self._busy_reason() or "nothing is running, so it starts now"
+        self._update_waiting = {"tip": tip, "channel_id": interaction.channel_id or 0,
+                                "due": time.time() + UPDATE_PING_SECONDS}
+        await interaction.response.send_message(
+            f"Waiting to update to `{tip[:7]}`: {reason}. New jobs are paused; I check "
+            "every 30s and ping hourly while work is running.")
+
+    async def _update_wait_tick(self) -> None:
+        wait = self._update_waiting
+        if wait is None:
+            return
+        reason = self._busy_reason()
+        if reason:
+            if time.time() >= float(wait["due"]):
+                wait["due"] = time.time() + UPDATE_PING_SECONDS
+                await self._update_say(
+                    f"Still waiting to update to `{str(wait['tip'])[:7]}`: {reason}.", wait)
+            return
+        await self._apply_update(wait)
+
+    def _busy_reason(self) -> str:
+        """Why an update must wait: a running job (even on a question) or a queue."""
+        running = self.queue.running
+        if running is not None:
+            asked = " and waiting on a question" if self.freebuff.pending_question else ""
+            return f"`{running.id}` is still {running.status}{asked}"
+        waiting = self.queue.pending_count
+        return f"{waiting} job(s) are still queued" if waiting else ""
+
+    async def _update_say(self, text: str, wait: dict) -> None:
+        channel = self._target_channel(int(wait.get("channel_id") or 0))
+        if channel is not None:
+            await channel.send(_clip_reply(text))
+
+    async def _apply_update(self, wait: dict) -> None:
+        """Verify the new code in a worktree, pull only if it passes, then exit."""
+        tip, supervisor = str(wait["tip"]), self.supervisor
+        old, reason = supervisor.head(), supervisor.refusal(tip)
+        if reason:
+            self._update_waiting = None
+            return await self._update_say(f"Not updating: {reason}. Nothing was pulled.", wait)
+        ok, tail = await asyncio.to_thread(supervisor.verify, tip)
+        if not ok:
+            self._update_waiting = None
+            return await self._update_say(f"Staying on `{old[:7]}`: the suite failed on "
+                                          f"`{tip[:7]}`.\n```\n{tail[-1400:]}\n```", wait)
+        if self._busy_reason():
+            return  # work started while the suite ran; the next tick waits again
+        pulled, detail = await asyncio.to_thread(supervisor.pull)
+        if not pulled:
+            self._update_waiting = None
+            return await self._update_say(f"Staying on `{old[:7]}`: pull failed: {detail}", wait)
+        new = supervisor.head()
+        supervisor.note_applied(old, new, supervisor.subjects(old, new), wait["channel_id"])
+        self._update_waiting = None
+        await self._update_say(f"Restarting at `{new[:7]}` from `{old[:7]}`.", wait)
+        await self._exit_for_restart()
+
+    async def _exit_for_restart(self) -> None:
+        """Exit 0 so launchd's KeepAlive starts the new code; only when idle."""
+        await self.close()
+        os._exit(0)
+
+    def _update_refusal(self) -> str:
+        wait = self._update_waiting
+        if wait is None:
+            return ""
+        return (f"An update to `{str(wait.get('tip'))[:7]}` is waiting to apply, so I am "
+                "not taking new jobs; nothing is queued until it lands.")
+
+    async def _repost_reviews(self, channel: discord.abc.Messageable) -> list[str]:
+        """Fresh cards for saved reviews still awaiting a decision; same as /review."""
+        posted: list[str] = []
+        for record in review_record.load(self.settings):
+            rebuilt = review_record.outcome(record)
+            try:
+                await (self._target_channel(rebuilt.job.channel_id) or channel).send(
+                    content=f"Refreshed review for `{rebuilt.job.id}`: these buttons work now; Approve still pushes only this branch.",
+                    embed=review_embed(self.settings, rebuilt),
+                    view=ReviewView(self, rebuilt, refreshed=True))
+            except Exception:
+                log.exception("could not refresh the review for job %s", rebuilt.job.id)
+                continue
+            posted.append(rebuilt.job.id)
+        return posted
 
     def _target_channel(self, channel_id: int) -> discord.abc.Messageable | None:
         channel = self.get_channel(channel_id) if channel_id else None
