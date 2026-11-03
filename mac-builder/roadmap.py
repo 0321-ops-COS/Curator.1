@@ -10,6 +10,8 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from projects import DEFAULT_PROJECT
+
 MAX_TASK_CHARS = 6000
 HEADING = "## job"
 # A job that ended without an approval stops the roadmap.
@@ -22,24 +24,27 @@ class RoadmapError(ValueError):
 
 @dataclass
 class Step:
-    """One job of the sheet: its task, its kind, and the job it became."""
+    """One job of the sheet: its task, its kind, its project, the job it became."""
 
     text: str
     kind: str = "task"
     job_id: str = ""
+    # The project the step builds; a sheet without a "project: <id>" line keeps
+    # the checkout the bot already built before projects existed.
+    project: str = DEFAULT_PROJECT
 
 
 def parse(sheet: str) -> list[Step]:
     """The sheet's jobs in order, or RoadmapError naming the rule broken."""
     steps: list[Step] = []
-    block, kind, started = [], "task", False
+    block, kind, project, started = [], "task", DEFAULT_PROJECT, False
 
     def flush() -> None:
-        nonlocal block, kind
+        nonlocal block, kind, project
         text = "\n".join(block).strip()
         if text:
-            steps.append(Step(text, kind))
-        block, kind = [], "task"
+            steps.append(Step(text, kind, "", project))
+        block, kind, project = [], "task", DEFAULT_PROJECT
 
     for raw in (sheet or "").splitlines():
         line = raw.rstrip()
@@ -49,6 +54,14 @@ def parse(sheet: str) -> list[Step]:
             started = True
         elif started and head in ("kind: task", "kind: dan"):
             kind = head.split(":", 1)[1].strip()
+        elif started and head.startswith("project:"):
+            # One id per job; a sheet may not pick a project by description.
+            value = head.split(":", 1)[1].strip()
+            if not value or any(char.isspace() for char in value):
+                raise RoadmapError(
+                    'a "project:" line must name one id, as in "project: notes"'
+                )
+            project = value
         elif started:
             block.append(line)
     flush()
@@ -73,7 +86,9 @@ def preview(steps: list[Step]) -> str:
     are dropped from the end once the plan would pass PREVIEW_LIMIT, and the last
     line says how many jobs were left out.
     """
-    rows = [f"{number}. `{step.kind}` " + " ".join(step.text.split())[:PREVIEW_SNIPPET]
+    rows = [f"{number}. `{step.kind}` "
+            + (f"[{step.project}] " if step.project != DEFAULT_PROJECT else "")
+            + " ".join(step.text.split())[:PREVIEW_SNIPPET]
             for number, step in enumerate(steps, start=1)]
     lines = [f"Preview: {len(rows)} job(s), nothing queued or saved"]
     for index, row in enumerate(rows):
@@ -142,10 +157,13 @@ def load(path: Path) -> tuple[list[Step], int, int, bool]:
     for item in items:
         text = item.get("text") if isinstance(item, dict) else None
         kind = (item.get("kind") if isinstance(item, dict) else None) or "task"
+        project = item.get("project") if isinstance(item, dict) else None
+        if not (isinstance(project, str) and project.strip()):
+            project = DEFAULT_PROJECT
         if (not isinstance(text, str) or not text.strip()
                 or len(text) > MAX_TASK_CHARS or kind not in ("task", "dan")):
             return [], 0, 0, paused
-        steps.append(Step(text, kind, str(item.get("job_id") or "")))
+        steps.append(Step(text, kind, str(item.get("job_id") or ""), project.strip()))
     try:
         return (steps, int(data.get("channel_id") or 0),
                 int(data.get("requester_id") or 0), paused)

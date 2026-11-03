@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Sequence
 
 import merge_command
+import projects
 import questions
 import rules
 import screens
@@ -196,10 +197,18 @@ def make_job(
     requester_id: int,
     text: str = "",
     branch: str = "",
+    project: str = "",
 ) -> Job:
+    """One job, with the project it builds fixed here and never changed after."""
     job_id = new_job_id()
     log_dir = Path(getattr(settings, "log_dir"))
     log_dir.mkdir(parents=True, exist_ok=True)
+    chosen = (project or "").strip() or projects.DEFAULT_PROJECT
+    registry = getattr(settings, "projects", None)
+    if isinstance(registry, projects.Registry) and registry.get(chosen) is None:
+        raise ValueError(
+            f"unknown project {chosen!r}; known: {', '.join(registry.ids())}"
+        )
     return Job(
         id=job_id,
         kind=kind,
@@ -209,6 +218,7 @@ def make_job(
         log_path=log_dir / f"{job_id}.log",
         text=text,
         branch=branch,
+        project=chosen,
     )
 
 
@@ -725,12 +735,16 @@ class JobRunner:
             job, stage, detail
         )
         try:
-            env = await self.freebuff.start_task(
+            started = dict(
                 job_id=job.id,
                 task_text=job.text,
                 log_path=job.log_path,
                 kind=job.kind,
             )
+            if job.project and job.project != projects.DEFAULT_PROJECT:
+                # A hustler job is started exactly as before projects existed.
+                started["project"] = job.project
+            env = await self.freebuff.start_task(**started)
             self._running_env = env
             # The base commit belongs on the job card, so the owner can see
             # which commit the branch was actually cut from.
@@ -741,7 +755,9 @@ class JobRunner:
             )
             # What the gated /merge reads: the real base and repo, never guessed.
             job.base = env.base_branch
-            job.repo_slug = merge_command.repo_slug_for(self.settings, job.kind)
+            job.repo_slug = merge_command.repo_slug_for(
+                self.settings, job.kind, project=job.project
+            )
             self._stage(
                 job, status_board.FREEBUFF_WORKING, f"launched from {job.base_label}"
             )
