@@ -6,6 +6,7 @@ throwaway worktree, and Freebuff and the manager are replaced with recorders.
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
@@ -121,9 +122,10 @@ class ProjectChecksTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state, "passed")  # exactly what /merge gates on
         self.assertEqual(lines, ("pwd > first.txt: passed", "ls first.txt: passed"))
         # In order, in the job worktree: the second check saw the first's file.
-        self.assertEqual(
-            (self.worktree / "first.txt").read_text(encoding="utf-8").strip(),
-            str(self.worktree))
+        # `pwd` prints the physical path (the shell resolves the cwd) and on
+        # macOS /var is a symlink to /private/var, so compare resolved paths.
+        printed = (self.worktree / "first.txt").read_text(encoding="utf-8").strip()
+        self.assertEqual(os.path.realpath(printed), os.path.realpath(self.worktree))
         self.assertIsNone(rules.force_revise_reason(check_ok=True, test_ok=None))
 
     async def test_a_timed_out_check_is_reported_as_timed_out(self) -> None:
