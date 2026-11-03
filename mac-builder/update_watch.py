@@ -39,6 +39,13 @@ def _line(root: Path, *args: str, timeout: float = 30.0) -> str:
     return out.strip() if code == 0 else ""
 
 
+class Notice(str):
+    def __new__(cls, text: str, kind: str, tip: str) -> "Notice":
+        notice = super().__new__(cls, text)
+        notice.kind, notice.tip = kind, tip
+        return notice
+
+
 def group_for(path: str) -> str:
     if TESTS_RE.search(path):
         return "tests"
@@ -130,17 +137,19 @@ class UpdateWatcher:
     def enabled(self) -> bool:
         return self.interval > 0 and bool(self.running)
 
-    def status_line(self) -> str:
+    def status_line(self, supervised: bool | None = None) -> str:
         """The one-line /status field: running, origin, behind, supervised."""
+        note = ("supervised" if supervised is True else "not supervised; manual restart"
+                if supervised is False else "supervised unknown")
         if not self.running:
-            return "update: not a git checkout · supervised unknown"
+            return f"update: not a git checkout · {note}"
         if not self.enabled:
             return (f"update: running {self.running[:7]} · checks disabled "
-                    "(UPDATE_CHECK_SECONDS=0) · supervised unknown")
+                    f"(UPDATE_CHECK_SECONDS=0) · {note}")
         origin = self.origin if self.origin == "unknown" else self.origin[:7]
         behind = "unknown" if self.behind is None else str(self.behind)
         line = (f"update: running {self.running[:7]} · origin/main {origin} · "
-                f"{behind} behind · supervised unknown")
+                f"{behind} behind · {note}")
         return line + (" · last check failed" if self.error else "")
 
     def check(self) -> tuple[str, ...]:
@@ -166,9 +175,10 @@ class UpdateWatcher:
         if not self.behind or f"self:{tip}" in self._posted:
             return ()
         self._posted.add(f"self:{tip}")
-        return (_notice(f"🔄 New commits on origin/main for the bot's own code\n"
-                        f"running `{self.running[:7]}` · origin/main `{tip[:7]}`",
-                        self.behind, _changes(self.root, self.running, tip)),)
+        return (Notice(_notice(f"🔄 New commits on origin/main for the bot's own code\n"
+                               f"running `{self.running[:7]}` · origin/main `{tip[:7]}`",
+                               self.behind, _changes(self.root, self.running, tip)),
+                       "self", tip),)
 
     def _target_notice(self) -> tuple[str, ...]:
         if not self.branch:
