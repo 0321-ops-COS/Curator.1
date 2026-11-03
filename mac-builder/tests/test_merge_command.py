@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import bot  # noqa: E402
 import github_client  # noqa: E402
 import merge_command  # noqa: E402
+import projects  # noqa: E402
 
 TOKEN = "ghp_" + "Q1w2E3r4T5y6U7i8O9p0"  # split: a fixture, not a credential
 SHA = "a" * 40
@@ -26,6 +27,16 @@ SETTINGS = dict(max_diff_lines=400, authorized_branch="freebuff/base",
 FACTS = dict(id="20260101-000000-deadbeef", kind="dan", status="approved", branch="dan/x",
              base="origin/main", check_state="passed", diff_lines=12, merge_dry_run_sha=SHA,
              repo_slug="0321-ops-COS/Curator.1", changed_paths=("ios-app/RootView.swift",))
+
+
+def registry_for(project_id: str, protected: tuple[str, ...]) -> projects.Registry:
+    """Two projects; only the named one carries the entries under test."""
+    return projects.Registry([
+        projects.Project(id=entry, name=entry.title(), remote=f"git@github.com:o/{entry}.git",
+                         path=Path("/" + entry), authorized_branch=f"freebuff/{entry}",
+                         protected_paths=protected if entry == project_id else ())
+        for entry in ("hustler", "notes")
+    ])
 
 
 def client(calls: list, ci: str = "success", head: str = SHA) -> github_client.GitHubClient:
@@ -79,6 +90,28 @@ class GateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Merged PR #7", outcome.text)
         self.assertIn("press Revert on that page", outcome.text)
         self.assertNotIn(TOKEN, outcome.text)
+
+    async def test_a_projects_own_protected_path_stops_the_merge(self) -> None:
+        calls: list = []
+        outcome = await merge_command.run_merge(
+            SimpleNamespace(**{**FACTS, "project": "notes",
+                               "changed_paths": ("secrets/key.txt",)}),
+            SimpleNamespace(**SETTINGS, projects=registry_for("notes", ("secrets/",))),
+            dry_run=False, client=client(calls))
+        self.assertEqual((outcome.merged, [c for c in calls if c[0] == "PUT"]), (False, []))
+        self.assertIn("❌ protected paths:", outcome.text)
+        self.assertIn("protected by project notes: secrets/key.txt", outcome.text)
+
+    async def test_the_default_projects_protected_paths_are_ignored(self) -> None:
+        # Hustler must behave exactly as before, whatever its entry now carries.
+        calls: list = []
+        outcome = await merge_command.run_merge(
+            SimpleNamespace(**{**FACTS, "project": "hustler",
+                               "changed_paths": ("secrets/key.txt",)}),
+            SimpleNamespace(**SETTINGS, projects=registry_for("hustler", ("secrets/",))),
+            dry_run=False, client=client(calls))
+        self.assertTrue(outcome.merged, outcome.text)
+        self.assertIn("1 paths, none protected", outcome.text)
 
     async def test_hustler_main_is_never_merged_whatever_else_passes(self) -> None:
         outcome, merged = await self.gates(kind="task", branch="freebuff/a",

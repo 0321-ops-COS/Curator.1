@@ -56,6 +56,12 @@ async def run_merge(job: object, settings: object, *, dry_run: bool = True, clie
         mergeable, conflicts = detail.get("mergeable"), detail.get("mergeable_state") == "dirty"
         head = _text(detail.get("head_sha"))
         ci = await asyncio.to_thread(client.ci_states, head) if head else ()
+    project_id, project_protected = "", ()
+    registry = getattr(settings, "projects", None)
+    if isinstance(registry, projects.Registry):
+        entry = registry.get(_text(getattr(job, "project", "")))
+        if entry is not None and not entry.is_default:  # Hustler: as before
+            project_id, project_protected = entry.id, tuple(entry.protected_paths)
     results = merge_gates.evaluate_gates(MergeFacts(
         job_status=_text(getattr(job, "status", "")), branch=branch, base=base, repo=name,
         authorized_branch=_text(getattr(settings, "authorized_branch", "")),
@@ -65,6 +71,7 @@ async def run_merge(job: object, settings: object, *, dry_run: bool = True, clie
         pr_exists=pr is not None, pr_mergeable=mergeable, pr_conflicts=conflicts,
         ci_states=tuple(ci), head_sha=head, approved_sha=None,
         dry_run_sha=_text(getattr(job, "merge_dry_run_sha", "")),
+        project_id=project_id, project_protected=project_protected,
     ), max_diff_lines=int(getattr(settings, "max_diff_lines", 400) or 400))
     body = merge_gates.format_gates(results)
     if dry_run:
