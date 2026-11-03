@@ -883,8 +883,9 @@ class JobRunner:
                     )
                 )
                 project = self._project_for(job)
-                if project is not None:
-                    # A project's own protected list adds to the global one.
+                if project is not None and not project.is_default:
+                    # A project's own protected list adds to the global one; the
+                    # default project (hustler) behaves exactly as before.
                     violations += tuple(
                         projects.protected_violations(project, all_paths)
                     )
@@ -1465,12 +1466,15 @@ class JobRunner:
     ) -> tuple[str, str, bool | None, tuple[str, ...]]:
         """The project's checks after the job's edits; a clean run says "passed"."""
         _log_separator(job, f"project checks in {env.worktree}")
+        if not project.checks:
+            # Nothing ran, so this cannot be a pass: say so and force a revise.
+            self._stage(job, status_board.CHECKS, "no checks configured")
+            return "no checks configured", "", False, ("no checks configured",)
         self._stage(job, status_board.CHECKS,
                     f"{len(project.checks)} project check(s) running")
         checks = await run_project_checks(
             project, env.worktree, log_path=job.log_path)
-        lines = tuple(check.line() for check in checks) or (
-            "no project checks configured",)
+        lines = tuple(check.line() for check in checks)
         failed = tuple(check.line() for check in checks if not check.ok)
         tail = "\n".join(
             "\n".join((f"$ {check.command}", *check.tail)) for check in checks)

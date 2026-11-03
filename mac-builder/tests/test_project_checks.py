@@ -22,12 +22,14 @@ import rules  # noqa: E402
 from freebuff_runner import ChangeSet, TaskEnvironment  # noqa: E402
 
 
-def registry(*, checks=(), protected=(), kind="python") -> projects.Registry:
+def registry(*, checks=(), protected=(), kind="python",
+             default_protected=()) -> projects.Registry:
     """hustler as it is today, plus a non-default project with its own rules."""
     return projects.Registry([
         projects.Project(
             id="hustler", name="Hustler", remote="git@github.com:o/h.git",
-            path=Path("/hustler"), authorized_branch="freebuff/base"),
+            path=Path("/hustler"), authorized_branch="freebuff/base",
+            protected_paths=tuple(default_protected)),
         projects.Project(
             id="notes", name="Notes", remote="git@github.com:o/n.git",
             path=Path("/notes"), authorized_branch="freebuff/notes",
@@ -88,7 +90,8 @@ class ProjectChecksTests(unittest.IsolatedAsyncioTestCase):
         return await self.runner(**project_kwargs)._stage_outcome(
             self.job(), SimpleNamespace(worktree=self.worktree), "check")
 
-    async def review(self, changes: ChangeSet, **project_kwargs: object):
+    async def review(self, changes: ChangeSet, *, project: str = "notes",
+                     **project_kwargs: object):
         """Run the whole pipeline for one change set and record what it did."""
         manager, posted = ApprovingManager(), []
 
@@ -104,7 +107,7 @@ class ProjectChecksTests(unittest.IsolatedAsyncioTestCase):
             project=SimpleNamespace(prompt_block=lambda: "ctx"))
         runner = jobs.JobRunner(settings, manager, FakeFreebuff(changes, self.worktree),
                                 post_job=post_job, post_review=post_review)
-        ok, _summary = await runner._run_task(self.job())
+        ok, _summary = await runner._run_task(self.job(project))
         return ok, posted, manager, settings
 
     def change(self, path: str = "src/notes.py", **overrides: object) -> ChangeSet:
@@ -203,6 +206,29 @@ class ProjectChecksTests(unittest.IsolatedAsyncioTestCase):
                   for field in bot.review_embed(settings, posted[0]).fields}
         self.assertEqual(fields["Checks"], "echo ok: passed\ntrue: passed")
         self.assertEqual(fields["Check"], "passed")
+
+    async def test_an_empty_check_list_cannot_pass(self) -> None:
+        ok, posted, _manager, _settings = await self.review(self.change(), checks=[])
+        self.assertFalse(ok)
+        self.assertIs(posted[0].check_ok, False)
+        self.assertEqual(posted[0].check_state, "no checks configured")
+        self.assertEqual(posted[0].check_lines, ("no checks configured",))
+        self.assertNotEqual(posted[0].verdict, "approve")
+        self.assertIn("- no checks configured", posted[0].notes)
+
+    async def test_a_default_projects_protected_paths_are_ignored(self) -> None:
+        # hustler behaves exactly as it did before projects existed.
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        for name in ("check.sh", "test.sh"):
+            (scripts / name).write_text("exit 0\n", encoding="utf-8")
+        with mock.patch.object(jobs, "SCRIPT_DIR", scripts):
+            ok, posted, manager, _settings = await self.review(
+                self.change("lib/x.py"), project="hustler",
+                default_protected=["lib/"])
+        self.assertTrue(ok, posted[0].check_state)
+        self.assertEqual(manager.calls, ["review"])
+        self.assertEqual(posted[0].violations, ())
 
 
 if __name__ == "__main__":
