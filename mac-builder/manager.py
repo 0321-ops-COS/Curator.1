@@ -232,6 +232,51 @@ Rules:
 """
 
 
+@dataclass(frozen=True)
+class SheetLimits:
+    """The live numbers every planned job must fit: diff lines and characters."""
+
+    max_diff_lines: int
+    max_task_chars: int
+
+
+SHEET_SYSTEM_PROMPT = """You are the repo manager for a private iOS build bot. Your project, repo and
+builder are given under PROJECT below. You turn one goal into a build sheet the
+owner can approve job by job. You never edit code, run commands, push or merge
+anything, and a sheet request builds nothing.
+
+Reply with ONLY the sheet. Every job is one "## Job" heading followed by that
+job's text; optional "kind: task" or "kind: dan" and "project: <id>" lines go
+under the heading. No title, no prose, no summary, no markdown fence, and nothing
+before the first heading or after the last job.
+
+Rules for every job:
+- It is self-contained: the builder sees only that job's text, never this goal or
+  another job. State the goal, the files it touches, its acceptance as a command
+  or an observable result, and what is out of scope.
+- It fits under the changed-line and character limits given under LIMITS below.
+- Jobs run one at a time, and each waits for the owner's Approve and for its
+  branch to be merged before the next starts. Order them by dependency and keep
+  each one mergeable on its own.
+- Use only paths that appear in the file map. If a path is not there, write
+  "confirm the path" instead of inventing one.
+- Never plan an edit to a protected path: project.yml, *.xcconfig, .github/,
+  .env*, signing or provisioning files, and mac-builder/ for a task job.
+- There is no limit on the number of jobs: use as many as the goal needs, each
+  within the limits above.
+- Label any claim you did not verify as assumed.
+"""
+
+
+def sheet_system_prompt(limits: SheetLimits) -> str:
+    """The sheet prompt with this bot's live limits filled in."""
+    return SHEET_SYSTEM_PROMPT + (
+        "LIMITS\n"
+        f"- At most {limits.max_diff_lines} changed lines per job (MAX_DIFF_LINES).\n"
+        f"- At most {limits.max_task_chars} characters of text per job.\n"
+    )
+
+
 ANSWER_SYSTEM_PROMPT = """You answer ONE question from an interactive builder agent, so
 its job can continue without the owner. You have no tools, cannot edit code and
 cannot run commands.
@@ -520,7 +565,8 @@ OPTIONS
     ]
 
 
-def build_plan_messages(inputs: PlanInputs) -> list[dict[str, str]]:
+def _plan_material(inputs: PlanInputs) -> str:
+    """The material a plan and a sheet may both see, capped and marked when cut."""
     recent = "\n".join(f"- {line}" for line in inputs.recent) or "- (no job logs yet)"
     files = "\n".join(f"- {entry}" for entry in inputs.file_map) or "- (not listed)"
     gaps = "\n".join(f"- {line}" for line in inputs.known_gaps) or "- (none recorded)"
@@ -536,15 +582,38 @@ FILE MAP (top level of the target checkout)
 KNOWN GAPS (from the README)
 {gaps}
 """
-    system = PLAN_SYSTEM_PROMPT
-    if inputs.project_block.strip():
-        system += "\nPROJECT\n" + inputs.project_block.strip() + "\n"
-    clipped = len(user) > MAX_PLAN_CHARS
-    if clipped:
+    if len(user) > MAX_PLAN_CHARS:
         user = _truncate(user, MAX_PLAN_CHARS) + (
             "\n\n[NOTE: the material above was truncated to fit this request, so some "
             "job lines are missing. Say so in Evidence if it matters.]\n"
         )
+    return user
+
+
+def build_plan_messages(inputs: PlanInputs) -> list[dict[str, str]]:
+    system = PLAN_SYSTEM_PROMPT
+    if inputs.project_block.strip():
+        system += "\nPROJECT\n" + inputs.project_block.strip() + "\n"
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": _plan_material(inputs)},
+    ]
+
+
+def build_sheet_messages(inputs: PlanInputs, limits: SheetLimits,
+                         correction: str = "") -> list[dict[str, str]]:
+    """The sheet prompt, the same material, and why the last reply was refused."""
+    user = _plan_material(inputs)
+    if correction:
+        user += (
+            "\nYOUR PREVIOUS REPLY WAS REFUSED\n"
+            f"{correction}\n"
+            "Reply again with only the sheet: jobs as \"## Job\" headings, with no "
+            "prose around them.\n"
+        )
+    system = sheet_system_prompt(limits)
+    if inputs.project_block.strip():
+        system += "\nPROJECT\n" + inputs.project_block.strip() + "\n"
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -857,6 +926,18 @@ class Manager:
             raise ManagerUnavailable("manager returned an empty plan")
         if truncated:
             log.warning("the manager's plan hit the token limit and is incomplete")
+        return PlanResult(text=text.strip(), truncated=truncated)
+
+    async def plan_sheet(self, inputs: PlanInputs, limits: SheetLimits, *,
+                         correction: str = "") -> PlanResult:
+        """Draft a build sheet for the goal. Text only: no tools, no jobs, no edits."""
+        text, truncated = await self._complete_with_meta(
+            build_sheet_messages(inputs, limits, correction), max_tokens=self.max_tokens
+        )
+        if not text.strip():
+            raise ManagerUnavailable("manager returned an empty sheet")
+        if truncated:
+            log.warning("the manager's sheet hit the token limit and is incomplete")
         return PlanResult(text=text.strip(), truncated=truncated)
 
     async def chat(self, messages: Sequence[dict[str, str]], context: str) -> ChatReply:

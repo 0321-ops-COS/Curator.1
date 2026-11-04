@@ -59,6 +59,7 @@ import rules  # noqa: E402
 import screens  # noqa: E402
 import selftest  # noqa: E402
 import sheet_card  # noqa: E402
+import sheet_plan  # noqa: E402
 import heartbeat
 import status_board  # noqa: E402
 import supervision  # noqa: E402
@@ -946,6 +947,9 @@ class MacBuilderBot(discord.Client):
                 callback=self.cmd_plan,
             )
         )
+        self.tree.add_command(app_commands.Command(
+            name="plansheet", callback=self.cmd_plansheet,
+            description="Draft a build sheet from a goal (read-only: nothing is queued)"))
         self.tree.add_command(
             app_commands.Command(
                 name="check",
@@ -1372,6 +1376,19 @@ class MacBuilderBot(discord.Client):
             "claim is labelled verified or assumed.",
             file=discord.File(path, filename=path.name),
         )
+
+    # ----------------------------------------------------------- plansheet
+
+    @app_commands.describe(
+        goal="What you want built; a draft sheet goes on the card and nothing is queued",
+        project="Project id to plan for; empty plans for this bot's own project",
+    )
+    async def cmd_plansheet(
+        self, interaction: discord.Interaction, goal: str,
+        project: Optional[str] = None,
+    ) -> None:
+        """A goal becomes a draft sheet; the work is in sheet_plan, nothing is queued."""
+        await sheet_plan.command(self, interaction, goal, project or "")
 
     # ----------------------------------------------------------- fixed jobs
 
