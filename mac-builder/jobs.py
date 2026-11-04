@@ -116,6 +116,8 @@ class ReviewOutcome:
     test_counts: str = ""
     # "Test-only change: no app code was changed", when the diff is only tests.
     test_only: str = ""
+    # The CI state GitHub reported for the reviewed commit; set when posted.
+    ci_state: str = ""
 
 
 @dataclass
@@ -226,6 +228,7 @@ def make_job(
     channel_id: int,
     requester_id: int,
     text: str = "",
+    original_text: str = "",
     branch: str = "",
     project: str = "",
 ) -> Job:
@@ -247,6 +250,8 @@ def make_job(
         requester_id=requester_id,
         log_path=log_dir / f"{job_id}.log",
         text=text,
+        # The owner's request as written, whatever a later rewrite makes of it.
+        original_text=original_text or text,
         branch=branch,
         project=chosen,
     )
@@ -966,6 +971,7 @@ class JobRunner:
                     test_tail=test_tail,
                     round_number=env.round,
                     project_context=_project_block(self.settings),
+                    original_request=evidence.original_request(job),
                 )
                 self._stage(
                     job,
@@ -975,6 +981,11 @@ class JobRunner:
                 review = await self.manager.review(brief)
                 verdict = review.verdict
                 notes = review.notes
+                if getattr(review, "untouched_symptoms", ()):
+                    verdict, notes = evidence.block_approve(
+                        verdict, notes,
+                        "The original request has symptoms this diff does not "
+                        "touch: " + "; ".join(review.untouched_symptoms) + ".")
                 if test_only:
                     verdict, notes = evidence.block_approve(
                         verdict, notes,

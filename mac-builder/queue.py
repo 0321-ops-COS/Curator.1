@@ -27,6 +27,9 @@ class Job:
     requester_id: int
     log_path: Path
     text: str = ""
+    # The owner's own wording, kept before any planner rewrite; the review card
+    # and the manager prompt quote it.
+    original_text: str = ""
     # A plan the job was started from, when it has one; the manager reads it
     # before it answers a question.
     plan: str = ""

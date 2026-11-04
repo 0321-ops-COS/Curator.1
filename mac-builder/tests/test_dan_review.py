@@ -127,10 +127,17 @@ class TestCountAgainstMainTests(unittest.TestCase):
             "    def test_two(self):\n        pass\n",
             encoding="utf-8",
         )
+        swift = self.repo / "ios-app" / "HustlerTests"
+        swift.mkdir(parents=True)
+        (swift / "LoginTests.swift").write_text(
+            "final class LoginTests: XCTestCase {\n"
+            "    func testLogin() {}\n    func testLogout() {}\n}\n",
+            encoding="utf-8",
+        )
         self._git("init", "-q")
         self._git("config", "user.email", "test@example.com")
         self._git("config", "user.name", "Test")
-        self._git("add", "mac-builder/tests/test_sample.py")
+        self._git("add", "-A")
         self._git("commit", "-qm", "base")
         self._git("branch", "-M", "main")
 
@@ -149,6 +156,18 @@ class TestCountAgainstMainTests(unittest.TestCase):
         )
         self.assertEqual(len(problems), 1)
         self.assertIn("fewer than", problems[0])
+
+    def test_a_removed_swift_test_is_a_problem(self) -> None:
+        self.assertEqual(dan_review.count_swift_tests_at_ref(self.repo, "main"), 2)
+        (self.repo / "ios-app/HustlerTests/LoginTests.swift").write_text(
+            "final class LoginTests: XCTestCase {\n    func testLogin() {}\n}\n",
+            encoding="utf-8",
+        )
+        problems = dan_review.test_count_problems(
+            self.repo, ["ios-app/HustlerTests/LoginTests.swift"], base_ref="main"
+        )
+        self.assertEqual(len(problems), 1)
+        self.assertIn("XCTest function", problems[0])
 
     def test_untouched_tests_are_not_compared(self) -> None:
         self.assertEqual(

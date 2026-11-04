@@ -70,5 +70,47 @@ class TestOnlyTests(unittest.TestCase):
                          ("revise", "Do it again."))
 
 
+class CiTests(unittest.TestCase):
+    def test_a_failure_wins_then_pending_then_passed_then_none(self) -> None:
+        self.assertEqual(evidence.ci_label(("success", "failure")), "failed")
+        self.assertEqual(evidence.ci_label(("success", "pending")), "pending")
+        self.assertEqual(evidence.ci_label(("success",)), "passed")
+        self.assertEqual(evidence.ci_label(()), "none")
+
+
+class SwiftCountingTests(unittest.TestCase):
+    def test_xctest_functions_are_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp)
+            (app / "LoginTests.swift").write_text(
+                "@MainActor\nfinal class LoginTests: XCTestCase {\n"
+                "    func testLogin() async throws {}\n"
+                "    func testLogout() {}\n    func helper() {}\n}\n",
+                encoding="utf-8")
+            self.assertEqual(dan_review.count_swift_tests(app), 2)
+
+
+class PromptTests(unittest.TestCase):
+    def test_the_prompt_carries_the_original_request_and_the_symptom_question(self) -> None:
+        brief = manager.ReviewBrief(
+            task="Rewrite the login flow.", diff="+let x = 1\n", diff_lines=1, status="",
+            changed_files=["ios-app/Hustler/Login.swift"], check_state="passed",
+            check_tail="", test_state="not run", test_tail="",
+            original_request="Login is broken on iPad; the button does nothing.")
+        messages = manager.build_review_messages(brief)
+        self.assertIn("ORIGINAL REQUEST", messages[1]["content"])
+        self.assertIn("the button does nothing", messages[1]["content"])
+        self.assertIn("every symptom", messages[0]["content"])
+
+    def test_untouched_symptoms_are_parsed_or_empty(self) -> None:
+        parsed = manager.parse_review(
+            '{"verdict": "approve", "notes": "fine", '
+            '"untouched_symptoms": ["the icon is still wrong", ""]}')
+        self.assertEqual(parsed.untouched_symptoms, ("the icon is still wrong",))
+        self.assertEqual(
+            manager.parse_review('{"verdict": "approve", "notes": "fine"}')
+            .untouched_symptoms, ())
+
+
 if __name__ == "__main__":
     unittest.main()

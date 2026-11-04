@@ -70,6 +70,15 @@ def append_block(message: str, block: str) -> str:
     return f"{head}\n\n{body}" if head else body
 
 
+def original_request(job: object) -> str:
+    """The owner's own wording, before any rewrite; '' when none was kept."""
+    for value in (getattr(job, "original_text", ""), getattr(job, "text", "")):
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
 def is_swift_test_path(path: str) -> bool:
     """True for an XCTest file under ios-app."""
     value = str(path or "").replace("\\", "/").lstrip("./")
@@ -94,6 +103,16 @@ def test_only_note(kind: str, changed_paths: Iterable[str]) -> str:
     """The card's line for a fix that changed only tests: it proves nothing."""
     return TEST_ONLY_NOTE if (str(kind) in TEST_ONLY_KINDS
                               and is_test_only(changed_paths)) else ""
+
+
+def ci_label(states: Sequence[str]) -> str:
+    """One word for a CI state list; a failure wins over everything else."""
+    items = [str(state).strip().lower() for state in states or () if str(state).strip()]
+    if any(state in ("failure", "failed", "error", "timed_out") for state in items):
+        return "failed"
+    if "pending" in items:
+        return "pending"
+    return "passed" if items else "none"
 
 
 def block_approve(verdict: str, notes: str, reason: str) -> tuple[str, str]:
