@@ -51,15 +51,24 @@ def stage_line(label: str, command: str, state: str, counts_text: str = "") -> s
 
 
 def verification_block(outcome: object) -> str:
-    """The exact check and test commands run, their state and their counts."""
-    return "Verification\n" + "\n".join((
+    """The exact check, test and build commands run, with their state.
+
+    The build only appears when it ran: a scheme with a test action already
+    built the app, and a stage that did not run is never named as one that did.
+    """
+    lines = [
         stage_line("check", getattr(outcome, "check_command", ""),
                    getattr(outcome, "check_state", ""),
                    getattr(outcome, "check_counts", "")),
         stage_line("test", getattr(outcome, "test_command", ""),
                    getattr(outcome, "test_state", ""),
                    getattr(outcome, "test_counts", "")),
-    ))
+    ]
+    build_state = str(getattr(outcome, "build_state", "") or "").strip()
+    if build_state and build_state != "not run":
+        lines.append(stage_line("build", getattr(outcome, "build_command", ""),
+                                build_state))
+    return "Verification\n" + "\n".join(lines)
 
 
 def append_block(message: str, block: str) -> str:
