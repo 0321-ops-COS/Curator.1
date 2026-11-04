@@ -134,6 +134,8 @@ MAX_LOG_TAIL_CHARS = 2500
 
 RETRY_DELAY_SECONDS = 2.0
 
+MAX_SYMPTOMS = 5
+MAX_SYMPTOM_CHARS = 200
 MAX_CAUSE_CHARS = 600
 MAX_CAUSE_TAIL_CHARS = 6000
 CAUSE_SYSTEM_PROMPT = """You explain why one build or test stage failed, for the owner of a private iOS
@@ -165,6 +167,10 @@ Judge only the material given to you:
 3. Is there scope creep: unrelated edits, new dependencies, refactors?
 4. Were tests weakened, deleted or skipped?
 5. Is anything risky for a private, single-user app?
+6. Does the diff address every symptom in the original request (the owner's own
+   words, under ORIGINAL REQUEST)? List any symptom it does not touch in
+   untouched_symptoms. If anything is untouched you may not answer "approve":
+   use "ask_user" or "revise" and name the missing symptom.
 
 Verdicts:
 - "approve": the change does the task, is in scope, and looks sound.
@@ -174,7 +180,8 @@ Verdicts:
   incomplete or ambiguous to judge.
 
 Answer with ONLY a JSON object, no markdown fence, no commentary:
-{"verdict": "approve" | "revise" | "ask_user", "notes": "..."}
+{"verdict": "approve" | "revise" | "ask_user", "notes": "...",
+ "untouched_symptoms": ["..."]}
 Keep notes under 1500 characters. Empty notes are only acceptable for approve.
 """
 
@@ -295,6 +302,8 @@ class ReviewBrief:
     test_tail: str
     round_number: int = 0
     project_context: str = ""
+    # The owner's own words, kept before any planner rewrite.
+    original_request: str = ""
 
 
 @dataclass
@@ -303,6 +312,8 @@ class ReviewResult:
     notes: str
     raw: str = ""
     error: str = ""
+    # Symptoms of the original request the manager says the diff leaves alone.
+    untouched_symptoms: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -428,7 +439,11 @@ def build_review_messages(brief: ReviewBrief) -> list[dict[str, str]]:
     if len(brief.changed_files) > 120:
         changed += f", ... (+{len(brief.changed_files) - 120} more)"
     diff_text = brief.diff.strip() or "(no diff text; see diff line count and status)"
-    user = f"""TASK GIVEN TO THE BUILDER
+    original = brief.original_request.strip() or "(not recorded)"
+    user = f"""ORIGINAL REQUEST (the owner's own words, before any rewording)
+{_truncate(original, 6000)}
+
+TASK GIVEN TO THE BUILDER
 {brief.task}
 
 REVIEW ROUND
@@ -551,7 +566,20 @@ def parse_review(text: str) -> ReviewResult:
     notes = rules.clamp_notes(payload.get("notes"))
     if verdict == "revise" and not notes:
         notes = "The manager asked for a revision but did not explain why. Review the diff manually."
-    return ReviewResult(verdict=verdict, notes=notes, raw=raw[:4000])
+    symptoms = _symptoms(payload.get("untouched_symptoms"))
+    return ReviewResult(verdict=verdict, notes=notes, raw=raw[:4000],
+                        untouched_symptoms=symptoms)
+
+
+def _symptoms(value: object) -> tuple[str, ...]:
+    """The untouched symptoms a review named, cleaned and capped."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return ()
+    cleaned = [" ".join(str(item).split())[:MAX_SYMPTOM_CHARS]
+               for item in value if isinstance(item, str) and item.strip()]
+    return tuple(cleaned[:MAX_SYMPTOMS])
 
 
 def _extract_json_object(text: str) -> dict[str, object] | None:

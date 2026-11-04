@@ -542,6 +542,24 @@ def review_compare_url(settings: object, outcome: ReviewOutcome) -> str | None:
     return compare_link.compare_url(remote, base, env.branch)
 
 
+async def review_ci_state(settings: object, outcome: ReviewOutcome) -> str:
+    """The CI state GitHub reports for the reviewed commit: passed/failed/pending/none.
+
+    Read-only, through the existing client. No repo, no commit or no CI at all is
+    "none"; a call that fails says "none" too rather than a pass.
+    """
+    owner, _, name = str(getattr(outcome.job, "repo_slug", "") or "").partition("/")
+    sha = outcome.snapshot.partition(":")[0]
+    if not (owner and name and sha):
+        return "none"
+    try:
+        client = github_client.GitHubClient.from_env(owner, name)
+        return evidence.ci_label(await asyncio.to_thread(client.ci_states, sha))
+    except (github_client.GitHubError, OSError) as exc:
+        log.info("CI state for %s could not be read: %s", outcome.job.id, exc)
+        return "none"
+
+
 def approve_confirm_text(settings: object, outcome: ReviewOutcome, user_id: int,
                          sha: str) -> str:
     """What the Approve button confirms, with the link still in front of him."""
@@ -615,10 +633,14 @@ def review_embed(settings: object, outcome: ReviewOutcome) -> discord.Embed:
     embed.add_field(name="Files", value=str(len(outcome.changed_files)), inline=True)
     embed.add_field(name="Job", value=f"`{outcome.job.id}`", inline=True)
     embed.add_field(name="Log", value=f"`{outcome.job.log_path.name}`", inline=False)
+    original = evidence.original_request(outcome.job)
+    if original:
+        embed.add_field(name="Original request", value=original[:1000], inline=False)
     if outcome.test_only:
         embed.add_field(name="Test-only", value=outcome.test_only[:300], inline=False)
     embed.add_field(name="Verification", inline=False,
                     value=evidence.verification_block(outcome)[:1000])
+    embed.add_field(name="CI", value=outcome.ci_state or "none", inline=True)
     if outcome.check_lines:  # the project's own checks, one line each
         embed.add_field(name="Checks", inline=False,
                         value="\n".join(outcome.check_lines)[:1000])
@@ -683,6 +705,17 @@ class ReviewView(discord.ui.View):
         if interaction.message is not None:
             await interaction.message.edit(view=self)
 
+    async def _ci_state(self) -> str:
+        """Re-read CI when Approve is pressed; a failed read never blocks a push."""
+        hook = getattr(self.bot, "ci_state", None)
+        if hook is None:
+            return self.outcome.ci_state or "none"
+        try:
+            return await hook(self.outcome)
+        except Exception:  # a CI read must never hide the push or its error
+            log.exception("could not re-read CI for %s", self.outcome.job.id)
+            return "none"
+
     def _decided(self, status: str) -> None:
         """Tell the bot what was decided; a fake bot without the hook is fine."""
         hook = getattr(self.bot, "review_decided", None)
@@ -712,6 +745,12 @@ class ReviewView(discord.ui.View):
             if why:
                 await self._finish(interaction, why)
                 return
+        if await self._ci_state() == "failed":
+            await self._reopen(
+                interaction,
+                "CI failed for the reviewed commit, so nothing was pushed. "
+                "Rerun CI, then review and approve again.")
+            return
         env = self.outcome.environment
         if env is None:
             await self._finish(interaction, "Nothing to push; the worktree was not kept.")
@@ -3039,6 +3078,10 @@ class MacBuilderBot(discord.Client):
             except Exception:  # a report may never fail a review
                 log.exception("could not post a report line for job %s", outcome.job.id)
 
+    async def ci_state(self, outcome: ReviewOutcome) -> str:
+        """Re-read CI for an Approve press, so a failure there blocks the push."""
+        return await review_ci_state(self.settings, outcome)
+
     async def review_refusal(self, outcome: ReviewOutcome) -> str | None:
         """Why a refreshed card must not act, in plain words; None to go ahead."""
         record = review_record.load_one(self.settings, outcome.job.id)
@@ -3088,6 +3131,8 @@ class MacBuilderBot(discord.Client):
         # Save the card's facts before posting: a send that never lands or a
         # restart that loses the buttons is then recoverable with /review.
         if outcome.verdict != "blocked":
+            outcome = replace(
+                outcome, ci_state=await review_ci_state(self.settings, outcome))
             review_record.save(self.settings, outcome)
         self._remember_merge_job(outcome.job)
         channel = self._target_channel(outcome.job.channel_id)

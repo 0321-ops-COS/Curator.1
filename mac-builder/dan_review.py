@@ -8,10 +8,12 @@ import subprocess
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Sequence
 
+import evidence
 import rules
 
 DEFAULT_BASE_REF = "origin/main"
 TEST_DIR = "mac-builder/tests"
+IOS_DIR = evidence.IOS_DIR
 MAX_REPORTED_PATHS = 5
 
 _DO_NOT_RE = re.compile(
@@ -20,6 +22,10 @@ _DO_NOT_RE = re.compile(
 )
 _SPLIT_RE = re.compile(r"\s*(?:,|;|\band\b|\bor\b)\s*", re.IGNORECASE)
 _TEST_DEF_RE = re.compile(r"^[ \t]*(?:async[ \t]+)?def[ \t]+test", re.MULTILINE)
+# XCTest: `func testX()`, with any attributes on the line before or beside it.
+_SWIFT_TEST_RE = re.compile(
+    r"(?m)^[ \t]*(?:@\w+(?:\([^)]*\))?[ \t]+)*func[ \t]+test\w*[ \t]*\(")
+SWIFT_SUFFIX = ".swift"
 
 
 def _normalized(paths: Iterable[str]) -> list[str]:
@@ -94,31 +100,75 @@ def _git(worktree: Path, *args: str) -> str | None:
     return done.stdout if done.returncode == 0 else None
 
 
-def count_tests_at_ref(worktree: Path, base_ref: str = DEFAULT_BASE_REF) -> int | None:
-    """Test functions in mac-builder/tests at base_ref, or None if unreadable."""
-    ref = base_ref.strip() or DEFAULT_BASE_REF
-    listed = _git(worktree, "ls-tree", "-r", "--name-only", ref, "--", TEST_DIR)
+def count_swift_tests(directory: Path) -> int:
+    """XCTest functions defined by the Swift files under this directory."""
+    total = 0
+    for path in Path(directory).rglob("*.swift"):
+        try:
+            total += len(_SWIFT_TEST_RE.findall(
+                path.read_text(encoding="utf-8", errors="replace")))
+        except OSError:
+            pass
+    return total
+
+
+def _sources_at_ref(worktree: Path, ref: str, directory: str, suffix: str) -> list[str] | None:
+    """The files of one directory at ref, or None when they cannot be read."""
+    listed = _git(worktree, "ls-tree", "-r", "--name-only", ref, "--", directory)
     if listed is None:
         return None
     sources = [_git(worktree, "show", f"{ref}:{name}")
-               for name in listed.splitlines() if name.endswith(".py")]
+               for name in listed.splitlines() if name.endswith(suffix)]
     if None in sources:
         return None
-    return sum(len(_TEST_DEF_RE.findall(source)) for source in sources if source)
+    return [source for source in sources if source]
+
+
+def count_tests_at_ref(worktree: Path, base_ref: str = DEFAULT_BASE_REF) -> int | None:
+    """Test functions in mac-builder/tests at base_ref, or None if unreadable."""
+    sources = _sources_at_ref(
+        worktree, base_ref.strip() or DEFAULT_BASE_REF, TEST_DIR, ".py")
+    return None if sources is None else sum(
+        len(_TEST_DEF_RE.findall(source)) for source in sources)
+
+
+def count_swift_tests_at_ref(worktree: Path, base_ref: str = DEFAULT_BASE_REF) -> int | None:
+    """XCTest functions in ios-app at base_ref, or None if unreadable."""
+    sources = _sources_at_ref(
+        worktree, base_ref.strip() or DEFAULT_BASE_REF, IOS_DIR, SWIFT_SUFFIX)
+    return None if sources is None else sum(
+        len(_SWIFT_TEST_RE.findall(source)) for source in sources)
 
 
 def test_count_problems(
     worktree: Path, changed_paths: Sequence[str], *, base_ref: str = DEFAULT_BASE_REF,
 ) -> list[str]:
-    """Compare the test count with base_ref, but only when a test file changed."""
-    if not any(p.startswith(TEST_DIR + "/") for p in _normalized(changed_paths)):
+    """Compare the test count with base_ref, for whichever test kind changed.
+
+    Python tests and Swift XCTest functions are counted separately, so a removed
+    or weakened Swift test is caught as well as a Python one.
+    """
+    paths = _normalized(changed_paths)
+    python = any(p.startswith(TEST_DIR + "/") for p in paths)
+    swift = any(evidence.is_swift_test_path(p) for p in paths)
+    if not python and not swift:
         return []
-    before = count_tests_at_ref(worktree, base_ref)
-    after = count_tests(Path(worktree) / TEST_DIR)
-    if before is None or after >= before:
-        return []
-    return [f"The change leaves {after} Python test(s) in {TEST_DIR}/, fewer than "
-            f"main's {before}; keep at least as many tests as main has."]
+    problems: list[str] = []
+    if python:
+        before = count_tests_at_ref(worktree, base_ref)
+        after = count_tests(Path(worktree) / TEST_DIR)
+        if before is not None and after < before:
+            problems.append(
+                f"The change leaves {after} Python test(s) in {TEST_DIR}/, fewer "
+                f"than main's {before}; keep at least as many tests as main has.")
+    if swift:
+        before = count_swift_tests_at_ref(worktree, base_ref)
+        after = count_swift_tests(Path(worktree) / IOS_DIR)
+        if before is not None and after < before:
+            problems.append(
+                f"The change leaves {after} XCTest function(s) in {IOS_DIR}/, fewer "
+                f"than main's {before}; keep at least as many tests as main has.")
+    return problems
 
 
 def problems(
