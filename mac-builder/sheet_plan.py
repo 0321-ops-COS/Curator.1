@@ -196,8 +196,14 @@ def project_material(settings, project_id: str = "") -> tuple[str, Path]:
     return block, Path(getattr(settings, "repo_dir", Path.cwd()))
 
 
-async def command(bot, interaction, goal: str, project: str = "") -> None:
-    """Draft a build sheet for a goal and post it on the draft-sheet card."""
+async def command(bot, interaction, goal: str, project: str = "", *,
+                  prompt_goal: str = "", source: str = "/plansheet") -> None:
+    """Draft a build sheet for a goal and post it on the draft-sheet card.
+
+    ``prompt_goal`` is what the manager reads when it is not the goal itself
+    (/feedback frames an owner's note); the sheet, the attachment and the card
+    keep the owner's own words. ``source`` only names the command that asked.
+    """
     if not await bot.require_allowed(interaction):
         return
     await interaction.response.defer(thinking=True)
@@ -217,7 +223,7 @@ async def command(bot, interaction, goal: str, project: str = "") -> None:
         return
     block, target = project_material(settings, chosen)
     inputs = planner.gather(
-        goal=goal,
+        goal=(prompt_goal or goal),
         project_block=block,
         log_dir=settings.log_dir,
         target_dir=target,
@@ -255,7 +261,7 @@ async def command(bot, interaction, goal: str, project: str = "") -> None:
         return
     created = time.strftime("%Y-%m-%d %H:%M")
     document = sheet_document(
-        inputs.goal, steps,
+        goal, steps,
         bot_name=str(getattr(settings, "bot_name", "Melisa") or "Melisa"),
         created=created,
     )
@@ -273,14 +279,14 @@ async def command(bot, interaction, goal: str, project: str = "") -> None:
         previous.message_id if previous else 0,
     )
     sheet_card.save(bot._sheet_draft_path(), bot._sheet_draft)
-    note = f"From /plansheet: {inputs.goal[:80]}."
+    note = f"From {source}: {goal[:80]}."
     if previous is not None:
         note += " " + REPLACED_NOTE
     if attempt.warnings:
         note += "\n" + "\n".join(attempt.warnings)
     await sheet_card.post(bot, note=note, title=DRAFT_TITLE)
     await interaction.followup.send(
-        f"Planned `{inputs.goal[:80]}` as {len(steps)} job(s) on the draft card; nothing "
+        f"Planned `{goal[:80]}` as {len(steps)} job(s) on the draft card; nothing "
         f"is queued, approved, pushed or merged. The whole sheet is attached and saved "
         f"as `{path.name}`.",
         file=discord.File(path, filename=path.name),

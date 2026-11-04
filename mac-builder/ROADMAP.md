@@ -6,119 +6,122 @@ conversation between the owner — on a phone, through Discord — and the build
 The owner is the editor and the tester. No laptop is needed for a normal
 working day.
 
-Hustler (the web app, then the native iOS app) is the first project. More
-repositories follow, so nothing below may assume there is exactly one.
+## The goal
 
-Each phase is separately shippable and separately tested. Phase 1 and Phase 1.5
-are built; Phase 1.5 is what is current.
+**Curator is the home base for the building team. Melisa is the owner's
+companion and the communication, planning and coordination layer between the
+owner and the builders.**
 
-## Phase 1 — every screen Freebuff can show (done)
+The owner decides: they describe what they want, set priorities, approve
+consequential changes and test the result in the real world. Dan builds. Melisa
+turns the owner's words into clear, sized instructions, keeps the work
+organized, tracks progress, coordinates more than one repository, and says what
+needs the owner's attention — from a phone, with no laptop in the loop.
 
-**Problem.** Today a job can sit silently: only the "Some questions for you"
-box and the "quick question n/11" survey are recognized, readiness is "any
-output at all" (so a sign-in screen is treated as ready and gets the task text
-pasted into it), and the idle timer only starts once the worktree changes. A
-login, a rate limit, an update prompt, a confirmation or a crash screen
-therefore waits out the whole hard timeout with no message in Discord. A
-session exit is noticed but never explained, and "done" can fire while Freebuff
-is still thinking.
+The end state this roadmap builds towards:
 
-**Build.**
-1. `screens.py`: a pure classifier over captured pane text — `question_box`,
-   `survey`, `sign_in`, `rate_limit`, `update_prompt`, `confirm_prompt`,
-   `error_or_crash`, `ready_prompt`, `working`, `unknown` — built from
-   conservative patterns plus a generic fallback, because the real Freebuff
-   binary is closed source and its screens cannot be enumerated in advance.
-2. A stall detector in `freebuff_runner.py`: pane text and worktree both
-   unchanged for `STALL_SECONDS` while the job is not done ⇒ post the
-   sanitized pane to Discord once per distinct screen, pause the idle and
-   hard-timeout clocks, and cap the wait at `QUESTION_WAIT_SECONDS` before Esc
-   and an "expired" report. Unknown screens use the same path, so nothing is
-   ever silent.
-3. Readiness is a recognized ready prompt, or output that is not one of the
-   screens that must be handled by a person first. A sign-in screen is posted
-   instead of pasted into; after the owner finishes, the task is sent.
-4. `/screen` (read-only pane), `/key <name>` (fixed allowlist only), `/send
-   <text>` (the same paste path as `/task`, with a length cap). Allowlist
-   checked exactly like every other command.
-5. Redaction before anything leaves the process: long token-like strings,
-   `Bearer …` values and API-key shapes are masked; short human sign-in codes
-   are kept, because the owner needs them.
-6. Exit reasons: the last screen is classified and named in Discord instead of
-   a bare "exited".
-7. `scripts/screencap.sh` saves a real pane locally, so screens that are still
-   only known from a photograph become fixtures instead of guesses.
+1. **The owner's words become planned work.** A note, a complaint, an idea or a
+   goal becomes a reviewed plan, then sized jobs, then a build — with the plan
+   shown before anything runs.
+2. **One bot, many projects.** Hustler is the first project, not the definition
+   of the system. Every job names the repository and project it belongs to, and
+   no rule assumes there is only one checkout.
+3. **Nothing consequential happens without the owner.** Nothing is pushed
+   without a human Approve, nothing merges except through the gated `/merge`,
+   and no command can be talked around the allowlist.
+4. **Every claim is checkable.** Exact repository, branch, base/head commit,
+   changed files, checks and outcomes; anything unverified is labelled so.
+5. **Continuity survives the context window.** Decisions, blockers and the next
+   action live in the repository and in GitHub, not in a chat log.
+6. **It is reusable.** A second project, a second kind of app (iOS or Python),
+   and a future owner can pick it up without rewriting the bot.
 
-**Not in this phase.** No new screens invented, no change to the review or
-Approve path, no change to the allowlist, and no multi-repo assumptions.
+## Where it stands (2026-11-04)
 
-## Phase 1.5 — the live status board (current)
+| Phase | State | What is left |
+|---|---|---|
+| 1 — every screen Freebuff can show | shipped | — |
+| 1.5 — the live status board | shipped | — |
+| 2 — a registry of projects | shipped | switching without a restart |
+| 3 — the editor's side of the conversation | mostly shipped | one digest per finished job |
+| 4 — Melisa managing herself | mostly shipped | self-restart from Discord |
 
-**Problem.** The owner is on a phone and never at a laptop, but a job announces
-itself in separate posts and the only way to know where it is was `/status`
-plus a log tail. Freebuff reports no progress, so anything that looks like a
-percentage would be invented.
+## Phase 1 — every screen Freebuff can show (shipped)
 
-**Build.**
-1. `status_board.py`: the stage model (`queued`, `branch_ready`,
-   `freebuff_working`, `waiting_on_you`, `checks`, `tests`, `manager_review`,
-   `awaiting_approve`, `pushed`, `rejected`, `failed`, `cancelled`,
-   `timed_out`), a seven-slot bar whose fill is the stage number, real elapsed
-   time, the queue position, and a "looks like: <kind>" line carrying the exact
-   command for the screen `screens.py` reported. Pure functions with an injected
-   clock.
-2. One status hook (`stage, detail`) from `jobs.py` and `freebuff_runner.py`,
-   called where Phase 1 already sees branches, questions, stalls, sign-in gates,
-   stage runs, reviews and exits. A status failure never fails or delays a job.
-3. One Discord message per job, posted in `NOTIFY_CHANNEL_ID` (else the job's
-   channel) and edited in place, throttled by `STATUS_EDIT_MIN_SECONDS`; a
-   deleted message costs one new post. Queue positions refresh on a timer.
-4. Pings, as separate messages, only for: waiting on you, review ready, and a
-   job finished, failed or timed out; plus one ping per stall after
-   `STATUS_STALL_PING_SECONDS`. Deduplicated by job and screen kind, never by
-   pane text. `STATUS_PINGS=0` turns them off.
-5. `/status` renders the same board for the running job plus one line per
-   waiting job; `/board` re-posts a lost board. Both allowlist-checked.
+**Problem.** A job could sit silently: a login, a rate limit, an update prompt, a
+confirmation or a crash screen waited out the whole hard timeout with no message
+in Discord, and "done" could fire while Freebuff was still thinking.
 
-**Not in this phase.** No web server, no network endpoint and no iPhone widget:
-that needs its own approval, and the board is deliberately a message the owner
-already reads.
+**Built.** `screens.py` classifies captured pane text (question box, survey,
+sign-in, rate limit, update prompt, confirm prompt, error or crash, ready,
+working, unknown) with conservative patterns plus a generic fallback; a stall
+detector in `freebuff_runner.py` posts a sanitized pane once per distinct screen
+and pauses the clocks; readiness is a recognized ready prompt; `/screen`,
+`/key <name>` and `/send <text>` cover the human side; credentials are redacted
+before anything leaves the process; exit reasons are classified and named; and
+`scripts/screencap.sh` turns a real pane into a fixture instead of a guess.
 
-## Phase 2 — a registry of projects
+**Not in this phase, and still not.** No invented screens, no change to the
+review or Approve path, no multi-repo assumptions.
 
-- A projects registry (a small JSON file next to the bot, gitignored if it holds
-  paths) replacing the single `REPO_DIR`: id, path, remote, authorized branch,
-  push rules, builder binary, and per-project protected paths.
-- `/project list` and `/project use <id>`; every job records the project it
-  belongs to, and `/status` names it.
-- The same guardrails per project, evaluated from that project's entry: never
-  `main`/`master`, only the job's own `freebuff/*` branch, protected paths and
-  diff caps unchanged.
-- `/dan` still edits only her own folder, in her own checkout.
-- Tests: a second project cannot borrow the first one's branch, branch prefix
-  or protected paths; a project with a missing checkout fails in one line.
+## Phase 1.5 — the live status board (shipped)
 
-## Phase 3 — the editor's side of the conversation
+**Problem.** The owner is on a phone and never at a laptop, but a job announced
+itself in separate posts and the only way to know where it was was `/status`
+plus a log tail. Freebuff reports no progress, so a percentage would be invented.
 
-- `/feedback <plain language>`: notes from the owner become a plan and then a
-  task, through the manager, with the plan posted before anything runs.
-- Job-finished and needs-you digests: one message per event that says what
-  happened, what changed, what is blocked and what the owner must decide.
-- Phone-first status: `/status` as a short, scannable summary, and no wall of
-  log text unless asked.
-- Tests: a digest is produced from a fake job set with no network, and a
-  feedback note never becomes a shell argument.
+**Built.** `status_board.py` has the stage model, a seven-slot bar filled from
+the stage number, real elapsed time, queue position, and a "looks like: <kind>"
+line carrying the exact command for the screen `screens.py` reported; one status
+hook from `jobs.py` and `freebuff_runner.py`; one Discord message per job edited
+in place; pings only for waiting-on-you, review-ready, finished and stalled; a
+pane-heartbeat digest; and `/status` and `/board`.
 
-## Phase 4 — Melisa managing herself
+## Phase 2 — a registry of projects (shipped)
 
-- A self-update flow: `/dan` result approved, then a controlled restart that
-  reports the old and new commit, with the queue drained first.
-- A health report: process age, queue depth, last job, manager reachability,
-  disk space for logs and worktrees, and stray worktrees/sessions.
-- Crash recovery: an unfinished job is reported at startup, with what it left
-  behind, instead of disappearing.
-- Tests: a restart refuses while a job is running; a health report is rendered
-  from fake state; recovery names the interrupted job.
+**Problem.** One `REPO_DIR`, one branch, one set of protected paths: every rule
+assumed Hustler.
+
+**Built.** `projects.py` holds a registry with `hustler` synthesized from the
+existing settings plus optional `projects.json` entries (id, path, remote,
+authorized branch, kind, checks, protected paths); a bad entry is skipped with
+one line instead of refusing to start. Every job records the project it was made
+for and cannot be re-routed; worktrees nest per project; the review, the push
+guard and `/merge` read that project's protected paths; `/project` shows the
+context and the registry, and `/project action:use project_id:<id>` saves the
+project to use at the next start.
+
+**Still open.** Switching without a restart. The runner, queue and push guard
+are built from the target at startup, so a live swap is a restart. That is
+deliberate: a mid-flight re-point is a guardrail bug, not a feature.
+
+## Phase 3 — the editor's side of the conversation (mostly shipped)
+
+**Problem.** The owner has feedback, not specifications, and it had to be
+hand-written into a sheet.
+
+**Built.** `/plansheet` drafts a sheet from a goal; `/feedback` does the same from
+a note, verbatim, with the note framed as data rather than instructions;
+`/audit` posts a fix sheet from failing branches or stages, with the same draft
+card (Preview, Edit job, Remove job, Replace sheet, Approve and queue, Discard);
+`/review` re-posts a review whose buttons died; `/roadmap` queues one job at a
+time, waits for each merge, and pauses and resumes; `/status` is phone-first.
+
+**Still open.** One digest per finished job saying what happened, what changed,
+what is blocked and what the owner must decide — today that is a board plus a
+result line.
+
+## Phase 4 — Melisa managing herself (mostly shipped)
+
+**Built.** A supervised update (`supervision.py`: wait for idle, verify, pull,
+exit, launchd restarts) with the old and new commit announced; `update_watch.py`
+looking for newer code; `/selftest` running every stage on fakes; the roadmap
+restored after a restart; `/health` reporting uptime, queue, last job, manager,
+roadmap, draft, disk and stray worktrees; and an interrupted job named at
+startup from the marker the queue writes while it runs.
+
+**Still open.** A self-restart initiated from Discord that refuses while a job
+is running, and a cleanup command for old logs and leftover worktrees.
 
 ## Standing rules for every phase
 
@@ -126,5 +129,6 @@ already reads.
 - The allowlist, the push guard, `rules.py`, `ReviewView`/`approve_and_push`
   and the Approve re-check stay off limits, including to `/dan`.
 - Nothing is pushed without a human Approve, and never to `main`/`master`.
+- Every claim in a report is verified or labelled unverified.
 - Everything above is testable offline: no Discord, no tmux, no network, no
   real secrets.
