@@ -328,7 +328,9 @@ tail -f ~/Curator.1/mac-builder/logs/launchd.log
 
 | Command | What it does |
 |---|---|
-| `/project` | Which repo, branch and project Melisa is working on, plus her own repo. |
+| `/project [action] [project_id]` | Which repo, branch and project Melisa is working on, plus her own repo and the registered projects. `action: list` names the ids; `action: use project_id:<id>` saves a project for the next start. It does not switch a running bot: the runner, the queue and the push guard are built from the target at startup, so the choice is applied before the preflight on the next restart and `/project` says which project is active and which one comes next. Nothing is built, pushed or merged by the switch. |
+| `/feedback <note> [project]` | The owner's feedback in plain words becomes a draft build sheet through the same path as `/plansheet`: the note is taken verbatim, the manager turns it into `## Job`s within the live limits, and the sheet lands on the draft card, saved as `logs/plansheet-<stamp>.md`. Nothing runs until **Approve and queue**, and the note is prompt material, never a command line. |
+| `/health` | One read-only report, ephemeral: how long the bot has been up, the running job and its elapsed time, the waiting count, the newest job log, whether the manager is configured, how many roadmap jobs are left and whether it is paused, the draft sheet's job count, free disk for `LOG_DIR`, and any worktree in `WORKTREE_ROOT` that no job log explains. No probe, no network, nothing started or written. |
 | `/status` | The live board for the running job — stage, elapsed time, "looks like" screen — plus one line per waiting job. Read-only and immediate; no probe. |
 | `/cancel [job-id]` | Stops the running job, or one still waiting. The branch is kept; nothing is pushed. |
 | `/check` | `swift test` in HustlerCore. Queued. |

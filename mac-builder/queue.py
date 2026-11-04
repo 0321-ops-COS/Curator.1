@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
+import recovery
 
 log = logging.getLogger(__name__)
 
@@ -91,11 +92,15 @@ class JobQueue:
         *,
         max_pending: int = 10,
         on_crash: CrashHandler | None = None,
+        log_dir=None,
     ) -> None:
         if max_pending < 1:
             raise ValueError("max_pending must be at least 1")
         self._handler = handler
         self._on_crash = on_crash
+        # Where the running job is recorded, so a restart can name it. Optional:
+        # a queue without a log dir simply never writes a marker.
+        self._log_dir = log_dir
         self._queue: asyncio.Queue[Job] = asyncio.Queue(maxsize=max_pending)
         # Submission order, so the status board can name a job's place in line.
         self._waiting: list[Job] = []
@@ -209,6 +214,10 @@ class JobQueue:
             job.status = "running"
             job.started = time.time()
             log.info("job %s (%s) started", job.id, job.kind)
+            if self._log_dir is not None:
+                # Name the job on disk while it runs: a restart that finds this
+                # marker knows exactly which job it interrupted.
+                recovery.mark(self._log_dir, job)
             worker = asyncio.current_task()
             # The handler runs as its own task so /cancel can stop one job
             # without touching the worker that owns the queue.
@@ -243,6 +252,8 @@ class JobQueue:
             else:
                 job.finished = time.time()
             finally:
+                if self._log_dir is not None:
+                    recovery.clear(self._log_dir)
                 self._current = None
                 self._current_task = None
                 self._queue.task_done()

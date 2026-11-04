@@ -60,6 +60,10 @@ import screens  # noqa: E402
 import selftest  # noqa: E402
 import sheet_card  # noqa: E402
 import sheet_plan  # noqa: E402
+import active_project  # noqa: E402
+import feedback  # noqa: E402
+import health  # noqa: E402
+import recovery  # noqa: E402
 import heartbeat
 import status_board  # noqa: E402
 import supervision  # noqa: E402
@@ -839,6 +843,8 @@ class MacBuilderBot(discord.Client):
         intents.guild_messages = True
         super().__init__(intents=intents)
         self.settings = settings
+        # Wall clock at construction: /health reports the process age from it.
+        self._started_at = time.time()
         # Read-only: fetch and inspect only, never a pull or a checkout.
         self._update_watcher = update_watch.UpdateWatcher(
             root=REPO_ROOT,
@@ -910,6 +916,8 @@ class MacBuilderBot(discord.Client):
             self._run_job,
             max_pending=settings.max_pending_jobs,
             on_crash=self._on_job_crash,
+            # A running job is named on disk, so a restart can report it.
+            log_dir=settings.log_dir,
         )
         self._history: dict[int, deque[dict[str, str]]] = defaultdict(
             lambda: deque(maxlen=12)
@@ -950,6 +958,12 @@ class MacBuilderBot(discord.Client):
         self.tree.add_command(app_commands.Command(
             name="plansheet", callback=self.cmd_plansheet,
             description="Draft a build sheet from a goal (read-only: nothing is queued)"))
+        self.tree.add_command(app_commands.Command(
+            name="feedback", callback=self.cmd_feedback,
+            description="Turn a note into a draft build sheet (nothing runs until you approve)"))
+        self.tree.add_command(app_commands.Command(
+            name="health", callback=self.cmd_health,
+            description="Read-only report: queue, last job, manager, disk and worktrees"))
         self.tree.add_command(
             app_commands.Command(
                 name="check",
@@ -1176,6 +1190,18 @@ class MacBuilderBot(discord.Client):
                     self._roadmap_restored = 0
             except Exception:
                 log.warning("could not announce the restored roadmap")
+        interrupted = recovery.take(self.settings.log_dir)
+        if interrupted:
+            channel = self._target_channel(int(interrupted.get("channel_id") or 0))
+            try:
+                if channel is not None:
+                    await channel.send(recovery.note(
+                        interrupted,
+                        bot_name=str(getattr(self.settings, "bot_name", "Melisa") or "Melisa"),
+                        worktree_root=self.settings.worktree_root,
+                    ))
+            except Exception:
+                log.warning("could not announce the interrupted job")
         if self._sheet_draft is not None:
             await self._restore_sheet_draft()
 
@@ -1277,7 +1303,15 @@ class MacBuilderBot(discord.Client):
             "```\n" + "\n".join(lines) + "\n```", ephemeral=True
         )
 
-    async def cmd_project(self, interaction: discord.Interaction) -> None:
+    @app_commands.describe(
+        action="list shows the projects; use chooses one for the next start",
+        project_id="Project id for action:use, e.g. notes",
+    )
+    async def cmd_project(
+        self, interaction: discord.Interaction, action: Optional[str] = None,
+        project_id: Optional[str] = None,
+    ) -> None:
+        """Which checkout I build now, and the project chosen for the next start."""
         if not await self.require_allowed(interaction):
             return
         ctx = self.settings.project
@@ -1285,6 +1319,35 @@ class MacBuilderBot(discord.Client):
         registry = getattr(self.settings, "projects", None)
         if isinstance(registry, projects.Registry):
             text += "\n\n" + "\n".join(registry.summary_lines())
+        current = active_project.active_id(self.settings)
+        text += f"\n\nactive project: {current}"
+        chosen_for_next = active_project.load(self.settings.log_dir)
+        if chosen_for_next and chosen_for_next != current:
+            text += f" (next start: {chosen_for_next})"
+        choice = (action or "").strip().lower()
+        if choice not in ("", "list", "use"):
+            await interaction.response.send_message(
+                "Use `/project` to look, `/project action:list` for the ids, or "
+                "`/project action:use project_id:<id>` to choose one for the next start.",
+                ephemeral=True,
+            )
+            return
+        if choice == "use":
+            wanted = (project_id or "").strip().lower()
+            problem = active_project.refusal(registry, wanted, current)
+            if problem:
+                await interaction.response.send_message(problem, ephemeral=True)
+                return
+            active_project.save(self.settings.log_dir, wanted)
+            await interaction.response.send_message(
+                f"Project {wanted!r} is chosen for the next start. Nothing changed in "
+                f"this run: the runner, the queue and the push guard still build "
+                f"{current!r}, and swapping them under a running job is not something "
+                "I will do. Restart me (launchctl) to apply it; a queued roadmap and "
+                "the draft sheet survive the restart.",
+                ephemeral=True,
+            )
+            return
         await interaction.response.send_message("```\n" + text + "\n```", ephemeral=True)
 
     @app_commands.describe(job_id="Job id to cancel; empty cancels the running job")
@@ -1389,6 +1452,21 @@ class MacBuilderBot(discord.Client):
     ) -> None:
         """A goal becomes a draft sheet; the work is in sheet_plan, nothing is queued."""
         await sheet_plan.command(self, interaction, goal, project or "")
+
+    @app_commands.describe(
+        note="Your feedback in plain words; it becomes a draft sheet, nothing runs yet",
+        project="Project id to plan for; empty plans for this bot's own project",
+    )
+    async def cmd_feedback(
+        self, interaction: discord.Interaction, note: str,
+        project: Optional[str] = None,
+    ) -> None:
+        """Owner feedback becomes a draft sheet; the work is in feedback.py."""
+        await feedback.command(self, interaction, note, project or "")
+
+    async def cmd_health(self, interaction: discord.Interaction) -> None:
+        """One read-only report; the work is in health.py."""
+        await health.command(self, interaction)
 
     # ----------------------------------------------------------- fixed jobs
 
@@ -3238,6 +3316,10 @@ def main() -> int:
         settings.log_dir,
     )
 
+    # /project use saved a project for the next start: retarget first, so this
+    # preflight, the runner, the queue and the push guard all build one checkout.
+    settings, _switched = active_project.retarget(
+        settings, active_project.load(settings.log_dir))
     ctx = project_context.build_context(
         target_dir=settings.repo_dir,
         authorized_branch=settings.authorized_branch,
