@@ -611,7 +611,8 @@ def is_approvable(outcome: ReviewOutcome) -> bool:
     test_ok is None when /test was unavailable (the scheme has no test action),
     which is reported but must not block a diff.
     """
-    return outcome.check_ok and outcome.test_ok is not False
+    return (outcome.check_ok and outcome.test_ok is not False
+            and outcome.build_ok is not False)
 
 
 def review_embed(settings: object, outcome: ReviewOutcome) -> discord.Embed:
@@ -630,6 +631,11 @@ def review_embed(settings: object, outcome: ReviewOutcome) -> discord.Embed:
     embed.add_field(name="Changed lines", value=str(outcome.diff_lines), inline=True)
     embed.add_field(name="Check", value=outcome.check_state[:100], inline=True)
     embed.add_field(name="Test", value=outcome.test_state[:100], inline=True)
+    if outcome.build_state and outcome.build_state != "not run":
+        build = outcome.build_state[:100]
+        if outcome.build_ok is False and outcome.build_tail:
+            build += "\n" + outcome.build_tail[-800:]
+        embed.add_field(name="Build", value=build[:1000], inline=False)
     embed.add_field(name="Files", value=str(len(outcome.changed_files)), inline=True)
     embed.add_field(name="Job", value=f"`{outcome.job.id}`", inline=True)
     embed.add_field(name="Log", value=f"`{outcome.job.log_path.name}`", inline=False)
@@ -653,7 +659,7 @@ def review_embed(settings: object, outcome: ReviewOutcome) -> discord.Embed:
         embed.add_field(name="Compare / merge link", value=link, inline=False)
     embed.set_footer(text=(
         "Nothing is pushed unless you press Approve." if is_approvable(outcome)
-        else "A check or test failed, so there is no Approve button."))
+        else "A check, test or build failed, so there is no Approve button."))
     return embed
 
 

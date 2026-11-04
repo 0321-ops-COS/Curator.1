@@ -27,7 +27,8 @@ JOB_FIELDS = ("id", "kind", "title", "channel_id", "requester_id", "text",
 REVIEW_FIELDS = ("verdict", "notes", "check_state", "test_state", "diff_lines",
                  "changed_files", "check_ok", "test_ok", "snapshot",
                  "check_command", "test_command", "check_counts", "test_counts",
-                 "test_only", "ci_state")
+                 "test_only", "ci_state", "build_state", "build_command",
+                 "build_ok", "build_tail")
 
 
 def record_path(settings: object, job_id: str) -> Path:

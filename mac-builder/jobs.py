@@ -80,6 +80,8 @@ GIT_TIMEOUT_SECONDS = 120.0
 # of each one's output a job keeps.
 PROJECT_CHECK_TIMEOUT_SECONDS = 900.0
 PROJECT_CHECK_TAIL_LINES = 40
+# The app build a scheme without a test action still needs.
+BUILD_COMMAND = "scripts/build.sh"
 # What a passing run says, so the card names the outcome in the script's words.
 SCRIPT_HEADLINES = {
     "build": "BUILD SUCCEEDED",
@@ -118,6 +120,13 @@ class ReviewOutcome:
     test_only: str = ""
     # The CI state GitHub reported for the reviewed commit; set when posted.
     ci_state: str = ""
+    # The app build, run only when the scheme has no test action: "not run"
+    # when the test stage already built it, "unavailable" when a tool or a
+    # simulator is missing, and a real failure when the app does not compile.
+    build_state: str = "not run"
+    build_command: str = ""
+    build_ok: bool | None = None
+    build_tail: str = ""
 
 
 @dataclass
@@ -943,6 +952,12 @@ class JobRunner:
                 check_state, check_tail, check_ok, check_lines = (
                     await self._stage_outcome(job, env, "check"))
                 test_state, test_tail, test_ok = await self._run_stage(job, env, "test")
+                # A scheme with a test action already built the app; only a
+                # scheme without one needs the separate build stage.
+                build_state, build_tail, build_ok = ("not run", "", None)
+                if job.kind != "dan" and (project is None or project.is_default):
+                    build_state, build_tail, build_ok = await self._run_build_stage(
+                        job, env, test_ok)
                 # The commit body and the card quote what actually ran, and the
                 # counts are parsed from that stage's own output.
                 check_counts = evidence.counts(check_tail)
@@ -995,6 +1010,11 @@ class JobRunner:
                     check_ok, test_ok, dan=job.kind == "dan",
                     check_note=project_check_note(self._project_for(job)),
                 )
+                if build_ok is False:
+                    forced = (
+                        "The app build failed (scripts/build.sh), so the diff "
+                        "cannot be approved." + (f"\n\n{forced}" if forced else "")
+                    )
                 if dan_problems:
                     forced = "Deterministic /dan checks found:\n" + "\n".join(
                         f"- {problem}" for problem in dan_problems
@@ -1068,6 +1088,10 @@ class JobRunner:
                     check_counts=check_counts,
                     test_counts=test_counts,
                     test_only=test_only,
+                    build_state=build_state,
+                    build_command=BUILD_COMMAND,
+                    build_ok=build_ok,
+                    build_tail=build_tail if build_ok is False else "",
                 )
                 await self.post_review(outcome)
                 return verdict == "approve", f"review: {verdict}"
@@ -1486,6 +1510,41 @@ class JobRunner:
     ) -> tuple[str, str, bool | None]:
         state, tail, ok, _checks = await self._stage_outcome(job, env, kind)
         return state, tail, ok
+
+    async def _run_build_stage(
+        self, job: Job, env: TaskEnvironment, test_ok: bool | None
+    ) -> tuple[str, str, bool | None]:
+        """The app build, run only when the scheme has no test action.
+
+        test_ok is not None when /test ran, and that run compiled the app, so
+        this stage says "not run" instead of claiming a build. A missing tool or
+        simulator is "unavailable": it is reported, but cannot fail a diff. A
+        build that did not compile is a failure, and keeps its last 20 lines.
+        """
+        if test_ok is not None:
+            return "not run", "", None
+        script = SCRIPT_DIR / "build.sh"
+        if not script.is_file():
+            return "missing script", f"scripts/{script.name} not found", False
+        _log_separator(job, f"{BUILD_COMMAND} in {env.worktree}")
+        outcome = await _exec(
+            ["/bin/bash", str(script)],
+            cwd=env.worktree,
+            env=build_script_env(self.settings, env.worktree),
+            timeout=_stage_timeout(self.settings, "build"),
+            log_path=job.log_path,
+            max_tail=120,
+        )
+        tail = "\n".join(outcome.tail[-20:])
+        if outcome.timed_out:
+            return "timed out", tail, False
+        if outcome.code == 127:
+            return "unavailable (xcodegen or xcodebuild missing)", tail, None
+        if outcome.code == 2:
+            return "unavailable (no simulator or no project.yml)", tail, None
+        if outcome.code == 0:
+            return "passed", "", True
+        return f"failed (exit {outcome.code})", tail, False
 
     async def _stage_outcome(
         self, job: Job, env: TaskEnvironment, kind: str
