@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, NamedTuple, Sequence
 
 import dan_review
+import evidence
 import merge_command
 import projects
 import questions
@@ -108,6 +109,13 @@ class ReviewOutcome:
     violations: tuple[rules.RuleViolation, ...] = ()
     # One "command: state" line per check a python project ran, for the card.
     check_lines: tuple[str, ...] = ()
+    # What each stage ran, and the pass/fail counts parsed from its output.
+    check_command: str = ""
+    test_command: str = ""
+    check_counts: str = ""
+    test_counts: str = ""
+    # "Test-only change: no app code was changed", when the diff is only tests.
+    test_only: str = ""
 
 
 @dataclass
@@ -313,6 +321,17 @@ def project_check_note(project: projects.Project | None) -> str:
     if project is None or not project.uses_checks:
         return "swift test"  # the iOS scripts, worded exactly as they always were
     return project.checks[0][:60] if len(project.checks) == 1 else ""
+
+
+def stage_commands(job: Job, project: projects.Project | None) -> tuple[str, str]:
+    """The exact check and test commands a job runs, for the evidence block."""
+    if job.kind == "dan":
+        return (f"{Path(sys.executable).name} -m unittest discover -s tests -t .",
+                "py_compile + bash -n")
+    if project is not None and project.uses_checks:
+        return (" && ".join(project.checks) or "none configured",
+                "not used (project checks)")
+    return ("scripts/check.sh", "scripts/test.sh")
 
 
 def resolve_branch(settings: object, value: str | None) -> str:
@@ -919,6 +938,12 @@ class JobRunner:
                 check_state, check_tail, check_ok, check_lines = (
                     await self._stage_outcome(job, env, "check"))
                 test_state, test_tail, test_ok = await self._run_stage(job, env, "test")
+                # The commit body and the card quote what actually ran, and the
+                # counts are parsed from that stage's own output.
+                check_counts = evidence.counts(check_tail)
+                test_counts = evidence.counts(test_tail)
+                check_command, test_command = stage_commands(job, project)
+                test_only = evidence.test_only_note(job.kind, all_paths)
 
                 # Deterministic /dan checks: plain code, folded into the same
                 # forced-revise path as a failed stage (MAX_REVISE_ROUNDS).
@@ -950,6 +975,11 @@ class JobRunner:
                 review = await self.manager.review(brief)
                 verdict = review.verdict
                 notes = review.notes
+                if test_only:
+                    verdict, notes = evidence.block_approve(
+                        verdict, notes,
+                        test_only + ", so it cannot be approved without a change "
+                        "to app code.")
                 forced = rules.force_revise_reason(
                     check_ok, test_ok, dan=job.kind == "dan",
                     check_note=project_check_note(self._project_for(job)),
@@ -1022,6 +1052,11 @@ class JobRunner:
                     test_ok=test_ok,
                     snapshot=changes.snapshot,
                     check_lines=check_lines,
+                    check_command=check_command,
+                    test_command=test_command,
+                    check_counts=check_counts,
+                    test_counts=test_counts,
+                    test_only=test_only,
                 )
                 await self.post_review(outcome)
                 return verdict == "approve", f"review: {verdict}"

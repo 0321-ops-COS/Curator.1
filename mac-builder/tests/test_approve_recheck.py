@@ -132,6 +132,20 @@ class ApproveRecheckTests(unittest.TestCase):
             "the Freebuff session must be stopped before the final collect",
         )
 
+    def test_the_pushed_commit_carries_the_verification_block(self) -> None:
+        self._edit("let a = 2\n")
+        reviewed = self._review()
+        block = ("Verification\ncheck: scripts/check.sh — passed (2 passed, 0 failed)\n"
+                 "test: scripts/test.sh — not run")
+        sha = asyncio.run(self.runner.approve_and_push(
+            self.env, message="approve", expected_snapshot=reviewed.snapshot,
+            verification=block))
+        body = subprocess.run(
+            ["git", "--git-dir", str(self.remote), "log", "-1", "--format=%B", sha],
+            capture_output=True, text=True, check=True).stdout
+        self.assertIn("Verification", body)
+        self.assertIn("test: scripts/test.sh — not run", body)
+
     def test_protected_file_added_after_review_blocks_approve(self) -> None:
         self._edit("let a = 2\n")
         reviewed = self._review()
