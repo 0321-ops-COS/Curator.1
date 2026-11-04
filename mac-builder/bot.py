@@ -761,13 +761,13 @@ class ReviewView(discord.ui.View):
         if env is None:
             await self._finish(interaction, "Nothing to push; the worktree was not kept.")
             return
-        message = f"Freebuff task {self.outcome.job.id}: {self.outcome.job.title}"[:200]
+        message = evidence.commit_subject(self.outcome.job)
         try:
             sha = await self.bot.freebuff.approve_and_push(
                 env, message=message, expected_snapshot=self.outcome.snapshot,
                 # What ran goes in the commit body, so the evidence travels with
                 # the branch instead of living only on this card.
-                verification=evidence.verification_block(self.outcome),
+                verification=evidence.commit_body(self.outcome),
             )
         except (FreebuffError, ValueError) as exc:
             log.warning("approve failed for %s: %s", env.branch, exc)
