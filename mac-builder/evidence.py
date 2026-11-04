@@ -71,6 +71,34 @@ def verification_block(outcome: object) -> str:
     return "Verification\n" + "\n".join(lines)
 
 
+SUBJECT_LIMIT = 72
+
+
+def commit_subject(job: object) -> str:
+    """The commit's first line: cut at a word boundary, never mid-word.
+
+    The title is a card line, so it may be long; the message limit used to cut
+    it mid-word ("Original request: the si"). The full ask goes in the body.
+    """
+    job_id = str(getattr(job, "id", "") or "").strip()
+    title = " ".join(str(getattr(job, "title", "") or "").split())
+    subject = f"Freebuff task {job_id}: {title}".strip()
+    if len(subject) <= SUBJECT_LIMIT:
+        return subject
+    head = subject[: SUBJECT_LIMIT - 1]  # room for the ellipsis
+    stem = head.rsplit(" ", 1)[0] if " " in head else head
+    prefix = subject[: len(subject) - len(title)] if title else subject
+    # No word fits after the prefix: bound the one long word instead.
+    return (stem if len(stem) > len(prefix) else head) + "…"
+
+
+def commit_body(outcome: object) -> str:
+    """The body: the owner's whole ask, then the Verification block."""
+    block = verification_block(outcome)
+    request = original_request(getattr(outcome, "job", None))
+    return f"{request}\n\n{block}" if request else block
+
+
 def append_block(message: str, block: str) -> str:
     """A commit message with the verification block in its body."""
     body, head = (block or "").strip(), (message or "").strip()
