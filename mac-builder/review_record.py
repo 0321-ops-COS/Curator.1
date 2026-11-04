@@ -23,11 +23,11 @@ log = logging.getLogger(__name__)
 AWAITING = "awaiting_review"
 DECIDED = ("approved", "rejected")
 JOB_FIELDS = ("id", "kind", "title", "channel_id", "requester_id", "text",
-              "branch", "project", "repo_slug")
+              "original_text", "branch", "project", "repo_slug")
 REVIEW_FIELDS = ("verdict", "notes", "check_state", "test_state", "diff_lines",
                  "changed_files", "check_ok", "test_ok", "snapshot",
                  "check_command", "test_command", "check_counts", "test_counts",
-                 "test_only")
+                 "test_only", "ci_state")
 
 
 def record_path(settings: object, job_id: str) -> Path:
@@ -118,7 +118,7 @@ def outcome(record: dict) -> jobs.ReviewOutcome:
         # to the one checkout there was.
         project=str(data.get("project") or projects.DEFAULT_PROJECT),
         **{name: str(data.get(name, "")) for name in
-           ("id", "kind", "title", "text", "branch", "repo_slug")},
+           ("id", "kind", "title", "text", "original_text", "branch", "repo_slug")},
     )
     job.status = str(record.get("status", AWAITING))
     worktree = Path(str(env_data.get("worktree", "")))
