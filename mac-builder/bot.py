@@ -44,6 +44,7 @@ from dotenv import load_dotenv  # noqa: E402
 
 import audit  # noqa: E402
 import compare_link  # noqa: E402
+import evidence  # noqa: E402
 import github_client  # noqa: E402
 import jobs  # noqa: E402
 import merge_command  # noqa: E402
@@ -614,6 +615,10 @@ def review_embed(settings: object, outcome: ReviewOutcome) -> discord.Embed:
     embed.add_field(name="Files", value=str(len(outcome.changed_files)), inline=True)
     embed.add_field(name="Job", value=f"`{outcome.job.id}`", inline=True)
     embed.add_field(name="Log", value=f"`{outcome.job.log_path.name}`", inline=False)
+    if outcome.test_only:
+        embed.add_field(name="Test-only", value=outcome.test_only[:300], inline=False)
+    embed.add_field(name="Verification", inline=False,
+                    value=evidence.verification_block(outcome)[:1000])
     if outcome.check_lines:  # the project's own checks, one line each
         embed.add_field(name="Checks", inline=False,
                         value="\n".join(outcome.check_lines)[:1000])
@@ -667,6 +672,17 @@ class ReviewView(discord.ui.View):
             await interaction.message.edit(embed=embed, view=self)
         await interaction.followup.send(text)
 
+    async def _reopen(self, interaction: discord.Interaction, text: str) -> None:
+        """A refusal that leaves the card usable: nothing was pushed."""
+        async with self._lock:
+            self.resolved = False
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = False
+        await interaction.followup.send(text)
+        if interaction.message is not None:
+            await interaction.message.edit(view=self)
+
     def _decided(self, status: str) -> None:
         """Tell the bot what was decided; a fake bot without the hook is fine."""
         hook = getattr(self.bot, "review_decided", None)
@@ -703,18 +719,14 @@ class ReviewView(discord.ui.View):
         message = f"Freebuff task {self.outcome.job.id}: {self.outcome.job.title}"[:200]
         try:
             sha = await self.bot.freebuff.approve_and_push(
-                env, message=message, expected_snapshot=self.outcome.snapshot
+                env, message=message, expected_snapshot=self.outcome.snapshot,
+                # What ran goes in the commit body, so the evidence travels with
+                # the branch instead of living only on this card.
+                verification=evidence.verification_block(self.outcome),
             )
         except (FreebuffError, ValueError) as exc:
             log.warning("approve failed for %s: %s", env.branch, exc)
-            async with self._lock:
-                self.resolved = False
-            for child in self.children:
-                if isinstance(child, discord.ui.Button):
-                    child.disabled = False
-            await interaction.followup.send(f"Push failed, nothing was pushed: {exc}")
-            if interaction.message is not None:
-                await interaction.message.edit(view=self)
+            await self._reopen(interaction, f"Push failed, nothing was pushed: {exc}")
             return
         self.outcome.job.status = "approved"
         self._decided("approved")

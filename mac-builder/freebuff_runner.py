@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
+import evidence
 import questions
 import projects
 import rules
@@ -393,6 +394,32 @@ class GitRepo:
         if result.code != 0:
             detail = (result.stderr or result.stdout).strip()[-2000:]
             raise FreebuffError(f"commit failed ({result.code}): {detail}")
+        return await self.head(cwd)
+
+    async def append_to_commit_body(self, cwd: Path, block: str) -> str:
+        """Append a block to HEAD's message; the branch is unpushed, so this is safe."""
+        shown = await self._run(["log", "-1", "--pretty=%B"], cwd=cwd)
+        message = (shown.stdout.strip() + "\n\n" + block.strip()).strip()
+        result = await self._run(
+            [
+                "-c",
+                "user.name=Mac Builder Bot",
+                "-c",
+                "user.email=mac-builder@localhost",
+                "commit",
+                "--amend",
+                "-q",
+                "-m",
+                message,
+            ],
+            cwd=cwd,
+            check=False,
+        )
+        if result.code != 0:
+            detail = (result.stderr or result.stdout).strip()[-2000:]
+            raise FreebuffError(
+                f"could not add the verification block ({result.code}): {detail}"
+            )
         return await self.head(cwd)
 
     async def fetch_branch(self, branch: str, remote: str = "origin") -> None:
@@ -1790,7 +1817,8 @@ class FreebuffRunner:
         )
 
     async def approve_and_push(
-        self, env: TaskEnvironment, *, message: str, expected_snapshot: str
+        self, env: TaskEnvironment, *, message: str, expected_snapshot: str,
+        verification: str = "",
     ) -> str:
         """Push, but only the change a human approved.
 
@@ -1835,10 +1863,14 @@ class FreebuffRunner:
             )
         await repo.stage_all(env.worktree)
         if await repo.status_paths(env.worktree):
-            sha = await repo.commit_all(env.worktree, message)
+            sha = await repo.commit_all(
+                env.worktree, evidence.append_block(message, verification))
         else:
-            # Freebuff may have committed its own work; push that commit.
+            # Freebuff may have committed its own work; push that commit with the
+            # verification block on it, so the evidence is in the body either way.
             sha = await repo.head(env.worktree)
+            if verification.strip() and not sha.startswith(env.base_commit or "-"):
+                sha = await repo.append_to_commit_body(env.worktree, verification)
         await repo.push_branch(env.worktree, branch, kind=env.kind)
         log.info("pushed %s at %s", branch, sha)
         self.report_stage(status_board.PUSHED, f"{branch} at {sha[:7]}")

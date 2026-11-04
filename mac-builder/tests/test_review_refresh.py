@@ -57,7 +57,7 @@ class FakeFreebuff:
         return SimpleNamespace(snapshot=self.snapshot, changed_paths=list(self.files))
 
     async def approve_and_push(self, env: object, *, message: str,
-                               expected_snapshot: str) -> str:
+                               expected_snapshot: str, verification: str = "") -> str:
         self.pushes += 1
         return "abcdef1234567"
 

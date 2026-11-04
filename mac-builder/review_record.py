@@ -25,7 +25,9 @@ DECIDED = ("approved", "rejected")
 JOB_FIELDS = ("id", "kind", "title", "channel_id", "requester_id", "text",
               "branch", "project", "repo_slug")
 REVIEW_FIELDS = ("verdict", "notes", "check_state", "test_state", "diff_lines",
-                 "changed_files", "check_ok", "test_ok", "snapshot")
+                 "changed_files", "check_ok", "test_ok", "snapshot",
+                 "check_command", "test_command", "check_counts", "test_counts",
+                 "test_only")
 
 
 def record_path(settings: object, job_id: str) -> Path:
