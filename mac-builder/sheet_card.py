@@ -15,12 +15,29 @@ from pathlib import Path
 
 import discord
 
+import projects
 import roadmap
 
 log = logging.getLogger(__name__)
 DRAFT_FILE = "sheet-draft.json"
 FIELD_LIMIT = 4000  # a Discord modal text field
 NO_DRAFT = "There is no draft sheet; it was queued, replaced or discarded."
+
+
+def sheet_text(steps: list[roadmap.Step]) -> str:
+    """The steps as a sheet /roadmap parses back, each job's project kept.
+
+    The project line is written only when a job differs from the default, so a
+    single-project sheet reads exactly as it did before projects existed.
+    """
+    blocks: list[str] = []
+    for number, step in enumerate(steps, start=1):
+        lines = [f"## Job {number}", f"kind: {step.kind}"]
+        if step.project != projects.DEFAULT_PROJECT:
+            lines.append(f"project: {step.project}")
+        lines.append(step.text.strip())
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
 
 
 @dataclass
@@ -35,16 +52,15 @@ class Draft:
             raise roadmap.RoadmapError(f"job {index + 1} is no longer in the draft")
         if not text.strip():
             raise roadmap.RoadmapError("the job text is empty; use Remove job to drop it")
-        steps = [roadmap.Step(s.text, s.kind) for s in self.steps]
-        steps[index] = roadmap.Step(text.strip(), self.steps[index].kind)
-        self.steps = roadmap.parse("\n\n".join(
-            f"## Job {n}\nkind: {s.kind}\n{s.text.strip()}" for n, s in enumerate(steps, 1)))
+        steps = list(self.steps)
+        old = steps[index]
+        # kind, project and job id belong to the step, not to its text.
+        steps[index] = roadmap.Step(text.strip(), old.kind, old.job_id, old.project)
+        self.steps = roadmap.parse(sheet_text(steps))
 
 
 def save(path: Path, draft: Draft) -> None:
-    sheet = "\n\n".join(f"## Job {n}\nkind: {s.kind}\n{s.text.strip()}"
-                        for n, s in enumerate(draft.steps, 1))
-    path.write_text(json.dumps({"sheet": sheet, "channel_id": draft.channel_id,
+    path.write_text(json.dumps({"sheet": sheet_text(draft.steps), "channel_id": draft.channel_id,
                                 "requester_id": draft.requester_id, "message_id": draft.message_id}), "utf-8")
 
 
@@ -57,11 +73,12 @@ def load(path: Path) -> Draft | None:
         return None
 
 
-async def post(bot, channel=None, *, note: str = "", active: bool = True, file=None) -> None:
+async def post(bot, channel=None, *, note: str = "", active: bool = True, file=None,
+               title: str = "Fix sheet draft") -> None:
     draft = bot._sheet_draft
     if draft is None:
         return
-    body = f"**Fix sheet draft** — {len(draft.steps)} job(s); nothing is queued."
+    body = f"**{title}** — {len(draft.steps)} job(s); nothing is queued."
     if note:
         body += "\n" + note
     if active:
@@ -203,15 +220,53 @@ class SheetCardView(discord.ui.View):
 
 
 class JobPicker(discord.ui.View):
-    def __init__(self, bot, verb: str) -> None:
+    """Pick one job to edit or remove, a page at a time.
+
+    Discord caps one select at 25 options, and a sheet has no cap on its jobs, so
+    every page but the last holds PAGE_SIZE of them and Previous/Next reach the
+    rest: job 26 is on page 2, never out of reach.
+    """
+
+    PAGE_SIZE = 25
+
+    def __init__(self, bot, verb: str, page: int = 0) -> None:
         super().__init__(timeout=120)
         self.bot, self.verb = bot, verb
         steps = bot._sheet_draft.steps if bot._sheet_draft else []
-        select = discord.ui.Select(placeholder="Pick a job", options=[
+        self.pages = max(1, (len(steps) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page = min(max(int(page), 0), self.pages - 1)
+        start = self.page * self.PAGE_SIZE
+        options = [
             discord.SelectOption(label=f"Job {n}: {' '.join(s.text.split())[:70]}", value=str(n - 1))
-            for n, s in enumerate(steps[:25], 1)])
-        select.callback = self._chosen
-        self.add_item(select)
+            for n, s in enumerate(steps[start:start + self.PAGE_SIZE], start + 1)]
+        if options:
+            select = discord.ui.Select(placeholder=self._placeholder(), options=options)
+            select.callback = self._chosen
+            self.add_item(select)
+        if self.pages > 1:
+            earlier = discord.ui.Button(label="Previous", style=discord.ButtonStyle.secondary,
+                                        disabled=self.page == 0)
+            earlier.callback = self._earlier
+            self.add_item(earlier)
+            later = discord.ui.Button(label="Next", style=discord.ButtonStyle.primary,
+                                      disabled=self.page >= self.pages - 1)
+            later.callback = self._later
+            self.add_item(later)
+
+    def _placeholder(self) -> str:
+        where = f" (page {self.page + 1}/{self.pages})" if self.pages > 1 else ""
+        return f"Pick a job to {self.verb}{where}"
+
+    async def _earlier(self, i: discord.Interaction) -> None:
+        await self._turn(i, self.page - 1)
+
+    async def _later(self, i: discord.Interaction) -> None:
+        await self._turn(i, self.page + 1)
+
+    async def _turn(self, i: discord.Interaction, page: int) -> None:
+        if not await self.bot.require_allowed(i):
+            return
+        await i.response.edit_message(view=JobPicker(self.bot, self.verb, page))
 
     async def _chosen(self, i: discord.Interaction) -> None:
         if not await self.bot.require_allowed(i):
