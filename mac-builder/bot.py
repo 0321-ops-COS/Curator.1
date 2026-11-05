@@ -62,7 +62,11 @@ import sheet_card  # noqa: E402
 import sheet_plan  # noqa: E402
 import active_project  # noqa: E402
 import feedback  # noqa: E402
+import digest  # noqa: E402
+import handoff  # noqa: E402
 import health  # noqa: E402
+import job_index  # noqa: E402
+import tidy  # noqa: E402
 import recovery  # noqa: E402
 import heartbeat
 import status_board  # noqa: E402
@@ -845,6 +849,8 @@ class MacBuilderBot(discord.Client):
         self.settings = settings
         # Wall clock at construction: /health reports the process age from it.
         self._started_at = time.time()
+        # Where /health and /handoff read the code this process runs.
+        self.code_root = REPO_ROOT
         # Read-only: fetch and inspect only, never a pull or a checkout.
         self._update_watcher = update_watch.UpdateWatcher(
             root=REPO_ROOT,
@@ -964,6 +970,15 @@ class MacBuilderBot(discord.Client):
         self.tree.add_command(app_commands.Command(
             name="health", callback=self.cmd_health,
             description="Read-only report: queue, last job, manager, disk and worktrees"))
+        self.tree.add_command(app_commands.Command(
+            name="handoff", callback=self.cmd_handoff,
+            description="Write logs/session-handoff.md from live state (nothing else changes)"))
+        self.tree.add_command(app_commands.Command(
+            name="jobs", callback=self.cmd_jobs,
+            description="List the recent jobs with kind, project, status and branch"))
+        self.tree.add_command(app_commands.Command(
+            name="tidy", callback=self.cmd_tidy,
+            description="Report old logs and stray worktrees; delete old logs only"))
         self.tree.add_command(
             app_commands.Command(
                 name="check",
@@ -1467,6 +1482,18 @@ class MacBuilderBot(discord.Client):
     async def cmd_health(self, interaction: discord.Interaction) -> None:
         """One read-only report; the work is in health.py."""
         await health.command(self, interaction)
+
+    async def cmd_handoff(self, interaction: discord.Interaction) -> None:
+        """Write the session handoff from live state; nothing else changes."""
+        await handoff.command(self, interaction)
+
+    async def cmd_jobs(self, interaction: discord.Interaction) -> None:
+        """The recent jobs from the index: read-only and ephemeral."""
+        await job_index.command(self, interaction)
+
+    async def cmd_tidy(self, interaction: discord.Interaction) -> None:
+        """Stale logs and worktrees; only old logs are ever deleted."""
+        await tidy.command(self, interaction)
 
     # ----------------------------------------------------------- fixed jobs
 
@@ -3005,6 +3032,7 @@ class MacBuilderBot(discord.Client):
             # The review embed is this task's result; a second embed would only
             # repeat it with less information.
             return
+        job_index.record(getattr(self, "settings", None), job)
         channel = self._target_channel(job.channel_id)
         if channel is None:
             log.warning("no Discord channel for job %s", job.id)
@@ -3253,12 +3281,37 @@ class MacBuilderBot(discord.Client):
             embed.set_footer(text="Nothing can be pushed from a blocked change.")
             if await self._send_review(channel, outcome, embed=embed):
                 outcome.job.status = "blocked"
+                await self._post_digest(outcome.job, outcome)
             return
 
         embed = review_embed(self.settings, outcome)
         view = ReviewView(self, outcome)
         if await self._send_review(channel, outcome, embed=embed, view=view):
             outcome.job.status = "awaiting_review"
+            await self._post_digest(outcome.job, outcome)
+
+    async def _post_digest(self, job: Job, outcome: ReviewOutcome | None = None) -> None:
+        """One message per finished job: what happened, changed, and needs you."""
+        job_index.record(self.settings, job, outcome=outcome)
+        channel = self._target_channel(job.channel_id)
+        if channel is None:
+            return
+        try:
+            await channel.send(digest.build(
+                job, outcome,
+                bot_name=str(getattr(self.settings, "bot_name", "Melisa") or "Melisa"),
+                roadmap_next=self._roadmap_next_line(),
+            ))
+        except Exception:  # a digest may never fail a job
+            log.exception("could not post the digest for job %s", job.id)
+
+    def _roadmap_next_line(self) -> str:
+        """The next sheet job in one line, or "" when the roadmap has none left."""
+        pending = [step for step in getattr(self, "_roadmap_steps", [])
+                   if not getattr(step, "job_id", "")]
+        if not pending:
+            return ""
+        return f"{len(pending)} job(s) left — " + " ".join(pending[0].text.split())[:90]
 
     async def _send_review(
         self,

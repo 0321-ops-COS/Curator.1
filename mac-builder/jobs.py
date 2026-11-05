@@ -24,6 +24,7 @@ from typing import Awaitable, Callable, NamedTuple, Sequence
 
 import dan_review
 import evidence
+import job_plan
 import merge_command
 import projects
 import questions
@@ -240,6 +241,7 @@ def make_job(
     original_text: str = "",
     branch: str = "",
     project: str = "",
+    plan: str = "",
 ) -> Job:
     """One job, with the project it builds fixed here and never changed after."""
     job_id = new_job_id()
@@ -263,6 +265,9 @@ def make_job(
         original_text=original_text or text,
         branch=branch,
         project=chosen,
+        # The job's own acceptance and out-of-scope lines, so the reviewer
+        # and the question-answerer read them instead of "(no plan)".
+        plan=plan or job_plan.for_text(text),
     )
 
 
@@ -986,6 +991,7 @@ class JobRunner:
                     test_tail=test_tail,
                     round_number=env.round,
                     project_context=_project_block(self.settings),
+                    plan=str(getattr(job, "plan", "") or ""),
                     original_request=evidence.original_request(job),
                 )
                 self._stage(
@@ -1468,7 +1474,14 @@ class JobRunner:
         except Exception as exc:
             log.warning("job %s: suggestion failed: %s", job.id, exc)
             return
-        line = self._suggestion_line(question, result)
+        # Advice is worth most where the answer is the owner's call, so an
+        # escalated question still gets a line: it is labelled as advice and
+        # is never typed.
+        line = self._suggestion_line(
+            question, result,
+            escalated=bool(escalation_reason(
+                question.text, *self._option_lines(question))),
+        )
         if line is None or self.post_note is None:
             return
         _write_job_log(job, line)
@@ -1478,7 +1491,8 @@ class JobRunner:
             log.exception("could not post a suggestion for job %s", job.id)
 
     def _suggestion_line(
-        self, question: questions.Question, result: object
+        self, question: questions.Question, result: object, *,
+        escalated: bool = False,
     ) -> str | None:
         """'<BOT_NAME> suggests option N: ... (suggestion only, you decide)'."""
         if not getattr(result, "ok", True):
@@ -1496,7 +1510,10 @@ class JobRunner:
         line = f"{self._manager_name()} suggests {what}"
         if reason:
             line += f": {reason}"
-        return f"{line} (suggestion only, you decide)"
+        tail = " (suggestion only, you decide)"
+        if escalated:
+            tail += " This one is your call, not my answer."
+        return f"{line}{tail}"
 
     def _project_for(self, job: Job) -> projects.Project | None:
         """The registered project a job builds; None when startup built no registry."""
