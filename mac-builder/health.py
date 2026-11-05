@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +25,56 @@ log = logging.getLogger("macbuilder")
 JOB_ID_LEN = 24
 MAX_STRAYS = 5
 MAX_LOG_AGE_HOURS = 24.0
+# Her own checkout: "am I running the merged code" is a local-read question.
+MAIN_REF = "origin/main"
+
+
+@dataclass(frozen=True)
+class CodeState:
+    """The commit this process runs, and where main is, from local refs only."""
+
+    running: str = ""
+    main: str = ""
+    behind: int | None = None
+
+    @property
+    def known(self) -> bool:
+        return bool(self.running)
+
+    @property
+    def stale(self) -> bool:
+        return bool(self.behind)
+
+
+def _git(root: Path | str, *args: str) -> str:
+    """One short read-only git answer, or "" when git cannot say."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), *args], capture_output=True, text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def code_state(root: Path | str | None, *, base: str = MAIN_REF, git=None) -> CodeState:
+    """The running commit against ``main``; no fetch, no network, no guess.
+
+    ``main`` is the local ``origin/main`` ref, so a report never spends a fetch
+    to answer a question about a phone. A ref that cannot be read is left empty
+    and the report says unknown instead of "up to date".
+    """
+    if root is None:
+        return CodeState()
+    ask = git or _git
+    running = ask(root, "rev-parse", "--short", "HEAD")
+    main = ask(root, "rev-parse", "--short", base)
+    behind: int | None = None
+    if running and main:
+        count = ask(root, "rev-list", "--count", f"HEAD..{base}")
+        behind = int(count) if str(count).isdigit() else None
+    return CodeState(running=running, main=main, behind=behind)
 
 
 def format_uptime(seconds: float | None) -> str:
@@ -76,7 +127,8 @@ def last_log(log_dir: Path | str) -> tuple[str, float] | None:
     return newest.stem, max(0.0, time.time() - newest.stat().st_mtime)
 
 
-def stray_worktrees(root: Path | str, log_dir: Path | str) -> list[str]:
+def stray_worktrees(root: Path | str, log_dir: Path | str, *,
+                    limit: int = MAX_STRAYS) -> list[str]:
     """Directories in the worktree root that no job log explains.
 
     A worktree is expected to be named after the job that made it. One with no
@@ -93,7 +145,7 @@ def stray_worktrees(root: Path | str, log_dir: Path | str) -> list[str]:
     except OSError:
         pass
     strays = sorted(path.name for path in entries if path.name not in logs)
-    return strays[:MAX_STRAYS]
+    return strays[:limit]
 
 
 @dataclass
@@ -106,6 +158,7 @@ class Snapshot:
     waiting: int = 0
     last_job: tuple[str, float] | None = None
     manager_configured: bool = False
+    code: CodeState | None = None
     roadmap_left: int = 0
     roadmap_paused: bool = False
     draft_jobs: int = 0
@@ -116,7 +169,7 @@ class Snapshot:
     queue_depth: int = 0
 
 
-def snapshot(bot, *, now: float | None = None) -> Snapshot:
+def snapshot(bot, *, now: float | None = None, code_root=None) -> Snapshot:
     """Read the live state off a bot object; never raise, never probe."""
     settings = getattr(bot, "settings", None)
     log_dir = Path(getattr(settings, "log_dir", Path.cwd()))
@@ -140,6 +193,7 @@ def snapshot(bot, *, now: float | None = None) -> Snapshot:
         waiting=int(state.get("pending") or 0) if isinstance(state, dict) else 0,
         last_job=last_log(log_dir),
         manager_configured=bool(getattr(manager, "enabled", False)),
+        code=code_state(code_root) if code_root else None,
         roadmap_left=len([step for step in steps if not getattr(step, "job_id", "")]),
         roadmap_paused=bool(getattr(bot, "_roadmap_paused", False)),
         draft_jobs=len(getattr(draft, "steps", []) or []),
@@ -172,6 +226,15 @@ def report(state: Snapshot) -> str:
         lines.append("manager: configured (no probe, nothing sent)")
     else:
         lines.append("manager: NOT configured; reviews and sheets wait for you")
+    if state.code is not None and state.code.known:
+        if state.code.stale:
+            lines.append(
+                f"code: running {state.code.running} · main {state.code.main} "
+                f"({state.code.behind} commit(s) behind — restart to pick it up)")
+        else:
+            lines.append(
+                f"code: running {state.code.running} · "
+                f"main {state.code.main or 'unknown'}")
     roadmap = f"roadmap: {state.roadmap_left} job(s) left"
     if state.roadmap_paused:
         roadmap += ", paused"

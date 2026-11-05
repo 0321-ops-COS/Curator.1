@@ -345,6 +345,8 @@ class ReviewBrief:
     check_tail: str
     test_state: str
     test_tail: str
+    # The job's own plan: its goal, acceptance and out-of-scope lines.
+    plan: str = ""
     round_number: int = 0
     project_context: str = ""
     # The owner's own words, kept before any planner rewrite.
@@ -490,6 +492,9 @@ def build_review_messages(brief: ReviewBrief) -> list[dict[str, str]]:
 
 TASK GIVEN TO THE BUILDER
 {brief.task}
+
+PLAN FOR THIS JOB (its own goal, acceptance and out-of-scope lines)
+{_truncate(brief.plan.strip() or "(no plan recorded for this job)", 1500)}
 
 REVIEW ROUND
 {brief.round_number} revision round(s) already sent

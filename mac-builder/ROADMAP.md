@@ -43,7 +43,7 @@ The end state this roadmap builds towards:
 | 1 — every screen Freebuff can show | shipped | — |
 | 1.5 — the live status board | shipped | — |
 | 2 — a registry of projects | shipped | switching without a restart |
-| 3 — the editor's side of the conversation | mostly shipped | one digest per finished job |
+| 3 — the editor's side of the conversation | shipped | — |
 | 4 — Melisa managing herself | mostly shipped | self-restart from Discord |
 
 ## Phase 1 — every screen Freebuff can show (shipped)
@@ -107,21 +107,26 @@ card (Preview, Edit job, Remove job, Replace sheet, Approve and queue, Discard);
 `/review` re-posts a review whose buttons died; `/roadmap` queues one job at a
 time, waits for each merge, and pauses and resumes; `/status` is phone-first.
 
-**Still open.** One digest per finished job saying what happened, what changed,
-what is blocked and what the owner must decide — today that is a board plus a
-result line.
+**Closed this round.** Every job made from a sheet carries its own acceptance and
+out-of-scope lines onto the job, so the review prompt and the question-answerer
+read the intent instead of "(no plan)". One digest per finished job says what
+happened, what changed, what the stages said and what the owner must decide, and
+`/jobs` lists the recent jobs from an index written as each one finishes.
+Nothing in this phase is open.
 
 ## Phase 4 — Melisa managing herself (mostly shipped)
 
 **Built.** A supervised update (`supervision.py`: wait for idle, verify, pull,
 exit, launchd restarts) with the old and new commit announced; `update_watch.py`
 looking for newer code; `/selftest` running every stage on fakes; the roadmap
-restored after a restart; `/health` reporting uptime, queue, last job, manager,
-roadmap, draft, disk and stray worktrees; and an interrupted job named at
-startup from the marker the queue writes while it runs.
+restored after a restart; `/health` reporting uptime, queue, last job, manager, running commit against
+`main`, roadmap, draft, disk and stray worktrees; an interrupted job named at
+startup from the marker the queue writes while it runs; `/tidy` reporting old
+logs, stray worktrees and leftover audit folders and deleting only old logs; and
+`/handoff` writing the README's session handoff from live state.
 
 **Still open.** A self-restart initiated from Discord that refuses while a job
-is running, and a cleanup command for old logs and leftover worktrees.
+is running.
 
 ## Standing rules for every phase
 

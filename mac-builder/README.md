@@ -331,6 +331,9 @@ tail -f ~/Curator.1/mac-builder/logs/launchd.log
 | `/project [action] [project_id]` | Which repo, branch and project Melisa is working on, plus her own repo and the registered projects. `action: list` names the ids; `action: use project_id:<id>` saves a project for the next start. It does not switch a running bot: the runner, the queue and the push guard are built from the target at startup, so the choice is applied before the preflight on the next restart and `/project` says which project is active and which one comes next. Nothing is built, pushed or merged by the switch. |
 | `/feedback <note> [project]` | The owner's feedback in plain words becomes a draft build sheet through the same path as `/plansheet`: the note is taken verbatim, the manager turns it into `## Job`s within the live limits, and the sheet lands on the draft card, saved as `logs/plansheet-<stamp>.md`. Nothing runs until **Approve and queue**, and the note is prompt material, never a command line. |
 | `/health` | One read-only report, ephemeral: how long the bot has been up, the running job and its elapsed time, the waiting count, the newest job log, whether the manager is configured, how many roadmap jobs are left and whether it is paused, the draft sheet's job count, free disk for `LOG_DIR`, and any worktree in `WORKTREE_ROOT` that no job log explains. No probe, no network, nothing started or written. |
+| `/handoff` | Writes `logs/session-handoff.md` from live state — the project, the checkout's HEAD, her own commit against `main`, the queue, the roadmap, the draft, the reviews still waiting and the newest log — with the next action named and what it did not check. The only write is that file; it reads no network, no GitHub and no model. |
+| `/jobs` | The recent jobs from `logs/jobs.jsonl`, newest first: id, kind, project, outcome, branch and title, one row per job. Written as each job reaches its result or its review, so a phone can see where the last few ended without reading GitHub or a log by id. |
+| `/tidy` | What is stale: job logs older than 14 days, worktrees in `WORKTREE_ROOT` that no job log explains, and leftover `audit-*` folders, each with the exact `git worktree remove` command. Only old logs are deleted, and only after the button; branches and worktrees are named, never removed. |
 | `/status` | The live board for the running job — stage, elapsed time, "looks like" screen — plus one line per waiting job. Read-only and immediate; no probe. |
 | `/cancel [job-id]` | Stops the running job, or one still waiting. The branch is kept; nothing is pushed. |
 | `/check` | `swift test` in HustlerCore. Queued. |
@@ -470,9 +473,10 @@ Freebuff sometimes stops on a question box instead of finishing:
     posted immediately, exactly as before; the manager's line follows as its own
     message, `"<BOT_NAME> suggests option N: <reason> (suggestion only, you
     decide)"`, and only if it arrives inside a short window. It never delays the
-    question, never blocks `/answer`, is never returned to the runner and is
-    never typed into the session. If the manager is unavailable or throttled,
-    nothing is shown.
+    question, never blocks `/answer`, is never returned to the runner andis never typed into the session. If the manager is unavailable or throttled,
+    nothing is shown. An escalated question still gets the line, ending
+    " This one is your call, not my answer." — advice is worth most where the
+    decision is the owner's, and it is still never typed.
 12. Every auto-answer is auditable: `"<BOT_NAME> answered option N (confidence
     high): <reason>"` is posted to the job's channel and written to the job log.
     At most `QUESTION_AUTO_ANSWER_MAX` (3) auto-answers are taken per job, and
@@ -610,6 +614,7 @@ last event: branch freebuff/9a1c ready
   900) one short ping names the job, its stage as n/7, the elapsed time and the
   last event, so a long build is not silence. `STATUS_PINGS=0` and
   `STATUS_DIGEST_SECONDS=0` both turn it off.
+- **One digest per finished job:** after the review (or the result, for an audit) one plain message says what happened, what changed, what the check, test and build stages said, what needs the owner, and which roadmap job is next (`digest.py`). It quotes the job's own record and says so; nothing is re-run to produce it.
 - **`/board`** posts a fresh board for the running job. Script jobs (`/check`,
   `/test`, `/build`) keep their existing result embed and are listed by
   `/status` only: they are not builder stages, so they get no bar.
@@ -686,6 +691,7 @@ arguments (never Discord input).
   Approve commits the worktree, pushes only `freebuff/<id>` and reports the
   commit. Reject pushes nothing. Only the gated `/merge` merges: every gate must
   pass, Hustler `main` is refused, and it is a dry run by default.
+- The review prompt carries **PLAN FOR THIS JOB**: the job's own goal, acceptance lines and out-of-scope lines, derived from its text by `job_plan.py` with no model. The question-answerer reads the same plan instead of `(no plan)`; a job text with no labelled section says "(no plan recorded for this job)" rather than inventing one.
 - `/plan <goal>` asks the manager for a plan in the owner's task-document shape:
   evidence, items in priority order, acceptance per item, out of scope, open
   decisions. It is given the project block, the tails and error lines of the
