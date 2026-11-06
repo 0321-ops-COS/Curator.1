@@ -268,6 +268,7 @@ class Settings:
     log_dir: Path
     worktree_root: Path
     notify_channel_id: int | None
+    notify_channel_name: str
     ai_channel_id: int | None
     ai_channel_name: str
     guild_id: int | None
@@ -382,6 +383,10 @@ class Settings:
             log_dir=log_dir,
             worktree_root=worktree_root,
             notify_channel_id=_env_optional_id("NOTIFY_CHANNEL_ID"),
+            notify_channel_name=(
+                _env("NOTIFY_CHANNEL_NAME", "notifications").lstrip("#")
+                or "notifications"
+            ),
             ai_channel_id=_env_optional_id("AI_CHANNEL_ID"),
             ai_channel_name=_env("AI_CHANNEL_NAME", "ai").lstrip("#") or "ai",
             guild_id=_env_optional_id("GUILD_ID"),
@@ -1184,7 +1189,7 @@ class MacBuilderBot(discord.Client):
         if applied:
             self._roadmap_restored = 0
             left = len(self._roadmap_steps)
-            channel = self._target_channel(int(applied.get("channel_id") or 0))
+            channel = self._notification_channel(int(applied.get("channel_id") or 0))
             state = f"Roadmap restored: {left} job(s) left." if left else "No roadmap was queued."
             try:
                 if channel is not None:
@@ -1197,7 +1202,7 @@ class MacBuilderBot(discord.Client):
             except Exception:
                 log.exception("could not announce the applied update")
         if self._roadmap_restored:
-            channel = self._target_channel(self._roadmap_channel_id)
+            channel = self._notification_channel(self._roadmap_channel_id)
             try:
                 if channel is not None:
                     await channel.send(
@@ -1207,7 +1212,7 @@ class MacBuilderBot(discord.Client):
                 log.warning("could not announce the restored roadmap")
         interrupted = recovery.take(self.settings.log_dir)
         if interrupted:
-            channel = self._target_channel(int(interrupted.get("channel_id") or 0))
+            channel = self._notification_channel(int(interrupted.get("channel_id") or 0))
             try:
                 if channel is not None:
                     await channel.send(recovery.note(
@@ -2110,9 +2115,15 @@ class MacBuilderBot(discord.Client):
             await message.reply(embed=embed, view=TaskProposalView(self, task))
 
     def _is_ai_channel(self, channel: discord.abc.GuildChannel) -> bool:
+        """True for #ai and for every thread started under it."""
+        target = channel
+        if isinstance(channel, discord.Thread):
+            parent = getattr(channel, "parent", None)
+            if parent is not None:
+                target = parent
         if self.settings.ai_channel_id is not None:
-            return channel.id == self.settings.ai_channel_id
-        name = getattr(channel, "name", "") or ""
+            return target.id == self.settings.ai_channel_id
+        name = getattr(target, "name", "") or ""
         return name.lower() == self.settings.ai_channel_name.lower()
 
     def _ai_context(self) -> str:
@@ -2582,7 +2593,7 @@ class MacBuilderBot(discord.Client):
         """One line where the roadmap was started; a lost channel is not fatal."""
         who = f"<@{self._roadmap_requester_id}> " if self._roadmap_requester_id else ""
         try:
-            channel = self._target_channel(self._roadmap_channel_id)
+            channel = self._notification_channel(self._roadmap_channel_id)
             if channel is not None:
                 await channel.send(who + text)
         except Exception:
@@ -2605,7 +2616,7 @@ class MacBuilderBot(discord.Client):
         if now < due:
             return
         self._roadmap_reminder[job.id] = now + ROADMAP_PING_SECONDS
-        channel = self._target_channel(self._roadmap_channel_id)
+        channel = self._notification_channel(self._roadmap_channel_id)
         try:
             if channel is not None:
                 await channel.send(
@@ -2658,7 +2669,10 @@ class MacBuilderBot(discord.Client):
         await self._roadmap_say(text)
 
     def _board_channel_id(self, job: Job) -> int:
-        """Boards live in NOTIFY_CHANNEL_ID, else where the job was started."""
+        """Boards live in the notifications chat, else where the job started."""
+        channel = self._notify_channel()
+        if channel is not None:
+            return int(getattr(channel, "id", 0) or job.channel_id)
         return getattr(self.settings, "notify_channel_id", None) or job.channel_id
 
     async def _track_board(self, job: Job, position: int) -> None:
@@ -2669,13 +2683,19 @@ class MacBuilderBot(discord.Client):
         if publisher is None:  # a bot without a board still queues jobs
             return
         ctx = getattr(self.settings, "project", None)
+        job_project = str(getattr(job, "project", "") or "")
+        label = (
+            projects.label_for(self.settings, job_project)
+            if job_project and job_project != projects.DEFAULT_PROJECT
+            else getattr(ctx, "project_name", "") or ""
+        )
         try:
             publisher.track(
                 job.id,
                 channel_id=self._board_channel_id(job),
                 requester_id=job.requester_id,
                 kind=job.kind,
-                project=getattr(ctx, "project_name", "") or "",
+                project=label,
                 started_at=getattr(job, "started", None),
                 queue_position=position,
             )
@@ -2797,10 +2817,9 @@ class MacBuilderBot(discord.Client):
                 for notice in notices:
                     if getattr(notice, "kind", "") == "self" and notice.tip == skipped:
                         continue
-                    channel_id = getattr(self.settings, "notify_channel_id", None)
-                    channel = self._target_channel(channel_id) if channel_id else None
+                    channel = self._notify_channel()
                     if channel is None:
-                        log.warning("no NOTIFY_CHANNEL_ID for an update notice")
+                        log.warning("no notifications channel for an update notice")
                         continue
                     offer = UpdateNoticeView(self, notice.tip) if getattr(notice, "kind", "") == "self" else None
                     await channel.send(str(notice), view=offer)
@@ -2845,7 +2864,7 @@ class MacBuilderBot(discord.Client):
         return f"{waiting} job(s) are still queued" if waiting else ""
 
     async def _update_say(self, text: str, wait: dict) -> None:
-        channel = self._target_channel(int(wait.get("channel_id") or 0))
+        channel = self._notification_channel(int(wait.get("channel_id") or 0))
         if channel is not None:
             await channel.send(_clip_reply(text))
 
@@ -2868,7 +2887,11 @@ class MacBuilderBot(discord.Client):
             self._update_waiting = None
             return await self._update_say(f"Staying on `{old[:7]}`: pull failed: {detail}", wait)
         new = supervisor.head()
-        supervisor.note_applied(old, new, supervisor.subjects(old, new), wait["channel_id"])
+        channel = self._notify_channel()
+        supervisor.note_applied(
+            old, new, supervisor.subjects(old, new),
+            int(getattr(channel, "id", 0) or wait["channel_id"]),
+        )
         self._update_waiting = None
         await self._update_say(f"Restarting at `{new[:7]}` from `{old[:7]}`.", wait)
         await self._exit_for_restart()
@@ -2891,7 +2914,7 @@ class MacBuilderBot(discord.Client):
         for record in review_record.load(self.settings):
             rebuilt = review_record.outcome(record)
             try:
-                await (self._target_channel(rebuilt.job.channel_id) or channel).send(
+                await (self._notification_channel(rebuilt.job.channel_id) or channel).send(
                     content=f"Refreshed review for `{rebuilt.job.id}`: these buttons work now; Approve still pushes only this branch.",
                     embed=review_embed(self.settings, rebuilt),
                     view=ReviewView(self, rebuilt, refreshed=True))
@@ -2901,15 +2924,46 @@ class MacBuilderBot(discord.Client):
             posted.append(rebuilt.job.id)
         return posted
 
+    def _notify_channel(self) -> discord.abc.Messageable | None:
+        """The notifications chat: NOTIFY_CHANNEL_ID, else NOTIFY_CHANNEL_NAME.
+
+        Every autonomous job message goes here: boards, pings, reviews,
+        questions, screens, results, digests and update notices, whichever
+        channel a job was started in and whichever repository it builds.
+        """
+        wanted = getattr(self.settings, "notify_channel_id", None)
+        if wanted:
+            channel = self.get_channel(int(wanted))
+            if channel is not None:
+                return channel
+        name = str(
+            getattr(self.settings, "notify_channel_name", "") or ""
+        ).lstrip("#").strip().lower()
+        if not name:
+            return None
+        finder = getattr(self, "get_all_channels", None)
+        for channel in finder() if finder is not None else ():
+            if not isinstance(channel, discord.TextChannel):
+                continue
+            if (getattr(channel, "name", "") or "").lower() == name:
+                return channel
+        return None
+
+    def _notification_channel(
+        self, fallback_id: int = 0
+    ) -> discord.abc.Messageable | None:
+        """Where a job's state is announced: notifications, else where it started."""
+        return self._notify_channel() or self._target_channel(fallback_id)
+
     def _target_channel(self, channel_id: int) -> discord.abc.Messageable | None:
         channel = self.get_channel(channel_id) if channel_id else None
-        if channel is None and self.settings.notify_channel_id:
-            channel = self.get_channel(self.settings.notify_channel_id)
+        if channel is None:
+            channel = self._notify_channel()
         return channel  # type: ignore[return-value]
 
     async def _post_question(self, job: Job, question: questions.Question) -> bool:
         """Post a pending question where the job was started; /answer resolves it."""
-        channel = self._target_channel(job.channel_id)
+        channel = self._notification_channel(job.channel_id)
         if channel is None:
             log.warning("no Discord channel for the question in job %s", job.id)
             return False
@@ -2948,7 +3002,7 @@ class MacBuilderBot(discord.Client):
 
     async def _post_note(self, job: Job, text: str) -> None:
         """A manager line for the owner: an auto-answer record or a suggestion."""
-        channel = self._target_channel(job.channel_id)
+        channel = self._notification_channel(job.channel_id)
         if channel is None:
             log.warning("no Discord channel for a manager note in job %s", job.id)
             return
@@ -2959,7 +3013,7 @@ class MacBuilderBot(discord.Client):
 
     async def _post_pane(self, job: Job, tail: str) -> bool:
         """A box that did not parse: show the pane so the owner is never blind."""
-        channel = self._target_channel(job.channel_id)
+        channel = self._notification_channel(job.channel_id)
         if channel is None:
             log.warning("no Discord channel for the unreadable box in job %s", job.id)
             return False
@@ -2992,7 +3046,7 @@ class MacBuilderBot(discord.Client):
 
     async def _post_screen(self, job: Job, screen: screens.Screen, tail: str) -> bool:
         """A screen needs a person: show the pane and what may be sent to it."""
-        channel = self._target_channel(job.channel_id)
+        channel = self._notification_channel(job.channel_id)
         if channel is None:
             log.warning("no Discord channel for the screen in job %s", job.id)
             return False
@@ -3033,7 +3087,7 @@ class MacBuilderBot(discord.Client):
             # repeat it with less information.
             return
         job_index.record(getattr(self, "settings", None), job)
-        channel = self._target_channel(job.channel_id)
+        channel = self._notification_channel(job.channel_id)
         if channel is None:
             log.warning("no Discord channel for job %s", job.id)
             return
@@ -3143,7 +3197,7 @@ class MacBuilderBot(discord.Client):
                 files.append(discord.File(sheet_path, filename=sheet_path.name))
                 extra = f"\nFix sheet: `{sheet_path.name}`, {len(steps)} job(s); nothing queued."
         job.summary = audit.summary(stamp, results, path.name) + extra
-        channel = self._target_channel(job.channel_id)
+        channel = self._notification_channel(job.channel_id)
         if channel is None:
             log.warning("no Discord channel for the audit in job %s", job.id)
             return
@@ -3191,7 +3245,7 @@ class MacBuilderBot(discord.Client):
             await repo._run(["worktree", "remove", "--force", str(worktree)], check=False)
 
     async def _on_job_crash(self, job: Job, exc: BaseException) -> None:
-        channel = self._target_channel(job.channel_id)
+        channel = self._notification_channel(job.channel_id)
         if channel is None:
             return
         await channel.send(
@@ -3264,7 +3318,7 @@ class MacBuilderBot(discord.Client):
                 outcome, ci_state=await review_ci_state(self.settings, outcome))
             review_record.save(self.settings, outcome)
         self._remember_merge_job(outcome.job)
-        channel = self._target_channel(outcome.job.channel_id)
+        channel = self._notification_channel(outcome.job.channel_id)
         if channel is None:
             log.warning("no Discord channel for review of %s", outcome.job.id)
             return
@@ -3293,7 +3347,7 @@ class MacBuilderBot(discord.Client):
     async def _post_digest(self, job: Job, outcome: ReviewOutcome | None = None) -> None:
         """One message per finished job: what happened, changed, and needs you."""
         job_index.record(self.settings, job, outcome=outcome)
-        channel = self._target_channel(job.channel_id)
+        channel = self._notification_channel(job.channel_id)
         if channel is None:
             return
         try:

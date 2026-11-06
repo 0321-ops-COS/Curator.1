@@ -212,9 +212,11 @@ git -C ~/Desktop/Hustler switch freebuff/ce4b8907c250c30103d8993e
 5. Enable Discord **Developer Mode** (Settings → Advanced), then right-click
    your name → **Copy User ID**. Put it in `ALLOWED_USER_IDS`. Multiple IDs are
    comma-separated.
-6. Create `#ai` and, optionally, `#builds`. Right-click → **Copy Channel ID**
-   for `AI_CHANNEL_ID` / `NOTIFY_CHANNEL_ID`, or leave `AI_CHANNEL_ID` empty and
-   let `AI_CHANNEL_NAME=ai` find the channel by name.
+6. Create `#ai` and `#notifications`. Right-click → **Copy Channel ID** for
+   `AI_CHANNEL_ID` / `NOTIFY_CHANNEL_ID`, or leave them empty and let
+   `AI_CHANNEL_NAME=ai` and `NOTIFY_CHANNEL_NAME=notifications` find the
+   channels by name. Every job's updates and status notifications go to
+   `#notifications`; her chat replies stay in `#ai`, threads included.
 7. Set `GUILD_ID` to your server ID so slash commands appear instantly instead
    of waiting for a global sync.
 
@@ -257,7 +259,7 @@ are kept for inspection.
 | `DISCORD_TOKEN` | Bot token. Never commit it. |
 | `ALLOWED_USER_IDS` | Comma/space-separated Discord user IDs; required. |
 | `GUILD_ID` | Optional guild ID, so slash commands sync to one server instantly instead of globally. |
-| `NOTIFY_CHANNEL_ID`, `AI_CHANNEL_ID`, `AI_CHANNEL_NAME` | Optional result channel, the `#ai` channel by ID, or by name (default `ai`). An empty `NOTIFY_CHANNEL_ID` posts results where the job was started. |
+| `NOTIFY_CHANNEL_ID`, `NOTIFY_CHANNEL_NAME`, `AI_CHANNEL_ID`, `AI_CHANNEL_NAME` | Where her messages go. Every job's updates and status notifications — boards, pings, screens, questions, reviews, results, digests — go to the notifications channel, by ID or by name (default `notifications`); an ID wins. Her chat replies stay in `#ai` by ID or by name (default `ai`), including in threads started under it. With neither a matching ID nor name, a job's messages fall back to the channel it was started in. |
 | `AUTHORIZED_BRANCH` | Base branch for tasks; never `main`/`master`. |
 | `REPO_DIR` | The project checkout to build; default is the one containing `mac-builder/`. On the Mac that is `~/Desktop/Hustler`, because `mac-builder/` now lives in the Curator.1 checkout. |
 | `PROJECT_NAME`, `BUILDER_NAME`, `BOT_NAME` | Labels for `/project` and the manager; default to the target folder name, `Freebuff`, `Melisa`. |
@@ -355,7 +357,7 @@ tail -f ~/Curator.1/mac-builder/logs/launchd.log
 | `/audit [branch]` | Runs the Mac stages on detached worktrees and reports. Targets are the authorized-branch tip plus every saved review (`awaiting_review` or `approved`) whose branch is not yet in the base, or just one `branch`. Each gets `~/mac-builder-worktrees/audit-<stamp>/<name>` (fetched read-only, the checkout itself never touched) and runs `scripts/check.sh`, `scripts/build.sh`, `scripts/test.sh` with `REPO_DIR` in that worktree, then `node ios-app/tools/parity/drift.mjs`, recording exit code, duration and the last 80 lines. Each stage is passed, failed, unavailable (127 missing tool, 78 no test action) or not run — a stage that did not run is never a pass. Failures are parsed from the logs with plain patterns (compiler `file:line: error:` lines and failing XCTest/Swift Testing names); the model is never asked. It is queued like any other job, so it waits for a running Freebuff job; the worktrees are removed afterwards and the full report is written to `logs/audit-<stamp>.md` and attached to the summary, which says outright that CI results are not visible. Never commits, pushes, merges or approves. A failing audit also posts a fix sheet (one `## Job` per failed branch or stage, under 4000 characters) with a card: **Preview** gives `/roadmap`'s preview, **Edit job** picks a job and opens a modal whose save re-validates the sheet with `roadmap.parse`, **Remove job** drops one, **Replace sheet** waits ten minutes for the next `.md` message like `/roadmap`, **Approve and queue** starts the draft through `/roadmap`'s own start path (only the first job queues; it refuses while a roadmap is active), and **Discard** drops the draft. It never approves, pushes or merges a job; the draft is saved beside `roadmap.json` and says so when a restart restores its card. |
 | `/selftest` | Runs every stage on fakes — sheet parsing, the report and test card, the board and its pings, the merge gates against a mocked GitHub, and the allowlist — and reports pass or fail per stage with one line of evidence. No Freebuff, GitHub, repo write, push, merge or real queue. |
 
-Job results are posted where the job was started, or to `NOTIFY_CHANNEL_ID`.
+Job updates are posted to the notifications channel (`NOTIFY_CHANNEL_ID`, else `NOTIFY_CHANNEL_NAME`), for every job on every registered repository; if that channel cannot be found, a job's messages fall back to the channel it was started in.
 
 ## Freebuff runner
 
@@ -408,7 +410,8 @@ Freebuff sometimes stops on a question box instead of finishing:
    text. The ad banner above the box and `Close ✕` are ignored. No model and no
    shell are involved.
 2. The box is driven **one question at a time**. Question `n` of `m` is posted in
-   the channel the job was started in, with its options numbered. `/answer 2`
+   the notifications channel (falling back to the one the job was started in),
+   with its options numbered. `/answer 2`
    picks option 2, `/answer <text>` types free text, and free text for a box with
    a `Custom` row selects that row first. Free text goes through
    `tmux load-buffer`/`paste-buffer`/`send-keys`, exactly like `/task` text, so
@@ -478,7 +481,7 @@ Freebuff sometimes stops on a question box instead of finishing:
     " This one is your call, not my answer." — advice is worth most where the
     decision is the owner's, and it is still never typed.
 12. Every auto-answer is auditable: `"<BOT_NAME> answered option N (confidence
-    high): <reason>"` is posted to the job's channel and written to the job log.
+    high): <reason>"` is posted to the notifications channel and written to the job log.
     At most `QUESTION_AUTO_ANSWER_MAX` (3) auto-answers are taken per job, and
     after a 429 or a timeout no manager call is made for
     `QUESTION_MANAGER_COOLDOWN_SECONDS` (30): those questions are yours.
@@ -778,6 +781,8 @@ one owner and one job runs at a time, that cancelling drops the pending
 question, that `/answer` refuses a number outside the options, says so when
 nothing is pending and tells a denied user nothing, and that the manager's
 auto-answer is off by default and needs high confidence.
+
+`tests/test_notification_routing.py` checks that every job's updates and status notifications go to the notifications channel (by ID or by name, for every registered project), that her chat replies stay in `#ai` including in threads started under it, and that a missing notifications channel falls back to where the job started.
 
 `tests/test_question_manager.py` covers the manager without a network: the
 strict reply parser, the escalation list and its term in the log, the capped
