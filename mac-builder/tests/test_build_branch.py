@@ -289,7 +289,10 @@ class _Channel:
 class CardTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_card_names_the_branch_commit_and_elapsed_time(self) -> None:
         channel = _Channel()
-        fake_self = SimpleNamespace(_target_channel=lambda _id: channel)
+        fake_self = SimpleNamespace(
+            _target_channel=lambda _id: channel,
+            _notification_channel=lambda _id: channel,
+        )
         job = jobs.Job(
             id="20261102-120000-deadbeef",
             kind="build",
